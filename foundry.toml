@@ -1,0 +1,64 @@
+[profile.default]
+src = "src"
+out = "out"
+libs = ["lib"]
+test = "test"
+script = "script"
+cache_path = "cache"
+
+solc = "0.8.24"
+evm_version = "cancun"
+optimizer = true
+optimizer_runs = 200
+via_ir = true
+
+bytecode_hash = "none"
+cbor_metadata = false
+
+fs_permissions = [{ access = "read", path = "./" }]
+
+remappings = [
+    "@openzeppelin/contracts/=lib/openzeppelin-contracts/contracts/",
+    "@openzeppelin/contracts-upgradeable/=lib/openzeppelin-contracts-upgradeable/contracts/",
+    "solady/=lib/solady/src/",
+    "forge-std/=lib/forge-std/src/",
+]
+
+[profile.default.fuzz]
+runs = 10_000
+max_test_rejects = 200_000
+
+[profile.default.invariant]
+runs = 1_000
+depth = 100
+fail_on_revert = false
+call_override = false
+
+[profile.ci]
+fuzz = { runs = 50_000 }
+invariant = { runs = 5_000, depth = 200 }
+verbosity = 3
+
+[profile.lite]
+optimizer = false
+via_ir = false
+fuzz = { runs = 256 }
+invariant = { runs = 32, depth = 32 }
+
+[fmt]
+line_length = 120
+tab_width = 4
+bracket_spacing = false
+int_types = "long"
+quote_style = "double"
+number_underscore = "preserve"
+multiline_func_header = "all"
+sort_imports = true
+
+[rpc_endpoints]
+base = "${BASE_RPC_URL}"
+base_sepolia = "${BASE_SEPOLIA_RPC_URL}"
+
+[etherscan]
+base = { key = "${BASESCAN_API_KEY}", url = "https://api.basescan.org/api" }
+base_sepolia = { key = "${BASESCAN_API_KEY}", url = "https://api-sepolia.basescan.org/api" }

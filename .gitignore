@@ -1,0 +1,26 @@
+# Foundry
+out/
+cache/
+broadcast/
+
+# Coverage
+lcov.info
+coverage/
+
+# Env
+.env
+.env.local
+.env.*.local
+
+# Editor
+.vscode/
+.idea/
+*.swp
+.DS_Store
+
+# Node (in case docs/tooling sneaks in)
+node_modules/
+
+# Build artifacts
+artifacts/
+typechain-types/
