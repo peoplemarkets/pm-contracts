@@ -1,0 +1,322 @@
+// SPDX-License-Identifier: BUSL-1.1
+pragma solidity 0.8.24;
+
+import {IOracleRouter} from "../oracle/IOracleRouter.sol";
+
+/// @title StorageLib — namespaced storage for People Markets core contracts.
+/// @notice Each contract reads its mutable state from a deterministic, collision-free slot derived
+///         from a versioned namespace string. This is the Synthetix v3 / Diamond storage pattern: it
+///         lets us upgrade individual contracts behind UUPS proxies without auditors having to
+///         reason about storage layout drift across versions.
+///
+/// @dev Slot derivation: `keccak256("people.markets.<contract>.v1")`. The namespace string is the
+///      sole identifier — bumping the trailing `.vN` is how we declare a hard storage break (which
+///      we should never do without a migration plan and a fresh audit).
+///
+/// @dev Each library exposes a `load()` that yields a storage pointer. Consumers read and mutate
+///      fields directly; there is no per-field accessor wrapper.
+///
+/// @dev Structs are intentionally additive: new fields MUST be appended at the end, never inserted
+///      or reordered. Removing a field is forbidden — replace with a `_deprecated_*` placeholder of
+///      the same type to preserve layout. Each namespace lives in its own slot, so independent
+///      structs do not collide; the "no insert / no reorder" rule is per-struct.
+library PerpStorage {
+    bytes32 internal constant SLOT = keccak256("people.markets.perp.v1");
+
+    /// @dev `size` is signed: positive = long, negative = short, zero = closed slot.
+    ///      `entryFundingIndex` is the cumulative funding index at the time of last settlement,
+    ///      used to compute funding owed on the next interaction.
+    struct Position {
+        int256 size;
+        uint256 collateral;
+        uint256 entryPrice;
+        int256 entryFundingIndex;
+        uint64 openedAt;
+        uint64 lastInteractionAt;
+        address owner;
+        bytes32 subjectId;
+    }
+
+    struct Layout {
+        // mark price by subject (USDC-denominated, 1e18 decimals)
+        mapping(bytes32 subjectId => uint256) markPrice;
+        mapping(bytes32 subjectId => uint64) markUpdatedAt;
+        // open interest, gross long and short, USDC notional
+        mapping(bytes32 subjectId => uint256) totalLongOI;
+        mapping(bytes32 subjectId => uint256) totalShortOI;
+        // positions keyed by deterministic id (e.g. keccak(owner, subjectId, nonce))
+        mapping(bytes32 positionId => Position) positions;
+        // per-trader-per-subject open position id (one position per (trader, subject))
+        mapping(address trader => mapping(bytes32 subjectId => bytes32)) openPositionId;
+        // monotonic nonce for new positions; never reused
+        uint256 nextPositionNonce;
+        // off-chain mark writer (price keeper). Permissioned. Multiple writers allowed.
+        mapping(address writer => bool) markWriters;
+        // per-subject pause flag (auto-pause, cooldown, freeze, delisting)
+        mapping(bytes32 subjectId => uint8) subjectPauseStatus;
+        // global halt
+        bool globalHalt;
+    }
+
+    function load() internal pure returns (Layout storage l) {
+        bytes32 slot = SLOT;
+        assembly ("memory-safe") {
+            l.slot := slot
+        }
+    }
+}
+
+library MarginStorage {
+    bytes32 internal constant SLOT = keccak256("people.markets.margin.v1");
+
+    /// @dev KYC tiers map to notional caps. Tier 0 is unconfigured/blocked.
+    enum KycTier {
+        NONE,
+        T1,
+        T2,
+        T3
+    }
+
+    struct AccountExposure {
+        // sum of |perp_notional| across all subjects, USDC 1e18
+        uint256 totalPerpNotional;
+        // sum of correlated event-position contributions × c_event_xm × correlation
+        uint256 totalEventExposure;
+        KycTier tier;
+    }
+
+    struct Layout {
+        mapping(address trader => AccountExposure) exposure;
+        // per-tier combined-exposure cap. Spec: T1 $200K, T2 $1M, T3 $4M (200K × tier multipliers).
+        mapping(KycTier => uint256) tierCombinedCap;
+        // per-tier per-subject notional cap. Spec: T1 $50K, T2 $250K, T3 $1M.
+        mapping(KycTier => uint256) tierPerSubjectCap;
+        // c_event_xm: cross-margin multiplier for event-position exposure. Starts at 0.25e18, range
+        // 0.20e18-0.40e18. Governance-controlled, timelocked.
+        uint256 crossMarginMultiplier;
+        // initial margin / maintenance margin / liquidation buffer, in basis points of notional
+        uint16 initialMarginBps; // 2000 (20%)
+        uint16 maintenanceMarginBps; // 500 (5%)
+        uint16 liquidationBufferBps; // 250 (2.5%)
+        uint16 maxLeverageBps; // 50000 (5×)
+    }
+
+    function load() internal pure returns (Layout storage l) {
+        bytes32 slot = SLOT;
+        assembly ("memory-safe") {
+            l.slot := slot
+        }
+    }
+}
+
+library FundingStorage {
+    bytes32 internal constant SLOT = keccak256("people.markets.funding.v1");
+
+    struct Layout {
+        // cumulative funding index per subject (signed, scaled by 1e18). Frozen during pauses.
+        mapping(bytes32 subjectId => int256) cumulativeFundingIndex;
+        // last accrual timestamp per subject
+        mapping(bytes32 subjectId => uint64) lastFundingAt;
+        // whether funding accrual is currently frozen for a subject (pause-aware)
+        mapping(bytes32 subjectId => bool) frozen;
+        // funding parameters (1e18 scale unless stated)
+        uint256 kPremium; // 0.0125e18
+        uint256 kSentiment; // 0.004e18
+        uint256 kSkew; // 0.003e18
+        uint256 fMaxPerHour; // 0.00075e18 (0.075%/h)
+        uint32 fundingIntervalSeconds; // 3600 default, range 900-28800
+        // hard floor for event OI to contribute to sentiment. USDC 1e18. Spec: $25_000.
+        uint256 minEventOiForSentiment;
+        // permissioned writer for funding-rate keeper pushes
+        mapping(address => bool) fundingWriters;
+    }
+
+    function load() internal pure returns (Layout storage l) {
+        bytes32 slot = SLOT;
+        assembly ("memory-safe") {
+            l.slot := slot
+        }
+    }
+}
+
+library LiquidationStorage {
+    bytes32 internal constant SLOT = keccak256("people.markets.liquidation.v1");
+
+    /// @dev `inProgress` flag is set on entry to the liquidation flow so margin invariants
+    ///      (I5) tolerate transient under-collateralization.
+    struct LiquidationState {
+        uint8 partialAttempts;
+        uint64 lastPartialAt;
+        bool inProgress;
+    }
+
+    struct Layout {
+        mapping(bytes32 positionId => LiquidationState) state;
+        // partial liquidation: 25% increments, minimum 4 attempts before full
+        uint16 partialIncrementBps; // 2500
+        uint8 minPartialsBeforeFull; // 4
+        uint16 mmRestoreBufferBps; // 100 (restore to MM + 100bps buffer)
+        // bounty paid to liquidator on full liquidation, basis points of notional
+        uint16 fullLiquidationBountyBps; // 100 (1%)
+        // LP socialization cap per single event, basis points of vault TVL
+        uint16 lpSocializationCapBps; // 3000 (30%)
+    }
+
+    function load() internal pure returns (Layout storage l) {
+        bytes32 slot = SLOT;
+        assembly ("memory-safe") {
+            l.slot := slot
+        }
+    }
+}
+
+library VaultStorage {
+    bytes32 internal constant SLOT = keccak256("people.markets.vault.v1");
+
+    struct Layout {
+        // collateral locked against open positions, USDC 1e18. NOT the same as ERC-4626 totalAssets.
+        // totalAssets = freeAssets + positionCollateral + insuranceFundBalance + accruedFees.
+        uint256 positionCollateral;
+        // fees accrued, awaiting LP rebate / insurance routing
+        uint256 accruedFees;
+        // insurance fund balance held inside the vault (or address pointer if separated)
+        uint256 insuranceFundBalance;
+        // share-price boost paid down to LPs (excess over 10% TVL cap on insurance fund)
+        uint256 sharePriceBoostAccrued;
+        // operator that may pull/push collateral on behalf of positions (PerpEngine)
+        address perpEngine;
+        // operator that may move funds for liquidation flows
+        address liquidationEngine;
+        // insurance-fund manager (separate multi-sig per spec §3)
+        address insuranceFundManager;
+    }
+
+    function load() internal pure returns (Layout storage l) {
+        bytes32 slot = SLOT;
+        assembly ("memory-safe") {
+            l.slot := slot
+        }
+    }
+}
+
+library FeedbackStorage {
+    bytes32 internal constant SLOT = keccak256("people.markets.feedback.v1");
+
+    enum EventClass {
+        UNSET,
+        MAJOR,
+        STANDARD,
+        MINOR
+    }
+
+    /// @dev `cEventPositiveBps` and `cEventNegativeBps` are basis points of mark.
+    ///      Per spec: negative = 1.5× positive, enforced at config time.
+    struct CategoryCoefficients {
+        uint16 cEventPositiveBps;
+        uint16 cEventNegativeBps;
+    }
+
+    struct Layout {
+        mapping(EventClass => CategoryCoefficients) coefficients;
+        // per-resolution impulse cap, basis points of mark. Spec: 1500 (15%).
+        uint16 impulseCapBps;
+        // late-move discount params (1e18 scale)
+        // late_move_factor = late_move / lateMoveDenominator
+        // discount = min(maxDiscount, late_move_factor × discountSlope)
+        uint256 lateMoveDenominator; // 0.5e18
+        uint256 discountSlope; // 0.6e18
+        uint256 maxDiscount; // 0.5e18
+        // permissioned event-resolution caller (EventMarket / EventMarketFactory)
+        mapping(address resolver => bool) authorizedResolvers;
+    }
+
+    function load() internal pure returns (Layout storage l) {
+        bytes32 slot = SLOT;
+        assembly ("memory-safe") {
+            l.slot := slot
+        }
+    }
+}
+
+library OracleStorage {
+    bytes32 internal constant SLOT = keccak256("people.markets.oracle.v1");
+
+    /// @dev Pending config changes are timelocked. `pendingConfig` is a full replacement on activate.
+    struct PendingChange {
+        IOracleRouter.MetricConfig config;
+        uint64 activatesAt;
+        bool exists;
+    }
+
+    struct Layout {
+        // active configs
+        mapping(bytes32 metricId => IOracleRouter.MetricConfig) configs;
+        // pending registration / config-replacement proposals
+        mapping(bytes32 metricId => PendingChange) pending;
+        // pending fallback-adapter changes (separate from full config replacements)
+        mapping(bytes32 metricId => address) pendingFallback;
+        mapping(bytes32 metricId => uint64) pendingFallbackActivatesAt;
+        // governance: rotates configs, timelocked
+        address governance;
+        // operator: fast lever for setDegraded only, NO timelock. Separate multi-sig from governance.
+        address operator;
+        // timelock delay for governance changes, in seconds (spec: 48h baseline)
+        uint32 timelockDelay;
+    }
+
+    function load() internal pure returns (Layout storage l) {
+        bytes32 slot = SLOT;
+        assembly ("memory-safe") {
+            l.slot := slot
+        }
+    }
+}
+
+library RegistryStorage {
+    bytes32 internal constant SLOT = keccak256("people.markets.registry.v1");
+
+    enum SubjectStatus {
+        UNREGISTERED,
+        ACTIVE,
+        AUTO_PAUSED, // 5%/30s, 10%/30min, 20%/1h triggers
+        COOLDOWN,
+        FROZEN,
+        DELISTING, // 7-day close window
+        DELISTED // forced settlement complete
+
+    }
+
+    enum PolicyFlag {
+        NONE,
+        US_POLITICIAN_ELECTION_YEAR,
+        MINOR,
+        OTHER_BLOCKED
+    }
+
+    struct Subject {
+        SubjectStatus status;
+        PolicyFlag policyFlag;
+        uint64 listedAt;
+        uint64 statusChangedAt;
+        bytes32 categoryId;
+    }
+
+    struct Layout {
+        mapping(bytes32 subjectId => Subject) subjects;
+        // KYC tier per trader, mirrored from off-chain KYC pipeline by an authorized writer
+        mapping(address trader => uint8) kycTier;
+        // category caps and category metadata addressed elsewhere; this maps subject → category
+        mapping(bytes32 categoryId => uint256) maxNetCategoryOiBps; // 2000 (20%)
+        // permissioned KYC writer
+        mapping(address => bool) kycWriters;
+        // permissioned subject admin
+        mapping(address => bool) subjectAdmins;
+    }
+
+    function load() internal pure returns (Layout storage l) {
+        bytes32 slot = SLOT;
+        assembly ("memory-safe") {
+            l.slot := slot
+        }
+    }
+}
