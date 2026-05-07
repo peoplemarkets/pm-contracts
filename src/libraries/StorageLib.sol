@@ -2,6 +2,7 @@
 pragma solidity 0.8.24;
 
 import {IOracleRouter} from "../oracle/IOracleRouter.sol";
+import {ISubjectRegistry} from "../registry/ISubjectRegistry.sol";
 
 /// @title StorageLib — namespaced storage for People Markets core contracts.
 /// @notice Each contract reads its mutable state from a deterministic, collision-free slot derived
@@ -275,42 +276,22 @@ library OracleStorage {
 library RegistryStorage {
     bytes32 internal constant SLOT = keccak256("people.markets.registry.v1");
 
-    enum SubjectStatus {
-        UNREGISTERED,
-        ACTIVE,
-        AUTO_PAUSED, // 5%/30s, 10%/30min, 20%/1h triggers
-        COOLDOWN,
-        FROZEN,
-        DELISTING, // 7-day close window
-        DELISTED // forced settlement complete
-
-    }
-
-    enum PolicyFlag {
-        NONE,
-        US_POLITICIAN_ELECTION_YEAR,
-        MINOR,
-        OTHER_BLOCKED
-    }
-
-    struct Subject {
-        SubjectStatus status;
-        PolicyFlag policyFlag;
-        uint64 listedAt;
-        uint64 statusChangedAt;
-        bytes32 categoryId;
-    }
-
     struct Layout {
-        mapping(bytes32 subjectId => Subject) subjects;
-        // KYC tier per trader, mirrored from off-chain KYC pipeline by an authorized writer
+        // subjects
+        mapping(bytes32 subjectId => ISubjectRegistry.Subject) subjects;
+        // KYC tier per trader, mirrored from the off-chain KYC pipeline by an authorized writer
         mapping(address trader => uint8) kycTier;
-        // category caps and category metadata addressed elsewhere; this maps subject → category
-        mapping(bytes32 categoryId => uint256) maxNetCategoryOiBps; // 2000 (20%)
-        // permissioned KYC writer
-        mapping(address => bool) kycWriters;
-        // permissioned subject admin
-        mapping(address => bool) subjectAdmins;
+        // governance: timelocked admin (role grants, contract upgrades)
+        address governance;
+        uint32 timelockDelay;
+        address pendingGovernance;
+        uint64 pendingGovernanceActivatesAt;
+        // role sets
+        mapping(address account => bool) subjectAdmins;
+        mapping(address account => bool) pauseGuardians;
+        mapping(address account => bool) kycWriters;
+        // pending role changes, keyed by keccak(account, role)
+        mapping(bytes32 changeKey => ISubjectRegistry.PendingRoleChange) pendingRoleChanges;
     }
 
     function load() internal pure returns (Layout storage l) {
