@@ -179,9 +179,13 @@ contract SignedFeedAdapterTest is Test {
     }
 
     function test_PushUpdate_SecondPushUpdates() public {
-        _push(100e18, uint64(block.timestamp), 1);
-        vm.warp(block.timestamp + 1 minutes);
-        _push(101e18, uint64(block.timestamp), 2); // 1% delta < 3% cap
+        // Capture-then-warp pattern — see test_PushUpdate_DeltaCapDownwardEnforced for the
+        // via-IR + block.timestamp quirk this works around.
+        uint64 t1 = uint64(block.timestamp);
+        _push(100e18, t1, 1);
+        uint64 t2 = t1 + 60;
+        vm.warp(t2);
+        _push(101e18, t2, 2); // 1% delta < 3% cap
         SignedFeedAdapter.SignedReading memory r = adapter.readingOf(METRIC_ID);
         assertEq(r.value, 101e18);
         assertEq(r.nonce, 2);
@@ -307,10 +311,13 @@ contract SignedFeedAdapterTest is Test {
     }
 
     function test_PushUpdate_DeltaCapAllowsExactly3Percent() public {
-        _push(100e18, uint64(block.timestamp), 1);
-        vm.warp(block.timestamp + 1 minutes);
+        // Capture-then-warp pattern — see test_PushUpdate_DeltaCapDownwardEnforced.
+        uint64 t1 = uint64(block.timestamp);
+        _push(100e18, t1, 1);
+        uint64 t2 = t1 + 60;
+        vm.warp(t2);
         // exactly 3% — at cap, should pass (≤ comparison)
-        _push(103e18, uint64(block.timestamp), 2);
+        _push(103e18, t2, 2);
         assertEq(adapter.readingOf(METRIC_ID).value, 103e18);
     }
 
