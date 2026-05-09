@@ -174,22 +174,31 @@ library LiquidationStorage {
 library VaultStorage {
     bytes32 internal constant SLOT = keccak256("people.markets.vault.v1");
 
+    /// @dev `freeAssets` is computed (not stored): balance(USDC) − positionCollateral −
+    ///      insuranceFundBalance − accruedFees. The four storage counters always sum to the
+    ///      USDC balance owned by the vault contract (invariant I1). LP shares are priced off
+    ///      `freeAssets` only — locked collateral, insurance fund, and treasury fees are not
+    ///      redeemable.
     struct Layout {
-        // collateral locked against open positions, USDC 1e18. NOT the same as ERC-4626 totalAssets.
-        // totalAssets = freeAssets + positionCollateral + insuranceFundBalance + accruedFees.
+        // bookkeeping buckets (sum = USDC.balanceOf(vault))
         uint256 positionCollateral;
-        // fees accrued, awaiting LP rebate / insurance routing
         uint256 accruedFees;
-        // insurance fund balance held inside the vault (or address pointer if separated)
         uint256 insuranceFundBalance;
-        // share-price boost paid down to LPs (excess over 10% TVL cap on insurance fund)
-        uint256 sharePriceBoostAccrued;
-        // operator that may pull/push collateral on behalf of positions (PerpEngine)
+        // collateral operator — the live PerpEngine address. Only this address may move locked
+        // collateral, accrue fees, or settle position PnL.
         address perpEngine;
-        // operator that may move funds for liquidation flows
-        address liquidationEngine;
-        // insurance-fund manager (separate multi-sig per spec §3)
-        address insuranceFundManager;
+        // governance: timelocked admin (proposes operator + governance transfers)
+        address governance;
+        uint32 timelockDelay;
+        address pendingPerpEngine;
+        uint64 pendingPerpEngineActivatesAt;
+        address pendingGovernance;
+        uint64 pendingGovernanceActivatesAt;
+        // operator: fast lever for deposit/withdrawal pause toggles. NO timelock.
+        address operator;
+        // pause flags
+        bool depositsPaused;
+        bool withdrawalsPaused;
     }
 
     function load() internal pure returns (Layout storage l) {
