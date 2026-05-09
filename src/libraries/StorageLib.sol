@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: BUSL-1.1
 pragma solidity 0.8.24;
 
+import {IPerpEngine} from "../core/IPerpEngine.sol";
 import {IOracleRouter} from "../oracle/IOracleRouter.sol";
 import {ISubjectRegistry} from "../registry/ISubjectRegistry.sol";
 
@@ -24,39 +25,37 @@ import {ISubjectRegistry} from "../registry/ISubjectRegistry.sol";
 library PerpStorage {
     bytes32 internal constant SLOT = keccak256("people.markets.perp.v1");
 
-    /// @dev `size` is signed: positive = long, negative = short, zero = closed slot.
-    ///      `entryFundingIndex` is the cumulative funding index at the time of last settlement,
-    ///      used to compute funding owed on the next interaction.
-    struct Position {
-        int256 size;
-        uint256 collateral;
-        uint256 entryPrice;
-        int256 entryFundingIndex;
-        uint64 openedAt;
-        uint64 lastInteractionAt;
-        address owner;
-        bytes32 subjectId;
-    }
-
     struct Layout {
         // mark price by subject (USDC-denominated, 1e18 decimals)
         mapping(bytes32 subjectId => uint256) markPrice;
         mapping(bytes32 subjectId => uint64) markUpdatedAt;
-        // open interest, gross long and short, USDC notional
+        // open interest at OPENING notional (long and short separately), USDC 1e18
         mapping(bytes32 subjectId => uint256) totalLongOI;
         mapping(bytes32 subjectId => uint256) totalShortOI;
-        // positions keyed by deterministic id (e.g. keccak(owner, subjectId, nonce))
-        mapping(bytes32 positionId => Position) positions;
+        // positions keyed by deterministic id (keccak(trader, subject, nonce)). The position
+        // struct itself is owned by `IPerpEngine` so the storage layout and external API stay
+        // in sync (mirrors the OracleStorage / RegistryStorage convention).
+        mapping(bytes32 positionId => IPerpEngine.Position) positions;
         // per-trader-per-subject open position id (one position per (trader, subject))
         mapping(address trader => mapping(bytes32 subjectId => bytes32)) openPositionId;
         // monotonic nonce for new positions; never reused
         uint256 nextPositionNonce;
         // off-chain mark writer (price keeper). Permissioned. Multiple writers allowed.
         mapping(address writer => bool) markWriters;
-        // per-subject pause flag (auto-pause, cooldown, freeze, delisting)
-        mapping(bytes32 subjectId => uint8) subjectPauseStatus;
-        // global halt
+        // pending mark-writer adds (timelocked). Revokes are not timelocked — fast cut-off.
+        mapping(address writer => uint64) pendingMarkWriterActivatesAt;
+        // global trading halt (governance, no timelock — emergency lever)
         bool globalHalt;
+        // mark-staleness window in seconds. Spec §1: 30s default.
+        uint32 markStaleAfter;
+        // dependencies — set in initialize, immutable after
+        address subjectRegistry;
+        address lpVault;
+        // governance + timelock (matches OracleRouter / SubjectRegistry pattern)
+        address governance;
+        uint32 timelockDelay;
+        address pendingGovernance;
+        uint64 pendingGovernanceActivatesAt;
     }
 
     function load() internal pure returns (Layout storage l) {
@@ -100,6 +99,8 @@ library MarginStorage {
         uint16 maintenanceMarginBps; // 500 (5%)
         uint16 liquidationBufferBps; // 250 (2.5%)
         uint16 maxLeverageBps; // 50000 (5×)
+        // per-subject side OI cap as basis points of vault.totalAssets(). Spec §3: 5% (500 bps).
+        uint16 perSubjectSideOiCapBps;
     }
 
     function load() internal pure returns (Layout storage l) {
