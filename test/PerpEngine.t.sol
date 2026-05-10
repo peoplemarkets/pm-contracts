@@ -1212,6 +1212,376 @@ contract PerpEngineTest is Test {
     }
 
     // ------------------------------------------------------------------------------------------
+    // Fix #7 — forceSettleSubject + closeAtForcedSettlement
+    // ------------------------------------------------------------------------------------------
+
+    /// @dev Helper: drive subject to DELISTED through the involuntary path (cleanest, no warps).
+    function _delistSubject(bytes32 subjectId) internal {
+        vm.prank(regAdmin);
+        registry.involuntaryDelist(subjectId);
+    }
+
+    function test_ForceSettleSubject_HappyPath_AfterInvoluntaryDelist() public {
+        _delistSubject(SUBJECT_ID);
+        vm.expectEmit(true, false, true, true, address(engine));
+        emit IPerpEngine.SubjectForceSettled(SUBJECT_ID, 110 * ONE_18, governance);
+        vm.prank(governance);
+        engine.forceSettleSubject(SUBJECT_ID, 110 * ONE_18);
+
+        assertTrue(engine.isForceSettled(SUBJECT_ID));
+        assertEq(engine.settlementMarkOf(SUBJECT_ID), 110 * ONE_18);
+    }
+
+    function test_ForceSettleSubject_HappyPath_AfterDeathConfirmed() public {
+        vm.prank(regAdmin);
+        registry.flagDeathPending(SUBJECT_ID);
+        vm.prank(regAdmin);
+        registry.confirmDeath(SUBJECT_ID);
+        vm.prank(governance);
+        engine.forceSettleSubject(SUBJECT_ID, 100 * ONE_18);
+        assertTrue(engine.isForceSettled(SUBJECT_ID));
+    }
+
+    function test_ForceSettleSubject_HappyPath_AfterDelistingWindow() public {
+        vm.prank(regAdmin);
+        registry.requestDelisting(SUBJECT_ID);
+        vm.warp(block.timestamp + 7 days);
+        registry.forceSettle(SUBJECT_ID);
+        vm.prank(governance);
+        engine.forceSettleSubject(SUBJECT_ID, 100 * ONE_18);
+        assertTrue(engine.isForceSettled(SUBJECT_ID));
+    }
+
+    function test_ForceSettleSubject_RevertOnNonGovernance() public {
+        _delistSubject(SUBJECT_ID);
+        vm.prank(stranger);
+        vm.expectRevert(abi.encodeWithSelector(IPerpEngine.Unauthorized.selector, stranger));
+        engine.forceSettleSubject(SUBJECT_ID, 100 * ONE_18);
+    }
+
+    function test_ForceSettleSubject_RevertOnActiveStatus() public {
+        vm.prank(governance);
+        vm.expectRevert(abi.encodeWithSelector(IPerpEngine.SubjectNotDelisted.selector, SUBJECT_ID));
+        engine.forceSettleSubject(SUBJECT_ID, 100 * ONE_18);
+    }
+
+    function test_ForceSettleSubject_RevertOnDeathPendingNotConfirmed() public {
+        vm.prank(regAdmin);
+        registry.flagDeathPending(SUBJECT_ID);
+        vm.prank(governance);
+        vm.expectRevert(abi.encodeWithSelector(IPerpEngine.SubjectNotDelisted.selector, SUBJECT_ID));
+        engine.forceSettleSubject(SUBJECT_ID, 100 * ONE_18);
+    }
+
+    function test_ForceSettleSubject_RevertOnDoubleCall() public {
+        _delistSubject(SUBJECT_ID);
+        vm.prank(governance);
+        engine.forceSettleSubject(SUBJECT_ID, 100 * ONE_18);
+        vm.prank(governance);
+        vm.expectRevert(abi.encodeWithSelector(IPerpEngine.SubjectAlreadyForceSettled.selector, SUBJECT_ID));
+        engine.forceSettleSubject(SUBJECT_ID, 110 * ONE_18);
+    }
+
+    function test_ForceSettleSubject_RevertOnZeroMark() public {
+        _delistSubject(SUBJECT_ID);
+        vm.prank(governance);
+        vm.expectRevert(abi.encodeWithSelector(IPerpEngine.MarkValueOutOfRange.selector, uint256(0)));
+        engine.forceSettleSubject(SUBJECT_ID, 0);
+    }
+
+    function test_ForceSettleSubject_RevertOnMarkAboveMax() public {
+        _delistSubject(SUBJECT_ID);
+        vm.prank(governance);
+        vm.expectRevert(
+            abi.encodeWithSelector(IPerpEngine.MarkValueOutOfRange.selector, uint256(1e36 + 1))
+        );
+        engine.forceSettleSubject(SUBJECT_ID, 1e36 + 1);
+    }
+
+    function test_ClosePosition_RevertOnForceSettled() public {
+        _open(_baseOpenParams());
+        _delistSubject(SUBJECT_ID);
+        vm.prank(governance);
+        engine.forceSettleSubject(SUBJECT_ID, 100 * ONE_18);
+        vm.prank(trader);
+        vm.expectRevert(abi.encodeWithSelector(IPerpEngine.SubjectIsForceSettled.selector, SUBJECT_ID));
+        engine.closePosition(_baseCloseParams());
+    }
+
+    function test_AddCollateral_RevertOnForceSettled() public {
+        _open(_baseOpenParams());
+        _delistSubject(SUBJECT_ID);
+        vm.prank(governance);
+        engine.forceSettleSubject(SUBJECT_ID, 100 * ONE_18);
+        vm.prank(trader);
+        vm.expectRevert(abi.encodeWithSelector(IPerpEngine.SubjectIsForceSettled.selector, SUBJECT_ID));
+        engine.addCollateral(SUBJECT_ID, 1_000 * ONE_USDC);
+    }
+
+    function test_RemoveCollateral_RevertOnForceSettled() public {
+        _open(_baseOpenParams());
+        _delistSubject(SUBJECT_ID);
+        vm.prank(governance);
+        engine.forceSettleSubject(SUBJECT_ID, 100 * ONE_18);
+        vm.prank(trader);
+        vm.expectRevert(abi.encodeWithSelector(IPerpEngine.SubjectIsForceSettled.selector, SUBJECT_ID));
+        engine.removeCollateral(SUBJECT_ID, 100 * ONE_USDC);
+    }
+
+    function test_CloseAtForcedSettlement_HappyPath_NoMove() public {
+        _open(_baseOpenParams());
+        _delistSubject(SUBJECT_ID);
+        vm.prank(governance);
+        engine.forceSettleSubject(SUBJECT_ID, INITIAL_MARK);
+
+        uint256 traderBefore = usdc.balanceOf(trader);
+        vm.prank(trader);
+        int256 pnl = engine.closeAtForcedSettlement(SUBJECT_ID);
+        assertEq(pnl, 0);
+        // No fee on forced settlement — trader gets full collateral back
+        assertEq(usdc.balanceOf(trader) - traderBefore, 10_000 * ONE_USDC);
+    }
+
+    function test_CloseAtForcedSettlement_HappyPath_LongProfit() public {
+        _open(_baseOpenParams());
+        _delistSubject(SUBJECT_ID);
+        vm.prank(governance);
+        engine.forceSettleSubject(SUBJECT_ID, 110 * ONE_18); // +10% → +$5K on $50K notional
+
+        uint256 traderBefore = usdc.balanceOf(trader);
+        vm.prank(trader);
+        int256 pnl = engine.closeAtForcedSettlement(SUBJECT_ID);
+        assertGt(pnl, 0);
+        // Collat $10K + ~$5K profit, zero fee
+        assertEq(usdc.balanceOf(trader) - traderBefore, 15_000 * ONE_USDC);
+    }
+
+    function test_CloseAtForcedSettlement_HappyPath_LongLoss() public {
+        _open(_baseOpenParams());
+        _delistSubject(SUBJECT_ID);
+        vm.prank(governance);
+        engine.forceSettleSubject(SUBJECT_ID, 95 * ONE_18); // -5% → -$2.5K
+
+        uint256 traderBefore = usdc.balanceOf(trader);
+        vm.prank(trader);
+        int256 pnl = engine.closeAtForcedSettlement(SUBJECT_ID);
+        assertLt(pnl, 0);
+        assertEq(usdc.balanceOf(trader) - traderBefore, 7_500 * ONE_USDC);
+    }
+
+    function test_CloseAtForcedSettlement_HappyPath_Short() public {
+        IPerpEngine.OpenParams memory p = _baseOpenParams();
+        p.side = IPerpEngine.Side.SHORT;
+        _open(p);
+        _delistSubject(SUBJECT_ID);
+        vm.prank(governance);
+        engine.forceSettleSubject(SUBJECT_ID, 90 * ONE_18); // -10% → +$5K for short
+
+        vm.prank(trader);
+        int256 pnl = engine.closeAtForcedSettlement(SUBJECT_ID);
+        assertGt(pnl, 0);
+    }
+
+    function test_CloseAtForcedSettlement_RevertOnNotForceSettled() public {
+        _open(_baseOpenParams());
+        vm.prank(trader);
+        vm.expectRevert(abi.encodeWithSelector(IPerpEngine.SubjectNotForceSettled.selector, SUBJECT_ID));
+        engine.closeAtForcedSettlement(SUBJECT_ID);
+    }
+
+    function test_CloseAtForcedSettlement_RevertOnNoPosition() public {
+        _delistSubject(SUBJECT_ID);
+        vm.prank(governance);
+        engine.forceSettleSubject(SUBJECT_ID, 100 * ONE_18);
+        vm.prank(trader);
+        vm.expectRevert(abi.encodeWithSelector(IPerpEngine.PositionNotOpen.selector, SUBJECT_ID));
+        engine.closeAtForcedSettlement(SUBJECT_ID);
+    }
+
+    function test_CloseAtForcedSettlement_RevertOnUnderwater() public {
+        _open(_baseOpenParams());
+        _delistSubject(SUBJECT_ID);
+        // Force-settle at -25% → -$12.5K loss on $10K collat → underwater
+        vm.prank(governance);
+        engine.forceSettleSubject(SUBJECT_ID, 75 * ONE_18);
+        vm.prank(trader);
+        vm.expectRevert();
+        engine.closeAtForcedSettlement(SUBJECT_ID);
+    }
+
+    function test_CloseAtForcedSettlement_IgnoresStaleness() public {
+        _open(_baseOpenParams());
+        _delistSubject(SUBJECT_ID);
+        vm.prank(governance);
+        engine.forceSettleSubject(SUBJECT_ID, INITIAL_MARK);
+        // Let the live mark go stale; capture is canonical, so close still works
+        vm.warp(block.timestamp + 1 hours);
+        vm.prank(trader);
+        engine.closeAtForcedSettlement(SUBJECT_ID);
+        assertEq(engine.positionIdOf(trader, SUBJECT_ID), bytes32(0));
+    }
+
+    function test_CloseAtForcedSettlement_NotBlockedByGlobalHalt() public {
+        _open(_baseOpenParams());
+        _delistSubject(SUBJECT_ID);
+        vm.prank(governance);
+        engine.forceSettleSubject(SUBJECT_ID, INITIAL_MARK);
+        vm.prank(governance);
+        engine.setGlobalHalt(true);
+        vm.prank(trader);
+        engine.closeAtForcedSettlement(SUBJECT_ID); // succeeds despite halt
+    }
+
+    function test_CloseAtForcedSettlement_OiAndExposureCleared() public {
+        _open(_baseOpenParams());
+        _delistSubject(SUBJECT_ID);
+        vm.prank(governance);
+        engine.forceSettleSubject(SUBJECT_ID, INITIAL_MARK);
+        vm.prank(trader);
+        engine.closeAtForcedSettlement(SUBJECT_ID);
+        (uint256 longOI, uint256 shortOI) = engine.openInterestOf(SUBJECT_ID);
+        assertEq(longOI, 0);
+        assertEq(shortOI, 0);
+        (uint256 totalNotional,,) = engine.exposureOf(trader);
+        assertEq(totalNotional, 0);
+    }
+
+    function test_CloseAtForcedSettlement_TwoTradersIndependent() public {
+        // Open two positions on the same subject (2 different traders), then force-settle.
+        IPerpEngine.OpenParams memory p = _baseOpenParams();
+        p.sizeNotional = 20_000 * ONE_USDC;
+        p.collateralAmount = 4_000 * ONE_USDC;
+        _open(p);
+        vm.prank(trader2);
+        engine.openPosition(p);
+
+        _delistSubject(SUBJECT_ID);
+        vm.prank(governance);
+        engine.forceSettleSubject(SUBJECT_ID, INITIAL_MARK);
+
+        vm.prank(trader);
+        engine.closeAtForcedSettlement(SUBJECT_ID);
+        // trader2 claims independently later
+        vm.warp(block.timestamp + 30 minutes);
+        vm.prank(trader2);
+        engine.closeAtForcedSettlement(SUBJECT_ID);
+
+        assertEq(engine.positionIdOf(trader, SUBJECT_ID), bytes32(0));
+        assertEq(engine.positionIdOf(trader2, SUBJECT_ID), bytes32(0));
+    }
+
+    function test_OpenPosition_BlockedOnForceSettledSubject() public {
+        // A delisted subject is already blocked by requireTradeable, but verify the chain.
+        _delistSubject(SUBJECT_ID);
+        vm.prank(governance);
+        engine.forceSettleSubject(SUBJECT_ID, INITIAL_MARK);
+        vm.prank(trader);
+        vm.expectRevert(); // requireTradeable rejects DELISTED status
+        engine.openPosition(_baseOpenParams());
+    }
+
+    // ------------------------------------------------------------------------------------------
+    // Fix #11 — setLpRebatePct
+    // ------------------------------------------------------------------------------------------
+
+    function test_LpRebatePct_DefaultIs40() public view {
+        assertEq(engine.lpRebatePct(), 40);
+    }
+
+    function test_SetLpRebatePct_HappyPath_AtMin() public {
+        vm.expectEmit(false, false, false, true, address(engine));
+        emit IPerpEngine.LpRebatePctSet(40, 25);
+        vm.prank(governance);
+        engine.setLpRebatePct(25);
+        assertEq(engine.lpRebatePct(), 25);
+    }
+
+    function test_SetLpRebatePct_HappyPath_AtMax() public {
+        vm.prank(governance);
+        engine.setLpRebatePct(50);
+        assertEq(engine.lpRebatePct(), 50);
+    }
+
+    function test_SetLpRebatePct_RevertBelowMin() public {
+        vm.prank(governance);
+        vm.expectRevert(abi.encodeWithSelector(IPerpEngine.LpRebatePctOutOfRange.selector, uint8(24)));
+        engine.setLpRebatePct(24);
+    }
+
+    function test_SetLpRebatePct_RevertAboveMax() public {
+        vm.prank(governance);
+        vm.expectRevert(abi.encodeWithSelector(IPerpEngine.LpRebatePctOutOfRange.selector, uint8(51)));
+        engine.setLpRebatePct(51);
+    }
+
+    function test_SetLpRebatePct_RevertOnNonGovernance() public {
+        vm.prank(stranger);
+        vm.expectRevert(abi.encodeWithSelector(IPerpEngine.Unauthorized.selector, stranger));
+        engine.setLpRebatePct(35);
+    }
+
+    function test_FeeSplit_RespectsRebatePct_AtOpen() public {
+        vm.prank(governance);
+        engine.setLpRebatePct(30);
+
+        uint256 freeBefore = vault.freeAssets();
+        uint256 insBefore = vault.insuranceFundBalance();
+        uint256 accruedBefore = vault.accruedFees();
+        IPerpEngine.OpenParams memory p = _baseOpenParams();
+        _open(p);
+
+        uint256 fee = (p.sizeNotional * 750) / 1_000_000;
+        uint256 expectedRebate = (fee * 30) / 100;
+        uint256 expectedInsurance = (fee * 50) / 100;
+        uint256 expectedResidual = fee - expectedRebate - expectedInsurance;
+
+        assertEq(vault.freeAssets() - freeBefore, expectedRebate);
+        assertEq(vault.insuranceFundBalance() - insBefore, expectedInsurance);
+        assertEq(vault.accruedFees() - accruedBefore, expectedResidual);
+    }
+
+    function test_FeeSplit_AtMaxRebate_ResidualIsZero() public {
+        vm.prank(governance);
+        engine.setLpRebatePct(50);
+        uint256 accruedBefore = vault.accruedFees();
+        _open(_baseOpenParams());
+        // 50 + 50 = 100% — residual is zero
+        assertEq(vault.accruedFees(), accruedBefore);
+    }
+
+    function test_FeeSplit_AtMinRebate_ResidualIsMaxed() public {
+        vm.prank(governance);
+        engine.setLpRebatePct(25);
+        uint256 accruedBefore = vault.accruedFees();
+        IPerpEngine.OpenParams memory p = _baseOpenParams();
+        _open(p);
+        uint256 fee = (p.sizeNotional * 750) / 1_000_000;
+        uint256 expectedResidual = fee - (fee * 25) / 100 - (fee * 50) / 100;
+        assertEq(vault.accruedFees() - accruedBefore, expectedResidual);
+    }
+
+    function test_FeeSplit_RespectsRebatePct_AtClose() public {
+        _open(_baseOpenParams());
+        vm.prank(governance);
+        engine.setLpRebatePct(35);
+
+        uint256 insBefore = vault.insuranceFundBalance();
+        uint256 accruedBefore = vault.accruedFees();
+        vm.prank(trader);
+        engine.closePosition(_baseCloseParams());
+
+        // Close fee = full notional × taker rate
+        uint256 closeNotional = 50_000 * ONE_USDC;
+        uint256 fee = (closeNotional * 750) / 1_000_000;
+        uint256 expectedRebate = (fee * 35) / 100;
+        uint256 expectedInsurance = (fee * 50) / 100;
+        uint256 expectedResidual = fee - expectedRebate - expectedInsurance;
+
+        assertEq(vault.insuranceFundBalance() - insBefore, expectedInsurance);
+        assertEq(vault.accruedFees() - accruedBefore, expectedResidual);
+    }
+
+    // ------------------------------------------------------------------------------------------
     // UUPS
     // ------------------------------------------------------------------------------------------
 

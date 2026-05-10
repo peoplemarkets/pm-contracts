@@ -928,6 +928,111 @@ contract SubjectRegistryTest is Test {
     }
 
     // ------------------------------------------------------------------------------------------
+    // Fix #8 — auto-pause expiry
+    // ------------------------------------------------------------------------------------------
+
+    function test_SetAutoPaused_WritesExpiry() public {
+        _list();
+        uint64 before = uint64(block.timestamp);
+        vm.prank(guardian);
+        registry.setAutoPaused(SUBJECT_ID, 1);
+        assertEq(registry.autoPauseExpiresAt(SUBJECT_ID), before + 30);
+    }
+
+    function test_UnpauseAuto_GuardianBeforeDeadline() public {
+        _setStatusTo(ISubjectRegistry.SubjectStatus.AUTO_PAUSED);
+        vm.warp(block.timestamp + 1);
+        vm.prank(guardian);
+        registry.unpauseAuto(SUBJECT_ID);
+        assertEq(uint8(registry.statusOf(SUBJECT_ID)), uint8(ISubjectRegistry.SubjectStatus.ACTIVE));
+        assertEq(registry.autoPauseExpiresAt(SUBJECT_ID), 0);
+    }
+
+    function test_UnpauseAuto_PermissionlessAfterDeadline() public {
+        _setStatusTo(ISubjectRegistry.SubjectStatus.AUTO_PAUSED);
+        uint64 readyAt = registry.autoPauseExpiresAt(SUBJECT_ID);
+        vm.warp(uint256(readyAt) + 1);
+        vm.prank(stranger);
+        registry.unpauseAuto(SUBJECT_ID);
+        assertEq(uint8(registry.statusOf(SUBJECT_ID)), uint8(ISubjectRegistry.SubjectStatus.ACTIVE));
+    }
+
+    function test_UnpauseAuto_PermissionlessAtExactDeadline() public {
+        _setStatusTo(ISubjectRegistry.SubjectStatus.AUTO_PAUSED);
+        uint64 readyAt = registry.autoPauseExpiresAt(SUBJECT_ID);
+        vm.warp(uint256(readyAt));
+        vm.prank(stranger);
+        registry.unpauseAuto(SUBJECT_ID);
+        assertEq(uint8(registry.statusOf(SUBJECT_ID)), uint8(ISubjectRegistry.SubjectStatus.ACTIVE));
+    }
+
+    function test_UnpauseAuto_RevertOnStrangerBeforeDeadline() public {
+        _setStatusTo(ISubjectRegistry.SubjectStatus.AUTO_PAUSED);
+        vm.prank(stranger);
+        vm.expectRevert(abi.encodeWithSelector(ISubjectRegistry.Unauthorized.selector, stranger));
+        registry.unpauseAuto(SUBJECT_ID);
+    }
+
+    function test_AutoPauseRedeposit_ResetsDeadline() public {
+        _setStatusTo(ISubjectRegistry.SubjectStatus.AUTO_PAUSED);
+        uint64 firstDeadline = registry.autoPauseExpiresAt(SUBJECT_ID);
+        // unpause early via guardian
+        vm.warp(uint256(firstDeadline) - 5);
+        vm.prank(guardian);
+        registry.unpauseAuto(SUBJECT_ID);
+
+        // re-pause; new deadline should reflect current time, NOT carry the old one
+        vm.warp(block.timestamp + 100);
+        vm.prank(guardian);
+        registry.setAutoPaused(SUBJECT_ID, 1);
+        uint64 secondDeadline = registry.autoPauseExpiresAt(SUBJECT_ID);
+        assertEq(secondDeadline, uint64(block.timestamp + 30));
+        assertGt(secondDeadline, firstDeadline);
+    }
+
+    function test_UnpauseAuto_ClearsDeadline() public {
+        _setStatusTo(ISubjectRegistry.SubjectStatus.AUTO_PAUSED);
+        vm.warp(block.timestamp + 31);
+        vm.prank(stranger);
+        registry.unpauseAuto(SUBJECT_ID);
+        assertEq(registry.autoPauseExpiresAt(SUBJECT_ID), 0);
+    }
+
+    function test_UnpauseAuto_RevertOnCooldown() public {
+        _setStatusTo(ISubjectRegistry.SubjectStatus.COOLDOWN);
+        vm.warp(block.timestamp + 1000);
+        vm.prank(stranger);
+        vm.expectRevert(
+            abi.encodeWithSelector(
+                ISubjectRegistry.InvalidStatusTransition.selector,
+                ISubjectRegistry.SubjectStatus.COOLDOWN,
+                ISubjectRegistry.SubjectStatus.ACTIVE
+            )
+        );
+        registry.unpauseAuto(SUBJECT_ID);
+    }
+
+    function test_UnpauseAuto_RevertOnFrozen() public {
+        _setStatusTo(ISubjectRegistry.SubjectStatus.FROZEN);
+        vm.warp(block.timestamp + 1000);
+        vm.prank(stranger);
+        vm.expectRevert(
+            abi.encodeWithSelector(
+                ISubjectRegistry.InvalidStatusTransition.selector,
+                ISubjectRegistry.SubjectStatus.FROZEN,
+                ISubjectRegistry.SubjectStatus.ACTIVE
+            )
+        );
+        registry.unpauseAuto(SUBJECT_ID);
+    }
+
+    function test_AutoPauseExpiresAt_View_MatchesStruct() public {
+        _setStatusTo(ISubjectRegistry.SubjectStatus.AUTO_PAUSED);
+        ISubjectRegistry.Subject memory s = registry.subjectOf(SUBJECT_ID);
+        assertEq(s.autoPauseExpiresAt, registry.autoPauseExpiresAt(SUBJECT_ID));
+    }
+
+    // ------------------------------------------------------------------------------------------
     // UUPS upgrade authorization
     // ------------------------------------------------------------------------------------------
 

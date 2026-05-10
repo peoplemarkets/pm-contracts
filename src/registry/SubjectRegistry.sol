@@ -48,6 +48,12 @@ contract SubjectRegistry is Initializable, UUPSUpgradeable, ISubjectRegistry {
     ///      confirmation. If unconfirmed at 24h, the halt lifts and the subject returns to ACTIVE.
     uint32 public constant DEATH_PENDING_WINDOW = 24 hours;
 
+    /// @dev Spec §3 line 169: "5% mark move in 30s | 30s pause; auto-resume". The deadline is
+    ///      stored on the subject; `unpauseAuto` is permissionless once it passes (anyone can
+    ///      cycle the subject back to ACTIVE), and remains pauseGuardian-only before the deadline
+    ///      for fast manual unpause if the operator decides the trigger was spurious.
+    uint32 public constant AUTO_PAUSE_DURATION = 30 seconds;
+
     /// @dev KYC tiers per spec §3 are T1–T3 (1, 2, 3). 0 means unverified / no tier.
     uint8 public constant MAX_KYC_TIER = 3;
 
@@ -261,8 +267,20 @@ contract SubjectRegistry is Initializable, UUPSUpgradeable, ISubjectRegistry {
     }
 
     /// @inheritdoc ISubjectRegistry
-    function unpauseAuto(bytes32 subjectId) external onlyPauseGuardian {
-        _unpauseFrom(subjectId, SubjectStatus.AUTO_PAUSED);
+    /// @dev Spec §3 line 169 ("auto-resume"): permissionless once `autoPauseExpiresAt` has passed;
+    ///      pauseGuardian-only before, for cases where operations decides the trigger was spurious.
+    function unpauseAuto(bytes32 subjectId) external {
+        RegistryStorage.Layout storage s = RegistryStorage.load();
+        Subject storage subj = s.subjects[subjectId];
+        if (subj.status != SubjectStatus.AUTO_PAUSED) {
+            revert InvalidStatusTransition(subj.status, SubjectStatus.ACTIVE);
+        }
+        bool deadlinePassed = block.timestamp >= uint256(subj.autoPauseExpiresAt);
+        if (!deadlinePassed && !s.pauseGuardians[msg.sender]) revert Unauthorized(msg.sender);
+        subj.autoPauseExpiresAt = 0;
+        subj.status = SubjectStatus.ACTIVE;
+        subj.statusChangedAt = uint64(block.timestamp);
+        emit SubjectStatusChanged(subjectId, SubjectStatus.AUTO_PAUSED, SubjectStatus.ACTIVE);
     }
 
     /// @inheritdoc ISubjectRegistry
@@ -284,6 +302,11 @@ contract SubjectRegistry is Initializable, UUPSUpgradeable, ISubjectRegistry {
         if (subj.status != SubjectStatus.ACTIVE) revert InvalidStatusTransition(subj.status, newStatus);
         subj.status = newStatus;
         subj.statusChangedAt = uint64(block.timestamp);
+        // AUTO_PAUSED carries a 30s permissionless-unpause deadline. Re-entering AUTO_PAUSED
+        // (after a manual unpause-then-pause cycle) resets the deadline by overwriting.
+        if (newStatus == SubjectStatus.AUTO_PAUSED) {
+            subj.autoPauseExpiresAt = uint64(block.timestamp + AUTO_PAUSE_DURATION);
+        }
         emit PauseTriggered(subjectId, newStatus, reasonCode);
         emit SubjectStatusChanged(subjectId, SubjectStatus.ACTIVE, newStatus);
     }
@@ -429,6 +452,11 @@ contract SubjectRegistry is Initializable, UUPSUpgradeable, ISubjectRegistry {
     /// @inheritdoc ISubjectRegistry
     function kycTierOf(address trader) external view returns (uint8) {
         return RegistryStorage.load().kycTier[trader];
+    }
+
+    /// @inheritdoc ISubjectRegistry
+    function autoPauseExpiresAt(bytes32 subjectId) external view returns (uint64) {
+        return RegistryStorage.load().subjects[subjectId].autoPauseExpiresAt;
     }
 
     /// @inheritdoc ISubjectRegistry

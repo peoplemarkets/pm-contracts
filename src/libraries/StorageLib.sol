@@ -56,6 +56,12 @@ library PerpStorage {
         uint32 timelockDelay;
         address pendingGovernance;
         uint64 pendingGovernanceActivatesAt;
+        // ---- APPENDED: Fix #11 LP rebate percent (governance-tunable, bounds [25, 50]) ----
+        uint8 lpRebatePct;
+        // ---- APPENDED: Fix #7 forced-settlement state per subject ----
+        // settlementMark is in 1e18 fixed-point (same scale as markPrice).
+        mapping(bytes32 subjectId => uint256) subjectSettlementMark;
+        mapping(bytes32 subjectId => bool) subjectForceSettled;
     }
 
     function load() internal pure returns (Layout storage l) {
@@ -175,6 +181,15 @@ library LiquidationStorage {
 library VaultStorage {
     bytes32 internal constant SLOT = keccak256("people.markets.vault.v1");
 
+    /// @dev Fix #5: governance-timelocked withdrawal of `accruedFees` (residual treasury bucket).
+    ///      Single in-flight; matches the `pendingPerpEngine` pattern.
+    struct PendingFeeWithdrawal {
+        address recipient;
+        uint256 amount;
+        uint64 activatesAt;
+        bool exists;
+    }
+
     /// @dev `freeAssets` is computed (not stored): balance(USDC) − positionCollateral −
     ///      insuranceFundBalance − accruedFees. The four storage counters always sum to the
     ///      USDC balance owned by the vault contract (invariant I1). LP shares are priced off
@@ -200,6 +215,10 @@ library VaultStorage {
         // pause flags
         bool depositsPaused;
         bool withdrawalsPaused;
+        // ---- APPENDED: Fix #6 cumulative insurance-fund seed counter (USDC, 6-dec) ----
+        uint256 insuranceSeedDeposited;
+        // ---- APPENDED: Fix #5 pending fee withdrawal (single in-flight) ----
+        PendingFeeWithdrawal pendingFeeWithdrawal;
     }
 
     function load() internal pure returns (Layout storage l) {

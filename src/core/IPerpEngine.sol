@@ -73,6 +73,16 @@ interface IPerpEngine {
     ///         Always sets `markUpdatedAt = block.timestamp` — the writer cannot supply a timestamp.
     function pushMark(bytes32 subjectId, uint256 newMark) external;
 
+    /// @notice Capture a settlement mark for a DELISTED subject. Governance only.
+    /// @dev    SHIM: traders must subsequently call `closeAtForcedSettlement` to claim. No
+    ///         iteration here — push model. The captured mark becomes canonical from this call
+    ///         onward; subsequent live-mark pushes are ignored by the close path.
+    function forceSettleSubject(bytes32 subjectId, uint256 settlementMark) external;
+
+    /// @notice Permissionless close of the caller's position on a force-settled subject. Uses the
+    ///         captured mark, full-close only, ZERO fee (forced settlement is a venue obligation).
+    function closeAtForcedSettlement(bytes32 subjectId) external returns (int256 realizedPnl);
+
     /// @notice Halt all trading globally. Governance only. v0 has no in-contract timelock here so
     ///         emergency response is fast; the operational risk is documented in the contract.
     function setGlobalHalt(bool halted) external;
@@ -92,6 +102,7 @@ interface IPerpEngine {
     function setMarginParams(uint16 imBps, uint16 mmBps, uint16 bufBps, uint16 maxLevBps) external;
     function setKycCaps(uint8 tier, uint256 perSubjectCap, uint256 combinedCap) external;
     function setMarkStaleAfter(uint32 seconds_) external;
+    function setLpRebatePct(uint8 pct) external;
 
     function proposeGovernanceTransfer(address newGovernance) external;
     function activateGovernanceTransfer() external;
@@ -117,6 +128,9 @@ interface IPerpEngine {
     function governance() external view returns (address);
     function timelockDelay() external view returns (uint32);
     function markStaleAfter() external view returns (uint32);
+    function lpRebatePct() external view returns (uint8);
+    function isForceSettled(bytes32 subjectId) external view returns (bool);
+    function settlementMarkOf(bytes32 subjectId) external view returns (uint256);
 
     // ------------------------------------------------------------------------------------------
     // Events
@@ -152,6 +166,15 @@ interface IPerpEngine {
     event MarginParamsSet(uint16 imBps, uint16 mmBps, uint16 bufBps, uint16 maxLevBps);
     event KycCapsSet(uint8 tier, uint256 perSubjectCap, uint256 combinedCap);
     event MarkStaleAfterSet(uint32 seconds_);
+    event LpRebatePctSet(uint8 oldPct, uint8 newPct);
+    event SubjectForceSettled(bytes32 indexed subjectId, uint256 settlementMark, address indexed by);
+    event PositionClosedAtForcedSettlement(
+        bytes32 indexed positionId,
+        address indexed trader,
+        bytes32 indexed subjectId,
+        int256 realizedPnl,
+        uint256 returnedToTrader
+    );
     event GovernanceTransferProposed(address indexed newGovernance, uint64 activatesAt);
     event GovernanceTransferActivated(address indexed oldGovernance, address indexed newGovernance);
     event GovernanceTransferCancelled(address indexed pendingGovernance);
@@ -187,4 +210,9 @@ interface IPerpEngine {
     error MarkValueOutOfRange(uint256 value);
     error MarkWriterAlreadyAdded(address writer);
     error MarkWriterNotFound(address writer);
+    error LpRebatePctOutOfRange(uint8 pct);
+    error SubjectNotDelisted(bytes32 subjectId);
+    error SubjectAlreadyForceSettled(bytes32 subjectId);
+    error SubjectNotForceSettled(bytes32 subjectId);
+    error SubjectIsForceSettled(bytes32 subjectId);
 }

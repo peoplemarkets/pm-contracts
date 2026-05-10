@@ -46,6 +46,11 @@ contract LPVault is Initializable, UUPSUpgradeable, ERC4626Upgradeable, Reentran
     uint32 public constant MAX_TIMELOCK_DELAY = 30 days;
     uint8 internal constant DECIMALS_OFFSET = 6;
 
+    /// @dev Cumulative ceiling on `seedInsurance`. 10× the spec's $1M initial seed (§3 line 159)
+    ///      gives generous headroom for the floor-mechanic top-up (§3 line 162) without making
+    ///      this a daily lever. Lifting the cap requires a UUPS upgrade — high friction by design.
+    uint256 public constant MAX_INSURANCE_SEED = 10_000_000 * 1e6;
+
     /// @custom:oz-upgrades-unsafe-allow constructor
     constructor() {
         _disableInitializers();
@@ -313,6 +318,73 @@ contract LPVault is Initializable, UUPSUpgradeable, ERC4626Upgradeable, Reentran
     }
 
     // ------------------------------------------------------------------------------------------
+    // Insurance fund seeding (Fix #6) — governance only, no timelock, capped cumulatively
+    // ------------------------------------------------------------------------------------------
+
+    /// @inheritdoc ILPVault
+    function seedInsurance(uint256 amount) external nonReentrant onlyGovernance {
+        if (amount == 0) revert AmountZero();
+        VaultStorage.Layout storage s = VaultStorage.load();
+        uint256 newCumulative = s.insuranceSeedDeposited + amount;
+        if (newCumulative > MAX_INSURANCE_SEED) {
+            revert InsuranceSeedCapExceeded(newCumulative, MAX_INSURANCE_SEED);
+        }
+        IERC20(asset()).safeTransferFrom(msg.sender, address(this), amount);
+        s.insuranceFundBalance += amount;
+        s.insuranceSeedDeposited = newCumulative;
+        emit InsuranceSeeded(msg.sender, amount, newCumulative);
+    }
+
+    // ------------------------------------------------------------------------------------------
+    // Treasury fee withdrawal (Fix #5) — governance, timelocked
+    // ------------------------------------------------------------------------------------------
+
+    /// @inheritdoc ILPVault
+    /// @dev Spec §3 fee structure leaves a 10% residual unallocated; we route it to `accruedFees`
+    ///      and expose it via this timelocked withdrawal flow. Single in-flight per the
+    ///      `pendingPerpEngine` pattern. Pause flags do NOT gate this — treasury operations are
+    ///      independent of LP deposit/withdrawal halts.
+    function proposeFeeWithdrawal(address recipient, uint256 amount) external onlyGovernance {
+        if (recipient == address(0)) revert InvalidConfig();
+        if (amount == 0) revert AmountZero();
+        VaultStorage.Layout storage s = VaultStorage.load();
+        if (amount > s.accruedFees) revert InsufficientAccruedFees(amount, s.accruedFees);
+        if (s.pendingFeeWithdrawal.exists) revert PendingProposalExists();
+        uint64 activatesAt = uint64(block.timestamp + s.timelockDelay);
+        s.pendingFeeWithdrawal = VaultStorage.PendingFeeWithdrawal({
+            recipient: recipient,
+            amount: amount,
+            activatesAt: activatesAt,
+            exists: true
+        });
+        emit FeeWithdrawalProposed(recipient, amount, activatesAt);
+    }
+
+    /// @inheritdoc ILPVault
+    function activateFeeWithdrawal() external nonReentrant {
+        VaultStorage.Layout storage s = VaultStorage.load();
+        VaultStorage.PendingFeeWithdrawal memory p = s.pendingFeeWithdrawal;
+        if (!p.exists) revert NoPendingProposal();
+        if (block.timestamp < p.activatesAt) revert TimelockNotElapsed(p.activatesAt);
+        // Defensive re-check: between propose and activate the residual could have moved (it
+        // only ever grows in v0, but a future contract version could decrement it).
+        if (p.amount > s.accruedFees) revert InsufficientAccruedFees(p.amount, s.accruedFees);
+        s.accruedFees -= p.amount;
+        delete s.pendingFeeWithdrawal;
+        IERC20(asset()).safeTransfer(p.recipient, p.amount);
+        emit FeeWithdrawalActivated(p.recipient, p.amount);
+    }
+
+    /// @inheritdoc ILPVault
+    function cancelFeeWithdrawal() external onlyGovernance {
+        VaultStorage.Layout storage s = VaultStorage.load();
+        VaultStorage.PendingFeeWithdrawal memory p = s.pendingFeeWithdrawal;
+        if (!p.exists) revert NoPendingProposal();
+        delete s.pendingFeeWithdrawal;
+        emit FeeWithdrawalCancelled(p.recipient, p.amount);
+    }
+
+    // ------------------------------------------------------------------------------------------
     // Governance: setPerpEngine (timelocked)
     // ------------------------------------------------------------------------------------------
 
@@ -469,6 +541,19 @@ contract LPVault is Initializable, UUPSUpgradeable, ERC4626Upgradeable, Reentran
     function pendingGovernance() external view returns (address account, uint64 activatesAt) {
         VaultStorage.Layout storage s = VaultStorage.load();
         return (s.pendingGovernance, s.pendingGovernanceActivatesAt);
+    }
+
+    function insuranceSeedDeposited() external view returns (uint256) {
+        return VaultStorage.load().insuranceSeedDeposited;
+    }
+
+    function pendingFeeWithdrawal()
+        external
+        view
+        returns (address recipient, uint256 amount, uint64 activatesAt, bool exists)
+    {
+        VaultStorage.PendingFeeWithdrawal memory p = VaultStorage.load().pendingFeeWithdrawal;
+        return (p.recipient, p.amount, p.activatesAt, p.exists);
     }
 
     // ------------------------------------------------------------------------------------------

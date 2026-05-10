@@ -800,6 +800,303 @@ contract LPVaultTest is Test {
     // UUPS
     // ------------------------------------------------------------------------------------------
 
+    // ------------------------------------------------------------------------------------------
+    // Fix #6 — seedInsurance
+    // ------------------------------------------------------------------------------------------
+
+    function test_SeedInsurance_HappyPath() public {
+        usdc.mint(governance, 5_000_000 * ONE_USDC);
+        vm.prank(governance);
+        usdc.approve(address(vault), type(uint256).max);
+
+        uint256 freeBefore = vault.freeAssets();
+        uint256 insBefore = vault.insuranceFundBalance();
+
+        vm.expectEmit(true, false, false, true, address(vault));
+        emit ILPVault.InsuranceSeeded(governance, 1_000_000 * ONE_USDC, 1_000_000 * ONE_USDC);
+        vm.prank(governance);
+        vault.seedInsurance(1_000_000 * ONE_USDC);
+
+        assertEq(vault.insuranceFundBalance() - insBefore, 1_000_000 * ONE_USDC);
+        assertEq(vault.insuranceSeedDeposited(), 1_000_000 * ONE_USDC);
+        // freeAssets unchanged: balance and bookkeeper both rise by the same amount
+        assertEq(vault.freeAssets(), freeBefore);
+    }
+
+    function test_SeedInsurance_RevertOnNonGovernance() public {
+        usdc.mint(stranger, 1_000_000 * ONE_USDC);
+        vm.prank(stranger);
+        usdc.approve(address(vault), type(uint256).max);
+        vm.prank(stranger);
+        vm.expectRevert(abi.encodeWithSelector(ILPVault.Unauthorized.selector, stranger));
+        vault.seedInsurance(1_000 * ONE_USDC);
+    }
+
+    function test_SeedInsurance_RevertOnZero() public {
+        vm.prank(governance);
+        vm.expectRevert(ILPVault.AmountZero.selector);
+        vault.seedInsurance(0);
+    }
+
+    function test_SeedInsurance_RevertOnCapExceededFirstCall() public {
+        uint256 cap = vault.MAX_INSURANCE_SEED();
+        usdc.mint(governance, cap + ONE_USDC);
+        vm.prank(governance);
+        usdc.approve(address(vault), type(uint256).max);
+
+        vm.prank(governance);
+        vm.expectRevert(
+            abi.encodeWithSelector(ILPVault.InsuranceSeedCapExceeded.selector, cap + ONE_USDC, cap)
+        );
+        vault.seedInsurance(cap + ONE_USDC);
+    }
+
+    function test_SeedInsurance_RevertOnCumulativeCapExceeded() public {
+        uint256 cap = vault.MAX_INSURANCE_SEED();
+        usdc.mint(governance, cap + ONE_USDC);
+        vm.prank(governance);
+        usdc.approve(address(vault), type(uint256).max);
+
+        vm.prank(governance);
+        vault.seedInsurance(cap - ONE_USDC);
+
+        vm.prank(governance);
+        vm.expectRevert(
+            abi.encodeWithSelector(ILPVault.InsuranceSeedCapExceeded.selector, cap + ONE_USDC, cap)
+        );
+        vault.seedInsurance(2 * ONE_USDC);
+    }
+
+    function test_SeedInsurance_Repeatable() public {
+        usdc.mint(governance, 5_000_000 * ONE_USDC);
+        vm.prank(governance);
+        usdc.approve(address(vault), type(uint256).max);
+
+        vm.prank(governance);
+        vault.seedInsurance(1_000_000 * ONE_USDC);
+        vm.prank(governance);
+        vault.seedInsurance(500_000 * ONE_USDC);
+        assertEq(vault.insuranceFundBalance(), 1_500_000 * ONE_USDC);
+        assertEq(vault.insuranceSeedDeposited(), 1_500_000 * ONE_USDC);
+    }
+
+    function test_SeedInsurance_BalanceInvariantHolds() public {
+        usdc.mint(governance, 1_000_000 * ONE_USDC);
+        vm.prank(governance);
+        usdc.approve(address(vault), type(uint256).max);
+        vm.prank(governance);
+        vault.seedInsurance(1_000_000 * ONE_USDC);
+
+        assertEq(
+            usdc.balanceOf(address(vault)),
+            vault.freeAssets() + vault.positionCollateral() + vault.insuranceFundBalance()
+                + vault.accruedFees()
+        );
+    }
+
+    function test_SeedInsurance_DoesNotInflateLpShares() public {
+        // Alice deposits before the seed; her share-to-asset ratio should not change after seed.
+        vm.prank(alice);
+        uint256 sharesAlice = vault.deposit(USDC_1M, alice);
+        uint256 priceBefore = vault.previewRedeem(sharesAlice);
+
+        usdc.mint(governance, 500_000 * ONE_USDC);
+        vm.prank(governance);
+        usdc.approve(address(vault), type(uint256).max);
+        vm.prank(governance);
+        vault.seedInsurance(500_000 * ONE_USDC);
+
+        uint256 priceAfter = vault.previewRedeem(sharesAlice);
+        assertEq(priceBefore, priceAfter);
+    }
+
+    function test_SeedInsurance_NotGatedByDepositsPaused() public {
+        vm.prank(operator);
+        vault.setDepositsPaused(true);
+
+        usdc.mint(governance, 100 * ONE_USDC);
+        vm.prank(governance);
+        usdc.approve(address(vault), type(uint256).max);
+        vm.prank(governance);
+        vault.seedInsurance(100 * ONE_USDC);
+        assertEq(vault.insuranceFundBalance(), 100 * ONE_USDC);
+    }
+
+    // ------------------------------------------------------------------------------------------
+    // Fix #5 — withdrawAccruedFees (proposed → activated → cancelled)
+    // ------------------------------------------------------------------------------------------
+
+    function _accrueFees(uint256 fee) internal {
+        // pranks vaultPerpEngine to call openPositionFlow; trader pays collat + fee
+        vm.prank(perpEngine);
+        vault.openPositionFlow(trader, 100 * ONE_USDC, fee, (fee * 40) / 100, (fee * 50) / 100);
+    }
+
+    function test_ProposeFeeWithdrawal_HappyPath() public {
+        _accrueFees(100 * ONE_USDC); // residual 10 USDC
+        address recipient = makeAddr("treasury");
+
+        vm.expectEmit(true, false, false, true, address(vault));
+        emit ILPVault.FeeWithdrawalProposed(recipient, 5 * ONE_USDC, uint64(block.timestamp + TIMELOCK_DELAY));
+        vm.prank(governance);
+        vault.proposeFeeWithdrawal(recipient, 5 * ONE_USDC);
+
+        (address r, uint256 a, uint64 t, bool e) = vault.pendingFeeWithdrawal();
+        assertEq(r, recipient);
+        assertEq(a, 5 * ONE_USDC);
+        assertEq(t, uint64(block.timestamp + TIMELOCK_DELAY));
+        assertTrue(e);
+    }
+
+    function test_ProposeFeeWithdrawal_RevertOnNonGovernance() public {
+        _accrueFees(100 * ONE_USDC);
+        vm.prank(stranger);
+        vm.expectRevert(abi.encodeWithSelector(ILPVault.Unauthorized.selector, stranger));
+        vault.proposeFeeWithdrawal(makeAddr("x"), ONE_USDC);
+    }
+
+    function test_ProposeFeeWithdrawal_RevertOnZeroRecipient() public {
+        _accrueFees(100 * ONE_USDC);
+        vm.prank(governance);
+        vm.expectRevert(ILPVault.InvalidConfig.selector);
+        vault.proposeFeeWithdrawal(address(0), ONE_USDC);
+    }
+
+    function test_ProposeFeeWithdrawal_RevertOnZeroAmount() public {
+        _accrueFees(100 * ONE_USDC);
+        vm.prank(governance);
+        vm.expectRevert(ILPVault.AmountZero.selector);
+        vault.proposeFeeWithdrawal(makeAddr("x"), 0);
+    }
+
+    function test_ProposeFeeWithdrawal_RevertOnAmountExceedsAccrued() public {
+        _accrueFees(100 * ONE_USDC);
+        uint256 accrued = vault.accruedFees();
+        vm.prank(governance);
+        vm.expectRevert(
+            abi.encodeWithSelector(ILPVault.InsufficientAccruedFees.selector, accrued + 1, accrued)
+        );
+        vault.proposeFeeWithdrawal(makeAddr("x"), accrued + 1);
+    }
+
+    function test_ProposeFeeWithdrawal_RevertOnPendingExists() public {
+        _accrueFees(100 * ONE_USDC);
+        vm.startPrank(governance);
+        vault.proposeFeeWithdrawal(makeAddr("a"), ONE_USDC);
+        vm.expectRevert(ILPVault.PendingProposalExists.selector);
+        vault.proposeFeeWithdrawal(makeAddr("b"), ONE_USDC);
+        vm.stopPrank();
+    }
+
+    function test_ActivateFeeWithdrawal_HappyPath() public {
+        _accrueFees(100 * ONE_USDC);
+        address recipient = makeAddr("treasury");
+        uint256 amt = 5 * ONE_USDC;
+        vm.prank(governance);
+        vault.proposeFeeWithdrawal(recipient, amt);
+
+        uint256 accruedBefore = vault.accruedFees();
+        uint256 recipBefore = usdc.balanceOf(recipient);
+        vm.warp(block.timestamp + TIMELOCK_DELAY);
+
+        vm.expectEmit(true, false, false, true, address(vault));
+        emit ILPVault.FeeWithdrawalActivated(recipient, amt);
+        vm.prank(stranger); // permissionless
+        vault.activateFeeWithdrawal();
+
+        assertEq(usdc.balanceOf(recipient) - recipBefore, amt);
+        assertEq(accruedBefore - vault.accruedFees(), amt);
+        (,,, bool exists) = vault.pendingFeeWithdrawal();
+        assertFalse(exists);
+    }
+
+    function test_ActivateFeeWithdrawal_BalanceInvariantHolds() public {
+        _accrueFees(100 * ONE_USDC);
+        address recipient = makeAddr("treasury");
+        vm.prank(governance);
+        vault.proposeFeeWithdrawal(recipient, 5 * ONE_USDC);
+        vm.warp(block.timestamp + TIMELOCK_DELAY);
+        vault.activateFeeWithdrawal();
+
+        assertEq(
+            usdc.balanceOf(address(vault)),
+            vault.freeAssets() + vault.positionCollateral() + vault.insuranceFundBalance()
+                + vault.accruedFees()
+        );
+    }
+
+    function test_ActivateFeeWithdrawal_RevertOnNoPending() public {
+        vm.expectRevert(ILPVault.NoPendingProposal.selector);
+        vault.activateFeeWithdrawal();
+    }
+
+    function test_ActivateFeeWithdrawal_RevertBeforeTimelock() public {
+        _accrueFees(100 * ONE_USDC);
+        vm.prank(governance);
+        vault.proposeFeeWithdrawal(makeAddr("x"), ONE_USDC);
+        uint64 readyAt = uint64(block.timestamp + TIMELOCK_DELAY);
+        vm.warp(uint256(readyAt) - 1);
+        vm.expectRevert(abi.encodeWithSelector(ILPVault.TimelockNotElapsed.selector, readyAt));
+        vault.activateFeeWithdrawal();
+    }
+
+    function test_CancelFeeWithdrawal_HappyPath() public {
+        _accrueFees(100 * ONE_USDC);
+        address recipient = makeAddr("treasury");
+        uint256 amt = ONE_USDC;
+        vm.prank(governance);
+        vault.proposeFeeWithdrawal(recipient, amt);
+
+        vm.expectEmit(true, false, false, true, address(vault));
+        emit ILPVault.FeeWithdrawalCancelled(recipient, amt);
+        vm.prank(governance);
+        vault.cancelFeeWithdrawal();
+
+        (,,, bool exists) = vault.pendingFeeWithdrawal();
+        assertFalse(exists);
+    }
+
+    function test_CancelFeeWithdrawal_RevertOnNonGovernance() public {
+        _accrueFees(100 * ONE_USDC);
+        vm.prank(governance);
+        vault.proposeFeeWithdrawal(makeAddr("x"), ONE_USDC);
+        vm.prank(stranger);
+        vm.expectRevert(abi.encodeWithSelector(ILPVault.Unauthorized.selector, stranger));
+        vault.cancelFeeWithdrawal();
+    }
+
+    function test_CancelFeeWithdrawal_RevertOnNoPending() public {
+        vm.prank(governance);
+        vm.expectRevert(ILPVault.NoPendingProposal.selector);
+        vault.cancelFeeWithdrawal();
+    }
+
+    function test_FeeWithdrawal_NotBlockedByWithdrawalsPaused() public {
+        _accrueFees(100 * ONE_USDC);
+        vm.prank(operator);
+        vault.setWithdrawalsPaused(true);
+
+        address recipient = makeAddr("treasury");
+        vm.prank(governance);
+        vault.proposeFeeWithdrawal(recipient, ONE_USDC);
+        vm.warp(block.timestamp + TIMELOCK_DELAY);
+        vault.activateFeeWithdrawal();
+        assertEq(usdc.balanceOf(recipient), ONE_USDC);
+    }
+
+    function test_FeeWithdrawal_FreeAssetsUnchanged() public {
+        _accrueFees(100 * ONE_USDC);
+        uint256 freeBefore = vault.freeAssets();
+
+        vm.prank(governance);
+        vault.proposeFeeWithdrawal(makeAddr("x"), ONE_USDC);
+        vm.warp(block.timestamp + TIMELOCK_DELAY);
+        vault.activateFeeWithdrawal();
+
+        // Both balance and accruedFees drop by the withdrawn amount; freeAssets is unchanged.
+        assertEq(vault.freeAssets(), freeBefore);
+    }
+
     function test_Withdraw_DefensiveCheckRejectsBypassedMaxCap() public {
         // Deploy a harness whose `exposeWithdraw` reaches the internal `_withdraw` directly,
         // bypassing the wrapper's maxWithdraw cap. The defensive freeAssets check should fire.

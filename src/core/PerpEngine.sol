@@ -44,9 +44,13 @@ contract PerpEngine is Initializable, UUPSUpgradeable, ReentrancyGuard, IPerpEng
     uint16 internal constant TAKER_FEE_RATE = 750; // 0.075% per spec §3
     uint16 internal constant MAKER_FEE_RATE = 250; // 0.025%
 
-    /// @dev Spec §3 fee split: 40% LP rebate, 50% insurance, 10% residual treasury.
-    uint8 internal constant LP_REBATE_PCT = 40;
+    /// @dev Spec §3 fee split: 40% LP rebate (default; tunable via `setLpRebatePct` in [25, 50]),
+    ///      50% insurance (pinned), residual = 100 - lpRebatePct - 50 to treasury (`accruedFees`).
+    ///      `lpRebatePct` lives in storage; the spec's 40 → 30% LP-rebate decay over 6 months is
+    ///      executed by governance ratcheting this value down.
     uint8 internal constant INSURANCE_PCT = 50;
+    uint8 internal constant MIN_LP_REBATE_PCT = 25;
+    uint8 internal constant MAX_LP_REBATE_PCT = 50;
 
     uint32 internal constant MIN_TIMELOCK_DELAY = 1 hours;
     uint32 internal constant MAX_TIMELOCK_DELAY = 30 days;
@@ -90,6 +94,7 @@ contract PerpEngine is Initializable, UUPSUpgradeable, ReentrancyGuard, IPerpEng
         perpS.subjectRegistry = subjectRegistry_;
         perpS.lpVault = lpVault_;
         perpS.markStaleAfter = 30 seconds; // spec §1 default
+        perpS.lpRebatePct = 40; // spec §3 starting value
 
         // Margin params seeded with spec §3 defaults; governance can tune later.
         MarginStorage.Layout storage marginS = MarginStorage.load();
@@ -214,6 +219,9 @@ contract PerpEngine is Initializable, UUPSUpgradeable, ReentrancyGuard, IPerpEng
         if (p.sizeFractionBps == 0 || p.sizeFractionBps > BPS_DENOMINATOR) {
             revert InvalidSizeFraction(p.sizeFractionBps);
         }
+        // Once a subject has been force-settled, the canonical price is captured. Trades against
+        // the live mark are no longer meaningful — traders must use `closeAtForcedSettlement`.
+        if (perpS.subjectForceSettled[p.subjectId]) revert SubjectIsForceSettled(p.subjectId);
 
         bytes32 positionId = perpS.openPositionId[msg.sender][p.subjectId];
         if (positionId == bytes32(0)) revert PositionNotOpen(p.subjectId);
@@ -261,7 +269,7 @@ contract PerpEngine is Initializable, UUPSUpgradeable, ReentrancyGuard, IPerpEng
         bool isMaker
     )
         internal
-        pure
+        view
         returns (_CloseValues memory v)
     {
         v.fullClose = sizeFractionBps == BPS_DENOMINATOR;
@@ -289,10 +297,78 @@ contract PerpEngine is Initializable, UUPSUpgradeable, ReentrancyGuard, IPerpEng
     }
 
     /// @inheritdoc IPerpEngine
+    /// @dev Spec §6 line 367/369: forced settlement at last fair mark on death/incapacitation
+    ///      (oracle-confirmed) or involuntary delisting (legal/regulatory). v0 SHIM: governance
+    ///      captures the mark; traders subsequently call `closeAtForcedSettlement` to claim.
+    ///      No on-chain iteration over open positions; ADL queueing is week 14+ (LiquidationEngine).
+    ///
+    /// @dev Subject status MUST be DELISTED. The two-step pattern (registry sets DELISTED via
+    ///      `confirmDeath` / `forceSettle` / `involuntaryDelist`, then engine `forceSettleSubject`)
+    ///      keeps the audit trail clean and avoids cross-contract reads of registry-internal state.
+    function forceSettleSubject(bytes32 subjectId, uint256 settlementMark) external onlyGovernance {
+        if (settlementMark < MIN_MARK || settlementMark > MAX_MARK) {
+            revert MarkValueOutOfRange(settlementMark);
+        }
+        PerpStorage.Layout storage perpS = PerpStorage.load();
+        if (perpS.subjectForceSettled[subjectId]) revert SubjectAlreadyForceSettled(subjectId);
+        ISubjectRegistry.SubjectStatus status =
+            ISubjectRegistry(perpS.subjectRegistry).statusOf(subjectId);
+        if (status != ISubjectRegistry.SubjectStatus.DELISTED) revert SubjectNotDelisted(subjectId);
+
+        perpS.subjectSettlementMark[subjectId] = settlementMark;
+        perpS.subjectForceSettled[subjectId] = true;
+        emit SubjectForceSettled(subjectId, settlementMark, msg.sender);
+    }
+
+    /// @inheritdoc IPerpEngine
+    /// @dev Permissionless: any caller with an open position on a force-settled subject can claim.
+    ///      Forced full close at the captured mark. ZERO fee — venue obligation, not discretionary
+    ///      trade. Skips staleness (the captured mark is canonical from `forceSettleSubject` time).
+    ///      Not gated by `globalHalt` — once a subject is force-settled, the trader has a vested
+    ///      right to the captured-mark unwind regardless of broader system state.
+    function closeAtForcedSettlement(bytes32 subjectId) external nonReentrant returns (int256 realizedPnl) {
+        PerpStorage.Layout storage perpS = PerpStorage.load();
+        MarginStorage.Layout storage marginS = MarginStorage.load();
+        if (!perpS.subjectForceSettled[subjectId]) revert SubjectNotForceSettled(subjectId);
+
+        bytes32 positionId = perpS.openPositionId[msg.sender][subjectId];
+        if (positionId == bytes32(0)) revert PositionNotOpen(subjectId);
+
+        Position memory orig = perpS.positions[positionId];
+        uint256 markCaptured = perpS.subjectSettlementMark[subjectId];
+
+        // Full close, zero fee. Reuse PositionMath for PnL.
+        int256 pnl = PositionMath.unrealizedPnl(orig.size, orig.entryPrice, markCaptured);
+        int256 returnedSigned = int256(orig.collateral) + pnl;
+        if (returnedSigned < 0) revert UnderwaterClose(returnedSigned);
+        uint256 returned = uint256(returnedSigned);
+
+        uint256 absSize = orig.size > 0 ? uint256(orig.size) : uint256(-orig.size);
+        uint256 openingNotional = (absSize * orig.entryPrice) / ONE;
+
+        // State updates BEFORE the external call (CEI).
+        delete perpS.positions[positionId];
+        delete perpS.openPositionId[msg.sender][subjectId];
+        if (orig.size > 0) {
+            perpS.totalLongOI[subjectId] -= openingNotional;
+        } else {
+            perpS.totalShortOI[subjectId] -= openingNotional;
+        }
+        marginS.exposure[msg.sender].totalPerpNotional -= openingNotional;
+
+        // Vault settle: zero fee, zero rebate, zero insurance share.
+        ILPVault(perpS.lpVault).settlePosition(msg.sender, orig.collateral, pnl, 0, 0, 0);
+
+        emit PositionClosedAtForcedSettlement(positionId, msg.sender, subjectId, pnl, returned);
+        return pnl;
+    }
+
+    /// @inheritdoc IPerpEngine
     function addCollateral(bytes32 subjectId, uint256 amount) external nonReentrant {
         if (amount == 0) revert AmountZero();
         PerpStorage.Layout storage perpS = PerpStorage.load();
         if (perpS.globalHalt) revert GlobalHaltedError();
+        if (perpS.subjectForceSettled[subjectId]) revert SubjectIsForceSettled(subjectId);
 
         bytes32 positionId = perpS.openPositionId[msg.sender][subjectId];
         if (positionId == bytes32(0)) revert PositionNotOpen(subjectId);
@@ -312,6 +388,7 @@ contract PerpEngine is Initializable, UUPSUpgradeable, ReentrancyGuard, IPerpEng
         PerpStorage.Layout storage perpS = PerpStorage.load();
         MarginStorage.Layout storage marginS = MarginStorage.load();
         if (perpS.globalHalt) revert GlobalHaltedError();
+        if (perpS.subjectForceSettled[subjectId]) revert SubjectIsForceSettled(subjectId);
 
         bytes32 positionId = perpS.openPositionId[msg.sender][subjectId];
         if (positionId == bytes32(0)) revert PositionNotOpen(subjectId);
@@ -418,12 +495,13 @@ contract PerpEngine is Initializable, UUPSUpgradeable, ReentrancyGuard, IPerpEng
         bool isMaker
     )
         internal
-        pure
+        view
         returns (uint256 fee, uint256 lpRebate, uint256 insuranceShare)
     {
         uint256 rate = isMaker ? MAKER_FEE_RATE : TAKER_FEE_RATE;
         fee = (notional * rate) / FEE_RATE_DENOM;
-        lpRebate = (fee * LP_REBATE_PCT) / 100;
+        // lpRebatePct lives in storage so governance can ratchet 40% → 30% per spec §3 line 139.
+        lpRebate = (fee * uint256(PerpStorage.load().lpRebatePct)) / 100;
         insuranceShare = (fee * INSURANCE_PCT) / 100;
         // residual = fee − lpRebate − insuranceShare flows to vault.accruedFees in the vault
     }
@@ -544,6 +622,19 @@ contract PerpEngine is Initializable, UUPSUpgradeable, ReentrancyGuard, IPerpEng
         if (seconds_ < MIN_MARK_STALE_AFTER || seconds_ > MAX_MARK_STALE_AFTER) revert InvalidConfig();
         PerpStorage.load().markStaleAfter = seconds_;
         emit MarkStaleAfterSet(seconds_);
+    }
+
+    /// @inheritdoc IPerpEngine
+    /// @dev Spec §3 line 139: LP rebate decreases from 40% to 30% over 6 months. Encoded as a
+    ///      governance setter rather than a fixed time-curve so the operations multi-sig can
+    ///      calibrate from yield trajectory (spec §7 line 417). Bounds [25, 50] prevent obvious
+    ///      mis-set; the upper bound matches `INSURANCE_PCT` so residual stays ≥ 0.
+    function setLpRebatePct(uint8 pct) external onlyGovernance {
+        if (pct < MIN_LP_REBATE_PCT || pct > MAX_LP_REBATE_PCT) revert LpRebatePctOutOfRange(pct);
+        PerpStorage.Layout storage perpS = PerpStorage.load();
+        uint8 old = perpS.lpRebatePct;
+        perpS.lpRebatePct = pct;
+        emit LpRebatePctSet(old, pct);
     }
 
     // ------------------------------------------------------------------------------------------
@@ -679,6 +770,21 @@ contract PerpEngine is Initializable, UUPSUpgradeable, ReentrancyGuard, IPerpEng
     /// @inheritdoc IPerpEngine
     function markStaleAfter() external view returns (uint32) {
         return PerpStorage.load().markStaleAfter;
+    }
+
+    /// @inheritdoc IPerpEngine
+    function lpRebatePct() external view returns (uint8) {
+        return PerpStorage.load().lpRebatePct;
+    }
+
+    /// @inheritdoc IPerpEngine
+    function isForceSettled(bytes32 subjectId) external view returns (bool) {
+        return PerpStorage.load().subjectForceSettled[subjectId];
+    }
+
+    /// @inheritdoc IPerpEngine
+    function settlementMarkOf(bytes32 subjectId) external view returns (uint256) {
+        return PerpStorage.load().subjectSettlementMark[subjectId];
     }
 
     function pendingMarkWriterActivatesAt(address writer) external view returns (uint64) {

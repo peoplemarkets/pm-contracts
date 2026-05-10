@@ -49,8 +49,8 @@ interface ISubjectRegistry {
         KYC_WRITER
     }
 
-    /// @dev Carrying timestamps for `deathPendingExpiresAt` and `delistingForceSettleAt` makes the
-    ///      state machine auditable from on-chain reads alone.
+    /// @dev Carrying timestamps for `deathPendingExpiresAt`, `delistingForceSettleAt`, and
+    ///      `autoPauseExpiresAt` makes the state machine auditable from on-chain reads alone.
     struct Subject {
         SubjectStatus status;
         PolicyFlag policyFlag;
@@ -59,6 +59,7 @@ interface ISubjectRegistry {
         bytes32 categoryId;
         uint64 deathPendingExpiresAt;
         uint64 delistingForceSettleAt;
+        uint64 autoPauseExpiresAt;
     }
 
     /// @dev Pending role grant or revoke. Keyed by keccak(account, role) — at most one pending
@@ -140,6 +141,7 @@ interface ISubjectRegistry {
     function requireTradeable(bytes32 subjectId) external view;
 
     function kycTierOf(address trader) external view returns (uint8);
+    function autoPauseExpiresAt(bytes32 subjectId) external view returns (uint64);
 
     function isAdmin(address account) external view returns (bool);
     function isPauseGuardian(address account) external view returns (bool);

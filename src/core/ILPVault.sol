@@ -70,6 +70,32 @@ interface ILPVault is IERC4626 {
     function releaseCollateral(address to, uint256 amount) external;
 
     // ------------------------------------------------------------------------------------------
+    // Insurance fund seeding (Fix #6) — governance only, no timelock, capped cumulatively
+    // ------------------------------------------------------------------------------------------
+
+    /// @notice Pulls `amount` USDC from `governance` and books it to `insuranceFundBalance`.
+    /// @dev    Spec §3 line 159: $1M treasury seed at launch. Spec §3 line 162: floor mechanic
+    ///         allows treasury top-up when the fund drops below 5% of TVL. Both flows go through
+    ///         this function. Cumulative cap is the contract-level `MAX_INSURANCE_SEED`; lifting
+    ///         it requires a UUPS upgrade.
+    function seedInsurance(uint256 amount) external;
+
+    function insuranceSeedDeposited() external view returns (uint256);
+
+    // ------------------------------------------------------------------------------------------
+    // Treasury fee withdrawal (Fix #5) — governance, timelocked
+    // ------------------------------------------------------------------------------------------
+
+    function proposeFeeWithdrawal(address recipient, uint256 amount) external;
+    function activateFeeWithdrawal() external;
+    function cancelFeeWithdrawal() external;
+
+    function pendingFeeWithdrawal()
+        external
+        view
+        returns (address recipient, uint256 amount, uint64 activatesAt, bool exists);
+
+    // ------------------------------------------------------------------------------------------
     // Slippage-protected ERC-4626 wrappers
     // ------------------------------------------------------------------------------------------
 
@@ -157,6 +183,11 @@ interface ILPVault is IERC4626 {
     event DepositsPausedSet(bool paused);
     event WithdrawalsPausedSet(bool paused);
 
+    event InsuranceSeeded(address indexed from, uint256 amount, uint256 cumulative);
+    event FeeWithdrawalProposed(address indexed recipient, uint256 amount, uint64 activatesAt);
+    event FeeWithdrawalActivated(address indexed recipient, uint256 amount);
+    event FeeWithdrawalCancelled(address indexed recipient, uint256 amount);
+
     // ------------------------------------------------------------------------------------------
     // Errors
     // ------------------------------------------------------------------------------------------
@@ -174,4 +205,6 @@ interface ILPVault is IERC4626 {
     error NoPendingProposal();
     error PendingProposalExists();
     error TimelockNotElapsed(uint64 readyAt);
+    error InsufficientAccruedFees(uint256 requested, uint256 available);
+    error InsuranceSeedCapExceeded(uint256 attempted, uint256 cap);
 }
