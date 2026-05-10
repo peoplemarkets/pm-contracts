@@ -95,7 +95,9 @@ contract PerpVaultE2ETest is Test {
             address(
                 new ERC1967Proxy(
                     address(engineImpl),
-                    abi.encodeCall(PerpEngine.initialize, (governance, TIMELOCK_DELAY, address(registry), address(vault)))
+                    abi.encodeCall(
+                        PerpEngine.initialize, (governance, TIMELOCK_DELAY, address(registry), address(vault))
+                    )
                 )
             )
         );
@@ -152,11 +154,12 @@ contract PerpVaultE2ETest is Test {
         assertEq(vault.insuranceFundBalance(), 1_000_000 * ONE_USDC);
         _assertBookkeeperIdentity();
 
-        // Step 2 — Alice deposits $5M LP capital.
+        // Step 2 — Alice deposits $5M LP capital. Poke the OI cap snapshot (v2-audit Fix #3).
         vm.prank(alice);
         uint256 sharesAlice = vault.deposit(5_000_000 * ONE_USDC, alice);
         assertGt(sharesAlice, 0);
         assertEq(vault.freeAssets(), 5_000_000 * ONE_USDC);
+        engine.pokeCappedTvl();
         _assertBookkeeperIdentity();
 
         // Step 3 — Trader opens a $50K notional long at 5× leverage.
@@ -261,6 +264,7 @@ contract PerpVaultE2ETest is Test {
         // Setup: trader has an open position.
         vm.prank(alice);
         vault.deposit(5_000_000 * ONE_USDC, alice);
+        engine.pokeCappedTvl();
         IPerpEngine.OpenParams memory p = IPerpEngine.OpenParams({
             subjectId: SUBJECT_ID,
             side: IPerpEngine.Side.LONG,

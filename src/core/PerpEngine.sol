@@ -69,6 +69,20 @@ contract PerpEngine is Initializable, UUPSUpgradeable, ReentrancyGuard, IPerpEng
     uint16 internal constant MAX_LEVERAGE_BPS = 60_000; // 6× (uint16 packing bound on storage)
     uint16 internal constant MAX_OI_CAP_BPS = 5_000; // 50%
 
+    /// @dev Per-update mark max-delta (v2-audit Fix #5). Defaults to 1500 bps (15% per push) — a
+    ///      generous bound that doesn't block legitimate volatility but caps the damage from a
+    ///      single compromised mark-writer key. Governance can tune in [100, 5_000] bps.
+    uint16 internal constant DEFAULT_MARK_MAX_DELTA_BPS = 1_500;
+    uint16 internal constant MIN_MARK_MAX_DELTA_BPS = 100; // 1%
+    uint16 internal constant MAX_MARK_MAX_DELTA_BPS = 5_000; // 50%
+
+    /// @dev v2-audit Fix #3. Minimum interval between consecutive `pokeCappedTvl` calls. The
+    ///      sole purpose is to defeat same-tx flash-deposit + open exploits — any non-zero
+    ///      cooldown across `tx`-boundaries works since EVM transactions are atomic. 60 seconds
+    ///      gives a clear human-readable buffer; first poke (when cappedTvlUpdatedAt == 0) is
+    ///      uncooled to bootstrap.
+    uint32 internal constant CAPPED_TVL_MIN_INTERVAL = 60 seconds;
+
     /// @custom:oz-upgrades-unsafe-allow constructor
     constructor() {
         _disableInitializers();
@@ -95,6 +109,7 @@ contract PerpEngine is Initializable, UUPSUpgradeable, ReentrancyGuard, IPerpEng
         perpS.lpVault = lpVault_;
         perpS.markStaleAfter = 30 seconds; // spec §1 default
         perpS.lpRebatePct = 40; // spec §3 starting value
+        perpS.markMaxDeltaBps = DEFAULT_MARK_MAX_DELTA_BPS; // v2-audit Fix #5
 
         // Margin params seeded with spec §3 defaults; governance can tune later.
         MarginStorage.Layout storage marginS = MarginStorage.load();
@@ -311,8 +326,7 @@ contract PerpEngine is Initializable, UUPSUpgradeable, ReentrancyGuard, IPerpEng
         }
         PerpStorage.Layout storage perpS = PerpStorage.load();
         if (perpS.subjectForceSettled[subjectId]) revert SubjectAlreadyForceSettled(subjectId);
-        ISubjectRegistry.SubjectStatus status =
-            ISubjectRegistry(perpS.subjectRegistry).statusOf(subjectId);
+        ISubjectRegistry.SubjectStatus status = ISubjectRegistry(perpS.subjectRegistry).statusOf(subjectId);
         if (status != ISubjectRegistry.SubjectStatus.DELISTED) revert SubjectNotDelisted(subjectId);
 
         perpS.subjectSettlementMark[subjectId] = settlementMark;
@@ -339,9 +353,22 @@ contract PerpEngine is Initializable, UUPSUpgradeable, ReentrancyGuard, IPerpEng
 
         // Full close, zero fee. Reuse PositionMath for PnL.
         int256 pnl = PositionMath.unrealizedPnl(orig.size, orig.entryPrice, markCaptured);
+
+        // v2-audit Fix #1: cap the trader's loss at posted collateral. If the captured mark puts
+        // the position deep underwater (loss > collateral), the trader gets nothing, the vault
+        // keeps the full collateral, and the position is cleanly cleared from `positionCollateral`.
+        // The shortfall (true loss − collateral) is an unfunded LP loss in v0; full coverage from
+        // the insurance fund lands with the InsuranceFund / LiquidationEngine work (week 14+).
+        // Without this cap, every revert here would permanently strand the trader's collateral.
+        int256 cappedPnl = pnl;
         int256 returnedSigned = int256(orig.collateral) + pnl;
-        if (returnedSigned < 0) revert UnderwaterClose(returnedSigned);
-        uint256 returned = uint256(returnedSigned);
+        uint256 returned;
+        if (returnedSigned < 0) {
+            cappedPnl = -int256(orig.collateral); // full collateral wiped, no payout
+            returned = 0;
+        } else {
+            returned = uint256(returnedSigned);
+        }
 
         uint256 absSize = orig.size > 0 ? uint256(orig.size) : uint256(-orig.size);
         uint256 openingNotional = (absSize * orig.entryPrice) / ONE;
@@ -356,11 +383,13 @@ contract PerpEngine is Initializable, UUPSUpgradeable, ReentrancyGuard, IPerpEng
         }
         marginS.exposure[msg.sender].totalPerpNotional -= openingNotional;
 
-        // Vault settle: zero fee, zero rebate, zero insurance share.
-        ILPVault(perpS.lpVault).settlePosition(msg.sender, orig.collateral, pnl, 0, 0, 0);
+        // Vault settle: zero fee, zero rebate, zero insurance share. cappedPnl ensures the
+        // vault's own UnderwaterClose check (collateral + cappedPnl − fee ≥ 0) passes — at the
+        // boundary it computes returnedSigned = 0, which is fine.
+        ILPVault(perpS.lpVault).settlePosition(msg.sender, orig.collateral, cappedPnl, 0, 0, 0);
 
-        emit PositionClosedAtForcedSettlement(positionId, msg.sender, subjectId, pnl, returned);
-        return pnl;
+        emit PositionClosedAtForcedSettlement(positionId, msg.sender, subjectId, cappedPnl, returned);
+        return cappedPnl;
     }
 
     /// @inheritdoc IPerpEngine
@@ -467,8 +496,13 @@ contract PerpEngine is Initializable, UUPSUpgradeable, ReentrancyGuard, IPerpEng
         internal
         view
     {
-        // Per-subject side OI cap as a fraction of vault.totalAssets() (= freeAssets in our impl).
-        uint256 vaultTvl = IERC4626(perpS.lpVault).totalAssets();
+        // Per-subject side OI cap. v2-audit Fix #3: cap denominator is `min(cappedTvl, liveTvl)`.
+        // - `cappedTvl` is a slow-moving snapshot updated by the permissionless `pokeCappedTvl`
+        //   under a 60s cooldown — defeats same-block flash-deposit cap inflation.
+        // - Live `freeAssets()` is still consulted so a sudden withdrawal or LP loss tightens the
+        //   cap immediately (conservative on the downside; permissive only after a delayed poke).
+        uint256 liveTvl = IERC4626(perpS.lpVault).totalAssets();
+        uint256 vaultTvl = perpS.cappedTvl < liveTvl ? perpS.cappedTvl : liveTvl;
         uint256 sideOiCap = (vaultTvl * marginS.perSubjectSideOiCapBps) / BPS_DENOMINATOR;
         uint256 newSideOi = side == Side.LONG
             ? perpS.totalLongOI[subjectId] + sizeNotional
@@ -514,12 +548,25 @@ contract PerpEngine is Initializable, UUPSUpgradeable, ReentrancyGuard, IPerpEng
     /// @dev Mark pushes are allowed regardless of subject status — a writer can record a price
     ///      observation even on a paused or delisting subject. State-changing trades gate the
     ///      mark via `_readFreshMark`.
+    /// @dev v2-audit Fix #5: per-update max-delta cap. The first push for a subject (oldMark == 0)
+    ///      is uncapped — there is no prior reference point. Subsequent pushes must satisfy
+    ///      |newMark − oldMark| × 10_000 ≤ markMaxDeltaBps × oldMark, bounding the damage from a
+    ///      single compromised mark-writer key. Legitimate volatility above the cap requires
+    ///      multiple successive pushes (each within the cap), spread across blocks.
     function pushMark(bytes32 subjectId, uint256 newMark) external {
         PerpStorage.Layout storage perpS = PerpStorage.load();
         if (!perpS.markWriters[msg.sender]) revert Unauthorized(msg.sender);
         if (newMark < MIN_MARK || newMark > MAX_MARK) revert MarkValueOutOfRange(newMark);
 
         uint256 oldMark = perpS.markPrice[subjectId];
+        if (oldMark != 0) {
+            uint256 diff = newMark > oldMark ? newMark - oldMark : oldMark - newMark;
+            uint16 capBps = perpS.markMaxDeltaBps;
+            if (diff * BPS_DENOMINATOR > uint256(capBps) * oldMark) {
+                revert MarkDeltaTooLarge(subjectId, oldMark, newMark, capBps);
+            }
+        }
+
         perpS.markPrice[subjectId] = newMark;
         perpS.markUpdatedAt[subjectId] = uint64(block.timestamp);
 
@@ -622,6 +669,36 @@ contract PerpEngine is Initializable, UUPSUpgradeable, ReentrancyGuard, IPerpEng
         if (seconds_ < MIN_MARK_STALE_AFTER || seconds_ > MAX_MARK_STALE_AFTER) revert InvalidConfig();
         PerpStorage.load().markStaleAfter = seconds_;
         emit MarkStaleAfterSet(seconds_);
+    }
+
+    /// @inheritdoc IPerpEngine
+    /// @dev v2-audit Fix #3. Permissionless — anyone can poke after the cooldown elapses. The
+    ///      OI cap reads `min(cappedTvl, freeAssets())` so a same-block flash deposit that
+    ///      inflates `freeAssets` does not raise the cap (cappedTvl is unchanged), and a sudden
+    ///      withdrawal that drops `freeAssets` does immediately tighten the cap.
+    function pokeCappedTvl() external {
+        PerpStorage.Layout storage perpS = PerpStorage.load();
+        uint64 lastUpdate = perpS.cappedTvlUpdatedAt;
+        if (lastUpdate != 0) {
+            uint64 readyAt = lastUpdate + uint64(CAPPED_TVL_MIN_INTERVAL);
+            if (block.timestamp < readyAt) revert CappedTvlPokeTooSoon(readyAt);
+        }
+        uint256 newTvl = IERC4626(perpS.lpVault).totalAssets();
+        perpS.cappedTvl = newTvl;
+        perpS.cappedTvlUpdatedAt = uint64(block.timestamp);
+        emit CappedTvlPoked(newTvl, msg.sender);
+    }
+
+    /// @inheritdoc IPerpEngine
+    /// @dev v2-audit Fix #5. Bounds [100, 5_000] bps (1% to 50% per push). Default 1500 (15%).
+    function setMarkMaxDeltaBps(uint16 bps) external onlyGovernance {
+        if (bps < MIN_MARK_MAX_DELTA_BPS || bps > MAX_MARK_MAX_DELTA_BPS) {
+            revert MarkMaxDeltaBpsOutOfRange(bps);
+        }
+        PerpStorage.Layout storage perpS = PerpStorage.load();
+        uint16 old = perpS.markMaxDeltaBps;
+        perpS.markMaxDeltaBps = bps;
+        emit MarkMaxDeltaBpsSet(old, bps);
     }
 
     /// @inheritdoc IPerpEngine
@@ -775,6 +852,17 @@ contract PerpEngine is Initializable, UUPSUpgradeable, ReentrancyGuard, IPerpEng
     /// @inheritdoc IPerpEngine
     function lpRebatePct() external view returns (uint8) {
         return PerpStorage.load().lpRebatePct;
+    }
+
+    /// @inheritdoc IPerpEngine
+    function markMaxDeltaBps() external view returns (uint16) {
+        return PerpStorage.load().markMaxDeltaBps;
+    }
+
+    /// @inheritdoc IPerpEngine
+    function cappedTvl() external view returns (uint256 tvl, uint64 updatedAt) {
+        PerpStorage.Layout storage perpS = PerpStorage.load();
+        return (perpS.cappedTvl, perpS.cappedTvlUpdatedAt);
     }
 
     /// @inheritdoc IPerpEngine

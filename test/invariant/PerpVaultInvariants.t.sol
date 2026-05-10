@@ -100,7 +100,9 @@ contract PerpVaultInvariants is Test {
             address(
                 new ERC1967Proxy(
                     address(engineImpl),
-                    abi.encodeCall(PerpEngine.initialize, (governance, TIMELOCK_DELAY, address(registry), address(vault)))
+                    abi.encodeCall(
+                        PerpEngine.initialize, (governance, TIMELOCK_DELAY, address(registry), address(vault))
+                    )
                 )
             )
         );
@@ -169,11 +171,13 @@ contract PerpVaultInvariants is Test {
             usdc.approve(address(vault), type(uint256).max);
         }
 
-        // Warm-start: LP[0] deposits $5M, LP[1] deposits $1M; one trader opens to seed ghost state.
+        // Warm-start: LP[0] deposits $5M, LP[1] deposits $1M.
         vm.prank(lps[0]);
         vault.deposit(5_000_000 * ONE_USDC, lps[0]);
         vm.prank(lps[1]);
         vault.deposit(1_000_000 * ONE_USDC, lps[1]);
+        // Poke the OI cap snapshot (v2-audit Fix #3); without this the cap denominator is 0.
+        engine.pokeCappedTvl();
 
         handler = new PerpVaultHandler(
             engine, vault, registry, usdc, markWriter, regGuardian, regAdmin, governance, traders, lps, subjects
@@ -186,8 +190,8 @@ contract PerpVaultInvariants is Test {
     /// @notice I1 — bookkeeper sum identity.
     function invariant_BookkeeperSumIdentity() public view {
         uint256 bal = usdc.balanceOf(address(vault));
-        uint256 sum = vault.freeAssets() + vault.positionCollateral() + vault.insuranceFundBalance()
-            + vault.accruedFees();
+        uint256 sum =
+            vault.freeAssets() + vault.positionCollateral() + vault.insuranceFundBalance() + vault.accruedFees();
         assertEq(bal, sum, "I1: balance != sum-of-buckets");
     }
 
@@ -203,9 +207,7 @@ contract PerpVaultInvariants is Test {
     /// @notice I1 ghost mirror — explicit bookkeepers match the handler's accumulator.
     function invariant_BucketGhostMirror() public view {
         assertEq(
-            vault.positionCollateral(),
-            handler.ghostExpectedPositionCollateral(),
-            "I1 ghost: positionCollateral drift"
+            vault.positionCollateral(), handler.ghostExpectedPositionCollateral(), "I1 ghost: positionCollateral drift"
         );
         assertEq(vault.insuranceFundBalance(), handler.ghostExpectedInsurance(), "I1 ghost: insurance drift");
         assertEq(vault.accruedFees(), handler.ghostExpectedAccruedFees(), "I1 ghost: accruedFees drift");

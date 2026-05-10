@@ -103,6 +103,12 @@ interface IPerpEngine {
     function setKycCaps(uint8 tier, uint256 perSubjectCap, uint256 combinedCap) external;
     function setMarkStaleAfter(uint32 seconds_) external;
     function setLpRebatePct(uint8 pct) external;
+    function setMarkMaxDeltaBps(uint16 bps) external;
+
+    /// @notice Permissionless poke that snapshots the live `vault.totalAssets()` into the
+    ///         `cappedTvl` field used by the per-subject OI cap. Cooldown-gated so a same-block
+    ///         flash deposit cannot inflate the cap. v2-audit Fix #3.
+    function pokeCappedTvl() external;
 
     function proposeGovernanceTransfer(address newGovernance) external;
     function activateGovernanceTransfer() external;
@@ -129,6 +135,8 @@ interface IPerpEngine {
     function timelockDelay() external view returns (uint32);
     function markStaleAfter() external view returns (uint32);
     function lpRebatePct() external view returns (uint8);
+    function markMaxDeltaBps() external view returns (uint16);
+    function cappedTvl() external view returns (uint256 tvl, uint64 updatedAt);
     function isForceSettled(bytes32 subjectId) external view returns (bool);
     function settlementMarkOf(bytes32 subjectId) external view returns (uint256);
 
@@ -167,6 +175,9 @@ interface IPerpEngine {
     event KycCapsSet(uint8 tier, uint256 perSubjectCap, uint256 combinedCap);
     event MarkStaleAfterSet(uint32 seconds_);
     event LpRebatePctSet(uint8 oldPct, uint8 newPct);
+    event MarkMaxDeltaBpsSet(uint16 oldBps, uint16 newBps);
+    event CappedTvlPoked(uint256 newTvl, address indexed by);
+    event MarkDeltaCapExceeded(bytes32 indexed subjectId, uint256 oldMark, uint256 newMark, uint16 capBps);
     event SubjectForceSettled(bytes32 indexed subjectId, uint256 settlementMark, address indexed by);
     event PositionClosedAtForcedSettlement(
         bytes32 indexed positionId,
@@ -211,6 +222,9 @@ interface IPerpEngine {
     error MarkWriterAlreadyAdded(address writer);
     error MarkWriterNotFound(address writer);
     error LpRebatePctOutOfRange(uint8 pct);
+    error MarkDeltaTooLarge(bytes32 subjectId, uint256 oldMark, uint256 newMark, uint16 capBps);
+    error MarkMaxDeltaBpsOutOfRange(uint16 bps);
+    error CappedTvlPokeTooSoon(uint64 readyAt);
     error SubjectNotDelisted(bytes32 subjectId);
     error SubjectAlreadyForceSettled(bytes32 subjectId);
     error SubjectNotForceSettled(bytes32 subjectId);

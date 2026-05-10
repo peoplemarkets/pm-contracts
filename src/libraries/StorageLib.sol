@@ -62,6 +62,17 @@ library PerpStorage {
         // settlementMark is in 1e18 fixed-point (same scale as markPrice).
         mapping(bytes32 subjectId => uint256) subjectSettlementMark;
         mapping(bytes32 subjectId => bool) subjectForceSettled;
+        // ---- APPENDED: v2-audit Fix #5 per-update mark max-delta cap (bps of prior mark) ----
+        // Bounds the blast radius of a single compromised mark-writer key. First-ever push for a
+        // subject is uncapped (no prior reference); subsequent pushes must satisfy
+        // |new - old| × 10_000 ≤ markMaxDeltaBps × old.
+        uint16 markMaxDeltaBps;
+        // ---- APPENDED: v2-audit Fix #3 slow-moving TVL signal for OI cap ----
+        // Snapshot of LPVault.freeAssets(). Updated by a permissionless poker (with cooldown)
+        // OR by an authoritative governance call. Used by `_enforceOpenCaps` instead of live
+        // freeAssets() to defeat same-block flash-deposit OI cap inflation.
+        uint256 cappedTvl;
+        uint64 cappedTvlUpdatedAt;
     }
 
     function load() internal pure returns (Layout storage l) {

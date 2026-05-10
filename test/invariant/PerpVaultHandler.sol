@@ -81,6 +81,7 @@ contract PerpVaultHandler is Test {
     uint256 public callsUnpauseAuto;
     uint256 public callsAdvanceTime;
     uint256 public callsRefreshMark;
+    uint256 public callsPokeTvl;
 
     constructor(
         PerpEngine _engine,
@@ -164,7 +165,13 @@ contract PerpVaultHandler is Test {
         _hOpen(traderSeed, subjectSeed, collat, levBps, IPerpEngine.Side.SHORT);
     }
 
-    function _hOpen(uint256 traderSeed, uint256 subjectSeed, uint256 collat, uint256 levBps, IPerpEngine.Side side)
+    function _hOpen(
+        uint256 traderSeed,
+        uint256 subjectSeed,
+        uint256 collat,
+        uint256 levBps,
+        IPerpEngine.Side side
+    )
         internal
     {
         address trader = _pickTrader(traderSeed);
@@ -210,7 +217,9 @@ contract PerpVaultHandler is Test {
         uint256 collateral,
         bool isMaker,
         bytes32 newId
-    ) internal {
+    )
+        internal
+    {
         // Mirror PerpEngine._computeFees and the vault's bucket math.
         uint256 rate = isMaker ? 250 : TAKER_FEE_RATE;
         uint256 fee = (sizeNotional * rate) / FEE_RATE_DENOM;
@@ -263,9 +272,7 @@ contract PerpVaultHandler is Test {
         vm.prank(trader);
         try engine.closePosition(p) returns (int256) {
             // Compute opening-notional delta so we can mirror OI updates.
-            int256 closeSize = fullClose
-                ? orig.size
-                : (orig.size * int256(fraction)) / int256(uint256(10_000));
+            int256 closeSize = fullClose ? orig.size : (orig.size * int256(fraction)) / int256(uint256(10_000));
             uint256 absCloseSize = closeSize > 0 ? uint256(closeSize) : uint256(-closeSize);
             uint256 openingNotionalDelta = (absCloseSize * orig.entryPrice) / ONE_18;
             uint256 closeNotionalAtMark = (absCloseSize * mark) / ONE_18;
@@ -438,5 +445,14 @@ contract PerpVaultHandler is Test {
         callsAdvanceTime++;
         uint256 sec = bound(secondsBound, 1, 25);
         vm.warp(block.timestamp + sec);
+    }
+
+    /// @dev v2-audit Fix #3 — exercise the OI cap snapshot. Most calls revert
+    ///      `CappedTvlPokeTooSoon` (60s cooldown vs ~13s expected per-call time advance);
+    ///      try/catch swallows. Successful calls keep the OI cap denominator in sync with
+    ///      the vault's actual freeAssets after legitimate LP deposits.
+    function hPokeCappedTvl() external {
+        callsPokeTvl++;
+        try engine.pokeCappedTvl() {} catch {}
     }
 }

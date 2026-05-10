@@ -108,6 +108,10 @@ contract PerpEngineTest is Test {
         engine.setKycCaps(1, 50_000 * ONE_USDC, 200_000 * ONE_USDC);
         engine.setKycCaps(2, 250_000 * ONE_USDC, 1_000_000 * ONE_USDC);
         engine.setKycCaps(3, 1_000_000 * ONE_USDC, 4_000_000 * ONE_USDC);
+        // Lift the mark-delta cap to its maximum (50%) for the suite — most tests need to push
+        // large mark moves to exercise PnL/underwater paths. Dedicated tests for the
+        // delta-cap behavior at the default 15% live below.
+        engine.setMarkMaxDeltaBps(5_000);
         engine.proposeAddMarkWriter(markWriter);
         vm.stopPrank();
         vm.warp(block.timestamp + TIMELOCK_DELAY);
@@ -133,6 +137,10 @@ contract PerpEngineTest is Test {
         // 9. Seed the LP vault with $1M from alice so the OI cap (5% of TVL = $50K) is meaningful.
         vm.prank(alice);
         vault.deposit(USDC_1M, alice);
+
+        // 10. Poke the OI cap snapshot. Without this the cap denominator is 0 and all opens
+        // revert PerSubjectOiCapExceeded. Permissionless — anyone can call.
+        engine.pokeCappedTvl();
     }
 
     // ------------------------------------------------------------------------------------------
@@ -171,6 +179,11 @@ contract PerpEngineTest is Test {
     function _pushMarkAt(uint256 newMark) internal {
         vm.prank(markWriter);
         engine.pushMark(SUBJECT_ID, newMark);
+    }
+
+    function _pushMarkAt2(uint256 newMark) internal {
+        vm.prank(markWriter);
+        engine.pushMark(SUBJECT_ID2, newMark);
     }
 
     // ------------------------------------------------------------------------------------------
@@ -261,10 +274,10 @@ contract PerpEngineTest is Test {
 
     function test_PushMark_MultiSubjectIndependent() public {
         vm.prank(markWriter);
-        engine.pushMark(SUBJECT_ID, 200 * ONE_18);
+        engine.pushMark(SUBJECT_ID, 140 * ONE_18); // +40%, within suite-wide 50% cap
         (uint256 priceA,) = engine.markOf(SUBJECT_ID);
         (uint256 priceB,) = engine.markOf(SUBJECT_ID2);
-        assertEq(priceA, 200 * ONE_18);
+        assertEq(priceA, 140 * ONE_18);
         assertEq(priceB, INITIAL_MARK); // unchanged
     }
 
@@ -486,6 +499,10 @@ contract PerpEngineTest is Test {
         usdc.mint(alice, 100 * USDC_10M);
         vm.prank(alice);
         vault.deposit(50 * USDC_10M, alice); // ~$500M TVL → 5% OI cap = $25M
+        // v2-audit Fix #3: cappedTvl is pinned at warm-start value until poked.
+        vm.warp(block.timestamp + 61);
+        engine.pokeCappedTvl();
+        _pushMarkAt(INITIAL_MARK); // refresh staleness after the warp
 
         IPerpEngine.OpenParams memory p = _baseOpenParams();
         p.sizeNotional = 60_000 * ONE_USDC; // > $50K per-trader-subject cap
@@ -562,6 +579,11 @@ contract PerpEngineTest is Test {
         usdc.approve(address(vault), type(uint256).max);
         vm.prank(alice);
         vault.deposit(50 * USDC_10M, alice);
+        // v2-audit Fix #3: poke the OI cap snapshot so cap follows the inflated TVL.
+        vm.warp(block.timestamp + 61);
+        engine.pokeCappedTvl();
+        _pushMarkAt(INITIAL_MARK); // refresh staleness after the warp
+        _pushMarkAt2(INITIAL_MARK); // also refresh subject 2 (used in the second open)
 
         // Now lift the trader's combined cap to $300K so we can hit it on the second open.
         vm.prank(governance);
@@ -1292,9 +1314,7 @@ contract PerpEngineTest is Test {
     function test_ForceSettleSubject_RevertOnMarkAboveMax() public {
         _delistSubject(SUBJECT_ID);
         vm.prank(governance);
-        vm.expectRevert(
-            abi.encodeWithSelector(IPerpEngine.MarkValueOutOfRange.selector, uint256(1e36 + 1))
-        );
+        vm.expectRevert(abi.encodeWithSelector(IPerpEngine.MarkValueOutOfRange.selector, uint256(1e36 + 1)));
         engine.forceSettleSubject(SUBJECT_ID, 1e36 + 1);
     }
 
@@ -1398,15 +1418,29 @@ contract PerpEngineTest is Test {
         engine.closeAtForcedSettlement(SUBJECT_ID);
     }
 
-    function test_CloseAtForcedSettlement_RevertOnUnderwater() public {
+    function test_CloseAtForcedSettlement_UnderwaterCappedAtCollateral() public {
+        // v2-audit Fix #1: an underwater position settles cleanly with trader losing all
+        // collateral; the vault keeps the full collateral as loss-recovery. Pre-fix this would
+        // revert UnderwaterClose and permanently strand the collateral.
         _open(_baseOpenParams());
         _delistSubject(SUBJECT_ID);
-        // Force-settle at -25% → -$12.5K loss on $10K collat → underwater
+        // Force-settle at -25% → -$12.5K loss on $10K collat → underwater by $2.5K
         vm.prank(governance);
         engine.forceSettleSubject(SUBJECT_ID, 75 * ONE_18);
+
+        uint256 traderBalBefore = usdc.balanceOf(trader);
+        uint256 vaultPosCollatBefore = vault.positionCollateral();
+
         vm.prank(trader);
-        vm.expectRevert();
-        engine.closeAtForcedSettlement(SUBJECT_ID);
+        int256 pnl = engine.closeAtForcedSettlement(SUBJECT_ID);
+        // Trader gets nothing (collateral fully wiped)
+        assertEq(usdc.balanceOf(trader), traderBalBefore);
+        // Position cleared
+        assertEq(engine.positionIdOf(trader, SUBJECT_ID), bytes32(0));
+        // Vault positionCollateral decremented by the position's collateral
+        assertEq(vault.positionCollateral(), vaultPosCollatBefore - 10_000 * ONE_USDC);
+        // PnL reported is capped at -collateral (not the true -$12.5K loss)
+        assertEq(pnl, -int256(10_000 * ONE_USDC));
     }
 
     function test_CloseAtForcedSettlement_IgnoresStaleness() public {
@@ -1478,6 +1512,165 @@ contract PerpEngineTest is Test {
         vm.prank(trader);
         vm.expectRevert(); // requireTradeable rejects DELISTED status
         engine.openPosition(_baseOpenParams());
+    }
+
+    // ------------------------------------------------------------------------------------------
+    // v2-audit Fix #3 — slow-moving TVL signal for OI cap
+    // ------------------------------------------------------------------------------------------
+
+    function test_PokeCappedTvl_HappyPath() public {
+        // setUp already poked. Advance past cooldown and re-poke.
+        (uint256 tvl0,) = engine.cappedTvl();
+        vm.warp(block.timestamp + 61);
+        // Add LP to grow freeAssets
+        usdc.mint(alice, 5 * USDC_1M);
+        vm.prank(alice);
+        usdc.approve(address(vault), type(uint256).max);
+        vm.prank(alice);
+        vault.deposit(2 * USDC_1M, alice);
+        engine.pokeCappedTvl();
+        (uint256 tvl1,) = engine.cappedTvl();
+        assertGt(tvl1, tvl0);
+    }
+
+    function test_PokeCappedTvl_RevertOnCooldown() public {
+        (, uint64 lastUpdate) = engine.cappedTvl();
+        uint64 readyAt = lastUpdate + 60;
+        vm.expectRevert(abi.encodeWithSelector(IPerpEngine.CappedTvlPokeTooSoon.selector, readyAt));
+        engine.pokeCappedTvl();
+    }
+
+    function test_FlashDepositCannotInflateOiCap() public {
+        // Reset to default OI cap (5%, ~$50K against ~$1M TVL) for this test.
+        // Attacker deposits a huge amount in the same tx as opening to inflate freeAssets.
+        // Without the cap, attacker could open against the inflated TVL.
+        // With the cap (cappedTvl is set to pre-deposit value), the attacker is bounded.
+        usdc.mint(trader, 100 * USDC_1M);
+        // First, the trader's pre-flash open at $50K (within the original $50K cap).
+        IPerpEngine.OpenParams memory pBaseline = _baseOpenParams();
+        _open(pBaseline); // succeeds
+        vm.prank(trader);
+        engine.closePosition(_baseCloseParams()); // close to free up cap
+
+        // Now try to open MORE than 5% of pre-deposit TVL after flash-depositing massive USDC.
+        vm.prank(trader);
+        usdc.approve(address(vault), type(uint256).max);
+        vm.prank(trader);
+        vault.deposit(50 * USDC_1M, trader); // huge flash-style deposit to try to inflate cap
+        // Try to open $200K notional (4× over the $50K cap of pre-deposit TVL).
+        IPerpEngine.OpenParams memory pBig = _baseOpenParams();
+        pBig.sizeNotional = 200_000 * ONE_USDC;
+        pBig.collateralAmount = 40_000 * ONE_USDC;
+        vm.prank(trader);
+        vm.expectRevert(); // PerSubjectOiCapExceeded — cap stayed pinned at pre-deposit cappedTvl
+        engine.openPosition(pBig);
+    }
+
+    function test_CappedTvlReadsLowerOfStoredAndLive() public {
+        // After a withdrawal, freeAssets drops below cappedTvl. Cap should immediately tighten.
+        // Setup deposits alice's USDC at setUp; she holds vault shares. Warm-start cappedTvl = $1M.
+        // alice has all the LP shares; redeem half to drop freeAssets to ~$500K.
+        uint256 aliceShares = vault.balanceOf(alice);
+        vm.prank(alice);
+        vault.redeem(aliceShares / 2, alice, alice); // freeAssets drops ≈ $500K
+        // cappedTvl is unchanged at ~$1M (last poked in setUp), but live is now ~$500K.
+        // OI cap reads min(cappedTvl, liveTvl) → ~$500K → cap = ~$25K.
+        // Try to open $40K (under the stale cap of $50K, but over the new effective cap of $25K).
+        IPerpEngine.OpenParams memory p = _baseOpenParams();
+        p.sizeNotional = 40_000 * ONE_USDC;
+        p.collateralAmount = 8_000 * ONE_USDC;
+        vm.prank(trader);
+        vm.expectRevert(); // PerSubjectOiCapExceeded — cap follows the lower of the two
+        engine.openPosition(p);
+    }
+
+    // ------------------------------------------------------------------------------------------
+    // v2-audit Fix #5 — pushMark per-update max-delta cap
+    // ------------------------------------------------------------------------------------------
+
+    function test_MarkMaxDeltaBps_DefaultIs1500() public {
+        // Reset to default for this test (setUp lifts to 5000).
+        vm.prank(governance);
+        engine.setMarkMaxDeltaBps(1_500);
+        assertEq(engine.markMaxDeltaBps(), 1_500);
+    }
+
+    function test_PushMark_WithinCap() public {
+        vm.prank(governance);
+        engine.setMarkMaxDeltaBps(1_500);
+        // 100 → 110 = +10%, within 15% cap
+        vm.prank(markWriter);
+        engine.pushMark(SUBJECT_ID, 110 * ONE_18);
+        (uint256 mark,) = engine.markOf(SUBJECT_ID);
+        assertEq(mark, 110 * ONE_18);
+    }
+
+    function test_PushMark_ExactlyAtCap() public {
+        vm.prank(governance);
+        engine.setMarkMaxDeltaBps(1_500);
+        // 100 → 115 = exactly +15%
+        vm.prank(markWriter);
+        engine.pushMark(SUBJECT_ID, 115 * ONE_18);
+    }
+
+    function test_PushMark_RevertOnDeltaTooLargeUp() public {
+        vm.prank(governance);
+        engine.setMarkMaxDeltaBps(1_500);
+        // 100 → 116 = +16%, exceeds 15% cap
+        vm.prank(markWriter);
+        vm.expectRevert(
+            abi.encodeWithSelector(
+                IPerpEngine.MarkDeltaTooLarge.selector, SUBJECT_ID, INITIAL_MARK, 116 * ONE_18, uint16(1_500)
+            )
+        );
+        engine.pushMark(SUBJECT_ID, 116 * ONE_18);
+    }
+
+    function test_PushMark_RevertOnDeltaTooLargeDown() public {
+        vm.prank(governance);
+        engine.setMarkMaxDeltaBps(1_500);
+        // 100 → 84 = -16%, exceeds 15% cap
+        vm.prank(markWriter);
+        vm.expectRevert(
+            abi.encodeWithSelector(
+                IPerpEngine.MarkDeltaTooLarge.selector, SUBJECT_ID, INITIAL_MARK, 84 * ONE_18, uint16(1_500)
+            )
+        );
+        engine.pushMark(SUBJECT_ID, 84 * ONE_18);
+    }
+
+    function test_PushMark_FirstPushUncappedOnFreshSubject() public {
+        // Fresh subject with no prior mark — first push is unbounded.
+        bytes32 freshSubject = keccak256("fresh");
+        vm.prank(regAdmin);
+        registry.listSubject(freshSubject, CATEGORY_ID);
+
+        vm.prank(governance);
+        engine.setMarkMaxDeltaBps(1_500);
+
+        // Any value within MIN_MARK..MAX_MARK is allowed on first push.
+        vm.prank(markWriter);
+        engine.pushMark(freshSubject, 1_000_000 * ONE_18); // far beyond 15% of any prior reference
+        (uint256 mark,) = engine.markOf(freshSubject);
+        assertEq(mark, 1_000_000 * ONE_18);
+    }
+
+    function test_SetMarkMaxDeltaBps_RevertBelowMin() public {
+        vm.prank(governance);
+        vm.expectRevert(abi.encodeWithSelector(IPerpEngine.MarkMaxDeltaBpsOutOfRange.selector, uint16(99)));
+        engine.setMarkMaxDeltaBps(99);
+    }
+
+    function test_SetMarkMaxDeltaBps_RevertAboveMax() public {
+        vm.prank(governance);
+        vm.expectRevert(abi.encodeWithSelector(IPerpEngine.MarkMaxDeltaBpsOutOfRange.selector, uint16(5_001)));
+        engine.setMarkMaxDeltaBps(5_001);
+    }
+
+    function test_SetMarkMaxDeltaBps_RevertOnNonGovernance() public {
+        vm.prank(stranger);
+        vm.expectRevert(abi.encodeWithSelector(IPerpEngine.Unauthorized.selector, stranger));
+        engine.setMarkMaxDeltaBps(1_500);
     }
 
     // ------------------------------------------------------------------------------------------
