@@ -57,6 +57,12 @@ contract SignedFeedAdapter is EIP712, IOracleAdapter {
     uint64 public pendingActivatesAt;
     bool public pendingExists;
 
+    /// @dev v2-audit Fix #7: timelocked governance transfer. Replaces the previous single-step
+    ///      `transferGovernance` so a typo or compromised governance key cannot instantly seize
+    ///      control (and from there, rotate signers to push arbitrary oracle values).
+    address public pendingGovernance;
+    uint64 public pendingGovernanceActivatesAt;
+
     /// @dev OracleRouter — used to look up per-metric maxDeltaBps caps. Set once at deploy.
     IOracleRouter public immutable router;
 
@@ -90,7 +96,9 @@ contract SignedFeedAdapter is EIP712, IOracleAdapter {
     event SignerRotationActivated(address[SIGNER_COUNT] newSigners);
     event SignerRotationCancelled();
     event PausedSet(bool paused);
-    event GovernanceTransferred(address indexed oldGovernance, address indexed newGovernance);
+    event GovernanceTransferProposed(address indexed newGovernance, uint64 activatesAt);
+    event GovernanceTransferActivated(address indexed oldGovernance, address indexed newGovernance);
+    event GovernanceTransferCancelled(address indexed pendingGovernance);
     event OperatorTransferred(address indexed oldOperator, address indexed newOperator);
 
     error Unauthorized(address caller);
@@ -109,6 +117,8 @@ contract SignedFeedAdapter is EIP712, IOracleAdapter {
     error PendingRotationExists();
     error InvalidSigners();
     error InvalidConfig();
+    error PendingGovernanceTransferExists();
+    error NoPendingGovernanceTransfer();
 
     // ------------------------------------------------------------------------------------------
     // Construction
@@ -320,15 +330,44 @@ contract SignedFeedAdapter is EIP712, IOracleAdapter {
     }
 
     // ------------------------------------------------------------------------------------------
-    // Role transfers (kept simple — caller transfers to a new address; receiver claim could be
-    // added later if needed)
+    // Role transfers
     // ------------------------------------------------------------------------------------------
+    // Governance transfer: TIMELOCKED (v2-audit Fix #7). Single-step transfers were the
+    // previous shape; a typo or compromised governance key could seize control instantly and
+    // then rotate the entire signer set inside the timelock window. Now propose/activate/cancel
+    // matches the LPVault / PerpEngine / SubjectRegistry pattern, with the same `timelockDelay`.
+    // Operator transfer stays single-step: the operator's only power is the pause flag, narrow
+    // blast radius, and fast emergency rotation is desirable.
 
-    function transferGovernance(address newGovernance) external {
+    function proposeGovernanceTransfer(address newGovernance) external {
         if (msg.sender != governance) revert Unauthorized(msg.sender);
         if (newGovernance == address(0)) revert InvalidConfig();
-        emit GovernanceTransferred(governance, newGovernance);
-        governance = newGovernance;
+        if (pendingGovernanceActivatesAt != 0) revert PendingGovernanceTransferExists();
+        uint64 activatesAt = uint64(block.timestamp + timelockDelay);
+        pendingGovernance = newGovernance;
+        pendingGovernanceActivatesAt = activatesAt;
+        emit GovernanceTransferProposed(newGovernance, activatesAt);
+    }
+
+    function activateGovernanceTransfer() external {
+        uint64 readyAt = pendingGovernanceActivatesAt;
+        if (readyAt == 0) revert NoPendingGovernanceTransfer();
+        if (block.timestamp < readyAt) revert TimelockNotElapsed(readyAt);
+        address oldGov = governance;
+        address newGov = pendingGovernance;
+        governance = newGov;
+        delete pendingGovernance;
+        delete pendingGovernanceActivatesAt;
+        emit GovernanceTransferActivated(oldGov, newGov);
+    }
+
+    function cancelGovernanceTransfer() external {
+        if (msg.sender != governance) revert Unauthorized(msg.sender);
+        if (pendingGovernanceActivatesAt == 0) revert NoPendingGovernanceTransfer();
+        address pending = pendingGovernance;
+        delete pendingGovernance;
+        delete pendingGovernanceActivatesAt;
+        emit GovernanceTransferCancelled(pending);
     }
 
     function transferOperator(address newOperator) external {

@@ -560,25 +560,82 @@ contract SignedFeedAdapterTest is Test {
     // Role transfers
     // ------------------------------------------------------------------------------------------
 
-    function test_TransferGovernance_HappyPath() public {
+    function test_GovernanceTransfer_HappyPath() public {
         address newGov = makeAddr("newGov");
-        vm.expectEmit(true, true, false, false, address(adapter));
-        emit SignedFeedAdapter.GovernanceTransferred(governance, newGov);
+        vm.expectEmit(true, false, false, true, address(adapter));
+        emit SignedFeedAdapter.GovernanceTransferProposed(newGov, uint64(block.timestamp + TIMELOCK_DELAY));
         vm.prank(governance);
-        adapter.transferGovernance(newGov);
+        adapter.proposeGovernanceTransfer(newGov);
+
+        // Pre-activation: governance still in place
+        assertEq(adapter.governance(), governance);
+
+        vm.warp(block.timestamp + TIMELOCK_DELAY);
+        vm.prank(stranger); // permissionless after timelock
+        vm.expectEmit(true, true, false, false, address(adapter));
+        emit SignedFeedAdapter.GovernanceTransferActivated(governance, newGov);
+        adapter.activateGovernanceTransfer();
         assertEq(adapter.governance(), newGov);
     }
 
-    function test_TransferGovernance_RevertOnNonGovernance() public {
+    function test_ProposeGovernanceTransfer_RevertOnNonGovernance() public {
         vm.prank(stranger);
         vm.expectRevert(abi.encodeWithSelector(SignedFeedAdapter.Unauthorized.selector, stranger));
-        adapter.transferGovernance(makeAddr("newGov"));
+        adapter.proposeGovernanceTransfer(makeAddr("newGov"));
     }
 
-    function test_TransferGovernance_RevertOnZero() public {
+    function test_ProposeGovernanceTransfer_RevertOnZero() public {
         vm.prank(governance);
         vm.expectRevert(SignedFeedAdapter.InvalidConfig.selector);
-        adapter.transferGovernance(address(0));
+        adapter.proposeGovernanceTransfer(address(0));
+    }
+
+    function test_ProposeGovernanceTransfer_RevertOnPendingExists() public {
+        vm.startPrank(governance);
+        adapter.proposeGovernanceTransfer(makeAddr("g1"));
+        vm.expectRevert(SignedFeedAdapter.PendingGovernanceTransferExists.selector);
+        adapter.proposeGovernanceTransfer(makeAddr("g2"));
+        vm.stopPrank();
+    }
+
+    function test_ActivateGovernanceTransfer_RevertOnNoPending() public {
+        vm.expectRevert(SignedFeedAdapter.NoPendingGovernanceTransfer.selector);
+        adapter.activateGovernanceTransfer();
+    }
+
+    function test_ActivateGovernanceTransfer_RevertBeforeTimelock() public {
+        vm.prank(governance);
+        adapter.proposeGovernanceTransfer(makeAddr("newGov"));
+        uint64 readyAt = uint64(block.timestamp + TIMELOCK_DELAY);
+        vm.warp(uint256(readyAt) - 1);
+        vm.expectRevert(abi.encodeWithSelector(SignedFeedAdapter.TimelockNotElapsed.selector, readyAt));
+        adapter.activateGovernanceTransfer();
+    }
+
+    function test_CancelGovernanceTransfer_HappyPath() public {
+        address newGov = makeAddr("newGov");
+        vm.prank(governance);
+        adapter.proposeGovernanceTransfer(newGov);
+        vm.expectEmit(true, false, false, false, address(adapter));
+        emit SignedFeedAdapter.GovernanceTransferCancelled(newGov);
+        vm.prank(governance);
+        adapter.cancelGovernanceTransfer();
+        assertEq(adapter.pendingGovernance(), address(0));
+        assertEq(adapter.pendingGovernanceActivatesAt(), 0);
+    }
+
+    function test_CancelGovernanceTransfer_RevertOnNonGovernance() public {
+        vm.prank(governance);
+        adapter.proposeGovernanceTransfer(makeAddr("newGov"));
+        vm.prank(stranger);
+        vm.expectRevert(abi.encodeWithSelector(SignedFeedAdapter.Unauthorized.selector, stranger));
+        adapter.cancelGovernanceTransfer();
+    }
+
+    function test_CancelGovernanceTransfer_RevertOnNoPending() public {
+        vm.prank(governance);
+        vm.expectRevert(SignedFeedAdapter.NoPendingGovernanceTransfer.selector);
+        adapter.cancelGovernanceTransfer();
     }
 
     function test_TransferOperator_HappyPath() public {
