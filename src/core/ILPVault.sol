@@ -107,11 +107,15 @@ interface ILPVault is IERC4626 {
         external
         returns (uint256 shares);
 
-    function withdrawWithMaxAssets(
+    /// @notice Slippage-protected redeem: burns `shares`, reverts if assets received are LESS
+    ///         than `minAssets`. The previous wrapper was named `withdrawWithMaxAssets` and
+    ///         checked the wrong direction (protected against receiving too many assets — which
+    ///         is impossible to harm a redeemer); this is the corrected form.
+    function redeemWithMinAssets(
         uint256 shares,
         address receiver,
         address owner_,
-        uint256 maxAssets
+        uint256 minAssets
     )
         external
         returns (uint256 assets);
@@ -198,7 +202,7 @@ interface ILPVault is IERC4626 {
     error InsufficientFreeAssets(uint256 requested, uint256 available);
     error InsufficientPositionCollateral(uint256 requested, uint256 available);
     error MinSharesNotMet(uint256 minShares, uint256 received);
-    error MaxAssetsExceeded(uint256 maxAssets, uint256 spent);
+    error MinAssetsNotMet(uint256 minAssets, uint256 received);
     error PerpEngineNotSet();
     error FeeSplitInvalid(uint256 fee, uint256 lpRebate, uint256 insuranceShare);
     error UnderwaterClose(uint256 collateralReleased, int256 pnl, uint256 fee);

@@ -211,18 +211,22 @@ contract LPVault is Initializable, UUPSUpgradeable, ERC4626Upgradeable, Reentran
     }
 
     /// @inheritdoc ILPVault
-    function withdrawWithMaxAssets(
+    function redeemWithMinAssets(
         uint256 shares,
         address receiver,
         address owner_,
-        uint256 maxAssets
+        uint256 minAssets
     )
         external
         nonReentrant
         returns (uint256 assets)
     {
         assets = redeem(shares, receiver, owner_);
-        if (assets > maxAssets) revert MaxAssetsExceeded(maxAssets, assets);
+        // Slippage floor: revert if the realized assets fall below the user's specified minimum.
+        // The earlier `withdrawWithMaxAssets` checked the wrong direction (`assets > maxAssets`),
+        // which only protected against a windfall — leaving redeemers fully exposed to share-price
+        // declines. See IMPLEMENTATION_AUDIT.md v2-audit finding #4.
+        if (assets < minAssets) revert MinAssetsNotMet(minAssets, assets);
     }
 
     // ------------------------------------------------------------------------------------------
@@ -286,6 +290,17 @@ contract LPVault is Initializable, UUPSUpgradeable, ERC4626Upgradeable, Reentran
         int256 returnedSigned = int256(collateralToRelease) + pnl - int256(fee);
         if (returnedSigned < 0) revert UnderwaterClose(collateralToRelease, pnl, fee);
         uint256 returned = uint256(returnedSigned);
+
+        // v2-audit Fix #2: solvency check on profitable closes. The PnL portion of `returned`
+        // (above what `collateralToRelease` covers) must be backed by `freeAssets`, otherwise the
+        // underlying `safeTransfer` would silently drain the USDC backing of the insurance and
+        // accruedFees buckets — leaving those storage counters phantom (storage > actual USDC).
+        // We check this BEFORE decrementing positionCollateral so freeAssets() is still computed
+        // against pre-settle state.
+        if (pnl > 0) {
+            uint256 pnlNet = uint256(pnl) > fee ? uint256(pnl) - fee : 0;
+            if (pnlNet > freeAssets()) revert InsufficientFreeAssets(pnlNet, freeAssets());
+        }
 
         s.positionCollateral -= collateralToRelease;
         s.insuranceFundBalance += insuranceShare;

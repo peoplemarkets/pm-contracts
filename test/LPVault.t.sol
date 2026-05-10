@@ -208,23 +208,25 @@ contract LPVaultTest is Test {
         vault.depositWithMinShares(USDC_1M, alice, expected + 1);
     }
 
-    function test_WithdrawWithMaxAssets_HappyPath() public {
+    function test_RedeemWithMinAssets_HappyPath() public {
         vm.prank(alice);
         uint256 shares = vault.deposit(USDC_1M, alice);
         uint256 expected = vault.previewRedeem(shares);
         vm.prank(alice);
-        uint256 assets = vault.withdrawWithMaxAssets(shares, alice, alice, expected);
+        uint256 assets = vault.redeemWithMinAssets(shares, alice, alice, expected);
         assertEq(assets, expected);
     }
 
-    function test_WithdrawWithMaxAssets_RevertOnSlippage() public {
+    function test_RedeemWithMinAssets_RevertOnSlippage() public {
         vm.prank(alice);
         uint256 shares = vault.deposit(USDC_1M, alice);
         uint256 expected = vault.previewRedeem(shares);
         if (expected == 0) return; // empty case
         vm.prank(alice);
-        vm.expectRevert(abi.encodeWithSelector(ILPVault.MaxAssetsExceeded.selector, expected - 1, expected));
-        vault.withdrawWithMaxAssets(shares, alice, alice, expected - 1);
+        // User asks for at least expected + 1 assets per share. Realized = expected.
+        // Reverts because realized < minAssets, protecting against share-price decline.
+        vm.expectRevert(abi.encodeWithSelector(ILPVault.MinAssetsNotMet.selector, expected + 1, expected));
+        vault.redeemWithMinAssets(shares, alice, alice, expected + 1);
     }
 
     // ------------------------------------------------------------------------------------------
@@ -422,6 +424,33 @@ contract LPVaultTest is Test {
             abi.encodeWithSelector(ILPVault.UnderwaterClose.selector, collat, -int256(collat + 1), uint256(0))
         );
         vault.settlePosition(trader, collat, -int256(collat + 1), 0, 0, 0);
+    }
+
+    function test_SettlePosition_RevertOnInsufficientFreeAssetsForProfit() public {
+        // v2-audit Fix #2: profitable PnL portion must be backed by freeAssets.
+        // Setup: vault has small freeAssets relative to the trader's profit.
+        // Alice deposits $1000. Trader opens $500 collat. freeAssets = $1000.
+        vm.prank(alice);
+        vault.deposit(1_000 * ONE_USDC, alice);
+        vm.prank(perpEngine);
+        vault.openPositionFlow(trader, 500 * ONE_USDC, 0, 0, 0);
+        // freeAssets is now $1000, positionCollateral $500.
+        // Try to settle with $2000 profit (way exceeds freeAssets).
+        vm.prank(perpEngine);
+        vm.expectRevert(
+            abi.encodeWithSelector(ILPVault.InsufficientFreeAssets.selector, 2_000 * ONE_USDC, 1_000 * ONE_USDC)
+        );
+        vault.settlePosition(trader, 500 * ONE_USDC, int256(2_000 * ONE_USDC), 0, 0, 0);
+    }
+
+    function test_SettlePosition_AllowsProfitWithinFreeAssets() public {
+        vm.prank(alice);
+        vault.deposit(1_000 * ONE_USDC, alice);
+        vm.prank(perpEngine);
+        vault.openPositionFlow(trader, 500 * ONE_USDC, 0, 0, 0);
+        // Profit of $500 is within freeAssets ($1000) — should succeed.
+        vm.prank(perpEngine);
+        vault.settlePosition(trader, 500 * ONE_USDC, int256(500 * ONE_USDC), 0, 0, 0);
     }
 
     function test_SettlePosition_RevertOnExcessRelease() public {
@@ -845,9 +874,7 @@ contract LPVaultTest is Test {
         usdc.approve(address(vault), type(uint256).max);
 
         vm.prank(governance);
-        vm.expectRevert(
-            abi.encodeWithSelector(ILPVault.InsuranceSeedCapExceeded.selector, cap + ONE_USDC, cap)
-        );
+        vm.expectRevert(abi.encodeWithSelector(ILPVault.InsuranceSeedCapExceeded.selector, cap + ONE_USDC, cap));
         vault.seedInsurance(cap + ONE_USDC);
     }
 
@@ -861,9 +888,7 @@ contract LPVaultTest is Test {
         vault.seedInsurance(cap - ONE_USDC);
 
         vm.prank(governance);
-        vm.expectRevert(
-            abi.encodeWithSelector(ILPVault.InsuranceSeedCapExceeded.selector, cap + ONE_USDC, cap)
-        );
+        vm.expectRevert(abi.encodeWithSelector(ILPVault.InsuranceSeedCapExceeded.selector, cap + ONE_USDC, cap));
         vault.seedInsurance(2 * ONE_USDC);
     }
 
@@ -889,8 +914,7 @@ contract LPVaultTest is Test {
 
         assertEq(
             usdc.balanceOf(address(vault)),
-            vault.freeAssets() + vault.positionCollateral() + vault.insuranceFundBalance()
-                + vault.accruedFees()
+            vault.freeAssets() + vault.positionCollateral() + vault.insuranceFundBalance() + vault.accruedFees()
         );
     }
 
@@ -973,9 +997,7 @@ contract LPVaultTest is Test {
         _accrueFees(100 * ONE_USDC);
         uint256 accrued = vault.accruedFees();
         vm.prank(governance);
-        vm.expectRevert(
-            abi.encodeWithSelector(ILPVault.InsufficientAccruedFees.selector, accrued + 1, accrued)
-        );
+        vm.expectRevert(abi.encodeWithSelector(ILPVault.InsufficientAccruedFees.selector, accrued + 1, accrued));
         vault.proposeFeeWithdrawal(makeAddr("x"), accrued + 1);
     }
 
@@ -1020,8 +1042,7 @@ contract LPVaultTest is Test {
 
         assertEq(
             usdc.balanceOf(address(vault)),
-            vault.freeAssets() + vault.positionCollateral() + vault.insuranceFundBalance()
-                + vault.accruedFees()
+            vault.freeAssets() + vault.positionCollateral() + vault.insuranceFundBalance() + vault.accruedFees()
         );
     }
 
