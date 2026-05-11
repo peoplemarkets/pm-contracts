@@ -142,6 +142,14 @@ contract PerpEngine is Initializable, UUPSUpgradeable, ReentrancyGuard, IPerpEng
         _;
     }
 
+    /// @dev Same shape as `onlyFundingEngine`. Until the FeedbackController is wired in, every
+    ///      `applyImpulse` call lands here and reverts.
+    modifier onlyFeedbackController() {
+        address writer = PerpStorage.load().feedbackController;
+        if (msg.sender != writer || writer == address(0)) revert OnlyFeedbackController(msg.sender);
+        _;
+    }
+
     // ------------------------------------------------------------------------------------------
     // Modifiers
     // ------------------------------------------------------------------------------------------
@@ -562,8 +570,7 @@ contract PerpEngine is Initializable, UUPSUpgradeable, ReentrancyGuard, IPerpEng
         // the cap in either direction.
         bytes32 categoryId = _categoryOf(perpS, subjectId);
         int256 currentNet = marginS.netCategoryOi[categoryId];
-        int256 prospective =
-            side == Side.LONG ? currentNet + int256(sizeNotional) : currentNet - int256(sizeNotional);
+        int256 prospective = side == Side.LONG ? currentNet + int256(sizeNotional) : currentNet - int256(sizeNotional);
         uint256 prospectiveAbs = prospective >= 0 ? uint256(prospective) : uint256(-prospective);
         uint256 categoryCap = (vaultTvl * marginS.categoryNetOiCapBps) / BPS_DENOMINATOR;
         if (prospectiveAbs > categoryCap) {
@@ -585,14 +592,7 @@ contract PerpEngine is Initializable, UUPSUpgradeable, ReentrancyGuard, IPerpEng
 
     /// @dev Look up the category for `subjectId` from the registry. Wrapped in a private helper
     ///      to keep the open/close paths terse and to make the cross-contract read explicit.
-    function _categoryOf(
-        PerpStorage.Layout storage perpS,
-        bytes32 subjectId
-    )
-        internal
-        view
-        returns (bytes32)
-    {
+    function _categoryOf(PerpStorage.Layout storage perpS, bytes32 subjectId) internal view returns (bytes32) {
         return ISubjectRegistry(perpS.subjectRegistry).subjectOf(subjectId).categoryId;
     }
 
@@ -651,14 +651,7 @@ contract PerpEngine is Initializable, UUPSUpgradeable, ReentrancyGuard, IPerpEng
     ///      event so indexers can compute realized funding off-chain. Pauses freeze funding per
     ///      spec §2 line 66 — we route through `requireTradeable` to share the existing
     ///      pause-state semantics (status == ACTIVE, no policy flag).
-    function pushFundingIndex(
-        bytes32 subjectId,
-        int256 newIndex,
-        int256 fundingRate1e18
-    )
-        external
-        onlyFundingEngine
-    {
+    function pushFundingIndex(bytes32 subjectId, int256 newIndex, int256 fundingRate1e18) external onlyFundingEngine {
         PerpStorage.Layout storage perpS = PerpStorage.load();
         ISubjectRegistry(perpS.subjectRegistry).requireTradeable(subjectId);
 
@@ -668,6 +661,40 @@ contract PerpEngine is Initializable, UUPSUpgradeable, ReentrancyGuard, IPerpEng
         fundingS.lastFundingAt[subjectId] = uint64(block.timestamp);
 
         emit FundingPushed(subjectId, oldIndex, newIndex, fundingRate1e18, uint64(block.timestamp));
+    }
+
+    /// @inheritdoc IPerpEngine
+    /// @dev Wave 3B FeedbackController hook. Multiplies the current mark by
+    ///      `(BPS_DENOMINATOR + impulseBps) / BPS_DENOMINATOR`. Caller MUST be the configured
+    ///      FeedbackController; the subject MUST be tradeable so spec §3 line 173
+    ///      ("no event-impulse application during pauses") holds.
+    ///
+    /// @dev No per-update delta-cap check here — the FeedbackController's own ±15% impulse cap
+    ///      is the controlling lever. The `markMaxDeltaBps` field bounds live mark-writer
+    ///      pushes (which use a separate channel via `pushMark`); applying that cap here would
+    ///      double-bound a path that is already constrained.
+    ///
+    /// @dev First-ever push for a subject (mark == 0) reverts: applying a multiplicative impulse
+    ///      to an uninitialized mark would still leave it at zero and silently drop the bump.
+    function applyImpulse(bytes32 subjectId, int256 impulseBps) external onlyFeedbackController {
+        PerpStorage.Layout storage perpS = PerpStorage.load();
+        ISubjectRegistry(perpS.subjectRegistry).requireTradeable(subjectId);
+
+        uint256 oldMark = perpS.markPrice[subjectId];
+        if (oldMark == 0) revert MarkNotInitialized(subjectId);
+
+        // newMark = oldMark × (BPS + impulseBps) / BPS. The multiplier is signed; for
+        // `impulseBps = -BPS_DENOMINATOR` it is zero and we revert as ImpulseUnderflow. For
+        // anything more negative it would be negative — also caught by the underflow guard.
+        int256 multiplier = int256(BPS_DENOMINATOR) + impulseBps;
+        int256 newMarkSigned = (int256(oldMark) * multiplier) / int256(BPS_DENOMINATOR);
+        if (newMarkSigned <= 0) revert ImpulseUnderflow();
+        uint256 newMark = uint256(newMarkSigned);
+
+        perpS.markPrice[subjectId] = newMark;
+        perpS.markUpdatedAt[subjectId] = uint64(block.timestamp);
+
+        emit MarkImpulsed(subjectId, oldMark, newMark, impulseBps, uint64(block.timestamp));
     }
 
     /// @inheritdoc IPerpEngine
@@ -868,6 +895,48 @@ contract PerpEngine is Initializable, UUPSUpgradeable, ReentrancyGuard, IPerpEng
     }
 
     // ------------------------------------------------------------------------------------------
+    // Governance: FeedbackController rotation (timelocked)
+    //
+    // Same shape as `proposeSetFundingEngine`. Until the FeedbackController is wired in, the
+    // writer stays at `address(0)` and `applyImpulse` reverts.
+    // ------------------------------------------------------------------------------------------
+
+    /// @inheritdoc IPerpEngine
+    function proposeSetFeedbackController(address newController) external onlyGovernance {
+        if (newController == address(0)) revert InvalidConfig();
+        PerpStorage.Layout storage perpS = PerpStorage.load();
+        if (perpS.pendingFeedbackControllerActivatesAt != 0) revert PendingFeedbackControllerExists();
+        uint64 activatesAt = uint64(block.timestamp + perpS.timelockDelay);
+        perpS.pendingFeedbackController = newController;
+        perpS.pendingFeedbackControllerActivatesAt = activatesAt;
+        emit FeedbackControllerProposed(newController, activatesAt);
+    }
+
+    /// @inheritdoc IPerpEngine
+    function activateSetFeedbackController() external {
+        PerpStorage.Layout storage perpS = PerpStorage.load();
+        uint64 readyAt = perpS.pendingFeedbackControllerActivatesAt;
+        if (readyAt == 0) revert NoPendingFeedbackController();
+        if (block.timestamp < readyAt) revert TimelockNotElapsed(readyAt);
+        address oldController = perpS.feedbackController;
+        address newController = perpS.pendingFeedbackController;
+        perpS.feedbackController = newController;
+        delete perpS.pendingFeedbackController;
+        delete perpS.pendingFeedbackControllerActivatesAt;
+        emit FeedbackControllerActivated(oldController, newController);
+    }
+
+    /// @inheritdoc IPerpEngine
+    function cancelSetFeedbackController() external onlyGovernance {
+        PerpStorage.Layout storage perpS = PerpStorage.load();
+        if (perpS.pendingFeedbackControllerActivatesAt == 0) revert NoPendingFeedbackController();
+        address pending = perpS.pendingFeedbackController;
+        delete perpS.pendingFeedbackController;
+        delete perpS.pendingFeedbackControllerActivatesAt;
+        emit FeedbackControllerCancelled(pending);
+    }
+
+    // ------------------------------------------------------------------------------------------
     // Governance: transfer (timelocked)
     // ------------------------------------------------------------------------------------------
 
@@ -1047,6 +1116,17 @@ contract PerpEngine is Initializable, UUPSUpgradeable, ReentrancyGuard, IPerpEng
     function pendingFundingEngine() external view returns (address account, uint64 activatesAt) {
         PerpStorage.Layout storage perpS = PerpStorage.load();
         return (perpS.pendingFundingEngine, perpS.pendingFundingEngineActivatesAt);
+    }
+
+    /// @inheritdoc IPerpEngine
+    function feedbackController() external view returns (address) {
+        return PerpStorage.load().feedbackController;
+    }
+
+    /// @inheritdoc IPerpEngine
+    function pendingFeedbackController() external view returns (address account, uint64 activatesAt) {
+        PerpStorage.Layout storage perpS = PerpStorage.load();
+        return (perpS.pendingFeedbackController, perpS.pendingFeedbackControllerActivatesAt);
     }
 
     /// @inheritdoc IPerpEngine

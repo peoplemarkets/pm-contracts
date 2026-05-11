@@ -82,6 +82,14 @@ library PerpStorage {
         address fundingEngine;
         address pendingFundingEngine;
         uint64 pendingFundingEngineActivatesAt;
+        // ---- APPENDED: Wave 3B FeedbackController wiring ----
+        // Authorized caller for `applyImpulse`. Rotated through the standard timelocked
+        // propose/activate/cancel flow (same shape as `pendingFundingEngine`). Stays at `0x0`
+        // until FeedbackController v1 is wired in; `applyImpulse` reverts on every call until
+        // then.
+        address feedbackController;
+        address pendingFeedbackController;
+        uint64 pendingFeedbackControllerActivatesAt;
     }
 
     function load() internal pure returns (Layout storage l) {

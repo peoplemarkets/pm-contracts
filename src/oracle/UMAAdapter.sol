@@ -1,10 +1,10 @@
 // SPDX-License-Identifier: BUSL-1.1
 pragma solidity 0.8.24;
 
-import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
-import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 import {Initializable} from "@openzeppelin/contracts-upgradeable/proxy/utils/Initializable.sol";
 import {UUPSUpgradeable} from "@openzeppelin/contracts-upgradeable/proxy/utils/UUPSUpgradeable.sol";
+import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 
 import {IOracleAdapter} from "./IOracleAdapter.sol";
 import {IOracleRouter} from "./IOracleRouter.sol";
@@ -188,9 +188,7 @@ contract UMAAdapter is Initializable, UUPSUpgradeable, IOracleAdapter {
         uint256 bond,
         uint64 expiresAt
     );
-    event AssertionSettled(
-        bytes32 indexed metricId, bytes32 indexed assertionId, uint256 settledValue, bool disputed
-    );
+    event AssertionSettled(bytes32 indexed metricId, bytes32 indexed assertionId, uint256 settledValue, bool disputed);
 
     event GovernanceTransferProposed(address indexed newGovernance, uint64 activatesAt);
     event GovernanceTransferActivated(address indexed oldGovernance, address indexed newGovernance);
@@ -347,8 +345,7 @@ contract UMAAdapter is Initializable, UUPSUpgradeable, IOracleAdapter {
             registered: true
         });
         uint64 activatesAt = uint64(block.timestamp) + uint64(l.timelockDelay);
-        l.pendingMetric[metricId] =
-            PendingMetric({config: cfg, activatesAt: activatesAt, isUpdate: true, exists: true});
+        l.pendingMetric[metricId] = PendingMetric({config: cfg, activatesAt: activatesAt, isUpdate: true, exists: true});
         emit MetricUpdateProposed(metricId, cfg, activatesAt);
     }
 

@@ -270,10 +270,8 @@ contract OracleRouter is Initializable, UUPSUpgradeable, IOracleRouter {
             revert InvalidConfig();
         }
         if (config.maxDeltaBps == 0 || config.maxDeltaBps > MAX_DELTA_BPS_CEILING) revert InvalidConfig();
-        if (
-            config.expectedCadenceSeconds < MIN_CADENCE_SECONDS
-                || config.expectedCadenceSeconds > MAX_CADENCE_SECONDS
-        ) {
+        if (config.expectedCadenceSeconds < MIN_CADENCE_SECONDS || config.expectedCadenceSeconds > MAX_CADENCE_SECONDS)
+        {
             revert CadenceOutOfRange(config.expectedCadenceSeconds);
         }
         // `degraded` may be either; setting it true at registration is a valid pre-staging move.

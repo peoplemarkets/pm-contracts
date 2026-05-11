@@ -1982,4 +1982,160 @@ contract PerpEngineTest is Test {
         vm.expectRevert(abi.encodeWithSelector(IPerpEngine.Unauthorized.selector, stranger));
         engine.setCategoryNetOiCapBps(3_000);
     }
+
+    // ------------------------------------------------------------------------------------------
+    // Wave 3B: applyImpulse + FeedbackController rotation
+    // ------------------------------------------------------------------------------------------
+
+    function test_ApplyImpulse_RevertWhenFeedbackControllerUnset() public {
+        // Default state: no feedbackController configured.
+        vm.prank(stranger);
+        vm.expectRevert(abi.encodeWithSelector(IPerpEngine.OnlyFeedbackController.selector, stranger));
+        engine.applyImpulse(SUBJECT_ID, int256(500));
+    }
+
+    function test_ApplyImpulse_ProposeSetFeedbackController_Happy() public {
+        address fb = makeAddr("fbController");
+        vm.expectEmit(true, false, false, true, address(engine));
+        emit IPerpEngine.FeedbackControllerProposed(fb, uint64(block.timestamp + TIMELOCK_DELAY));
+        vm.prank(governance);
+        engine.proposeSetFeedbackController(fb);
+        (address pending, uint64 readyAt) = engine.pendingFeedbackController();
+        assertEq(pending, fb);
+        assertEq(uint256(readyAt), block.timestamp + TIMELOCK_DELAY);
+    }
+
+    function test_ApplyImpulse_ProposeSetFeedbackController_RevertOnZero() public {
+        vm.prank(governance);
+        vm.expectRevert(IPerpEngine.InvalidConfig.selector);
+        engine.proposeSetFeedbackController(address(0));
+    }
+
+    function test_ApplyImpulse_ProposeSetFeedbackController_RevertOnExisting() public {
+        address fb = makeAddr("fbController");
+        vm.prank(governance);
+        engine.proposeSetFeedbackController(fb);
+        vm.prank(governance);
+        vm.expectRevert(IPerpEngine.PendingFeedbackControllerExists.selector);
+        engine.proposeSetFeedbackController(fb);
+    }
+
+    function test_ApplyImpulse_ActivateSetFeedbackController_Happy() public {
+        address fb = makeAddr("fbController");
+        vm.prank(governance);
+        engine.proposeSetFeedbackController(fb);
+        vm.warp(block.timestamp + TIMELOCK_DELAY);
+        vm.expectEmit(true, true, false, false, address(engine));
+        emit IPerpEngine.FeedbackControllerActivated(address(0), fb);
+        engine.activateSetFeedbackController();
+        assertEq(engine.feedbackController(), fb);
+    }
+
+    function test_ApplyImpulse_ActivateSetFeedbackController_RevertOnNoPending() public {
+        vm.expectRevert(IPerpEngine.NoPendingFeedbackController.selector);
+        engine.activateSetFeedbackController();
+    }
+
+    function test_ApplyImpulse_ActivateSetFeedbackController_RevertOnTimelockNotElapsed() public {
+        address fb = makeAddr("fbController");
+        vm.prank(governance);
+        engine.proposeSetFeedbackController(fb);
+        vm.expectRevert(
+            abi.encodeWithSelector(IPerpEngine.TimelockNotElapsed.selector, uint64(block.timestamp + TIMELOCK_DELAY))
+        );
+        engine.activateSetFeedbackController();
+    }
+
+    function test_ApplyImpulse_CancelSetFeedbackController_Happy() public {
+        address fb = makeAddr("fbController");
+        vm.prank(governance);
+        engine.proposeSetFeedbackController(fb);
+        vm.expectEmit(true, false, false, false, address(engine));
+        emit IPerpEngine.FeedbackControllerCancelled(fb);
+        vm.prank(governance);
+        engine.cancelSetFeedbackController();
+        (address pending,) = engine.pendingFeedbackController();
+        assertEq(pending, address(0));
+    }
+
+    function test_ApplyImpulse_CancelSetFeedbackController_RevertOnNoPending() public {
+        vm.prank(governance);
+        vm.expectRevert(IPerpEngine.NoPendingFeedbackController.selector);
+        engine.cancelSetFeedbackController();
+    }
+
+    /// @dev Helper: rotate a mock FeedbackController address into engine via the timelocked flow.
+    function _activateFeedbackController(address fb) internal {
+        vm.prank(governance);
+        engine.proposeSetFeedbackController(fb);
+        vm.warp(block.timestamp + TIMELOCK_DELAY);
+        engine.activateSetFeedbackController();
+    }
+
+    function test_ApplyImpulse_HappyPath_Positive() public {
+        address fb = makeAddr("fbController");
+        _activateFeedbackController(fb);
+        uint256 oldMark = INITIAL_MARK;
+        vm.expectEmit(true, false, false, true, address(engine));
+        emit IPerpEngine.MarkImpulsed(
+            SUBJECT_ID, oldMark, oldMark * 10_500 / 10_000, int256(500), uint64(block.timestamp)
+        );
+        vm.prank(fb);
+        engine.applyImpulse(SUBJECT_ID, int256(500)); // +5%
+        (uint256 newMark, uint64 updatedAt) = engine.markOf(SUBJECT_ID);
+        assertEq(newMark, oldMark * 10_500 / 10_000);
+        assertEq(uint256(updatedAt), block.timestamp);
+    }
+
+    function test_ApplyImpulse_NegativeImpulse_LowersMark() public {
+        address fb = makeAddr("fbController");
+        _activateFeedbackController(fb);
+        vm.prank(fb);
+        engine.applyImpulse(SUBJECT_ID, -int256(500)); // -5%
+        (uint256 newMark,) = engine.markOf(SUBJECT_ID);
+        assertEq(newMark, INITIAL_MARK * 9_500 / 10_000);
+    }
+
+    function test_ApplyImpulse_RevertOnUnderflow() public {
+        address fb = makeAddr("fbController");
+        _activateFeedbackController(fb);
+        vm.prank(fb);
+        vm.expectRevert(IPerpEngine.ImpulseUnderflow.selector);
+        engine.applyImpulse(SUBJECT_ID, -int256(10_000)); // multiplier = 0 → newMark = 0
+    }
+
+    function test_ApplyImpulse_RevertOnPausedSubject() public {
+        address fb = makeAddr("fbController");
+        _activateFeedbackController(fb);
+        vm.prank(regGuardian);
+        registry.setAutoPaused(SUBJECT_ID, 0);
+        vm.prank(fb);
+        vm.expectRevert(
+            abi.encodeWithSelector(
+                ISubjectRegistry.InvalidStatusTransition.selector,
+                ISubjectRegistry.SubjectStatus.AUTO_PAUSED,
+                ISubjectRegistry.SubjectStatus.ACTIVE
+            )
+        );
+        engine.applyImpulse(SUBJECT_ID, int256(500));
+    }
+
+    function test_ApplyImpulse_RevertOnUninitializedMark() public {
+        address fb = makeAddr("fbController");
+        _activateFeedbackController(fb);
+        bytes32 fresh = keccak256("freshpe");
+        vm.prank(regAdmin);
+        registry.listSubject(fresh, CATEGORY_ID);
+        vm.prank(fb);
+        vm.expectRevert(abi.encodeWithSelector(IPerpEngine.MarkNotInitialized.selector, fresh));
+        engine.applyImpulse(fresh, int256(500));
+    }
+
+    function test_ApplyImpulse_RevertOnNonControllerCaller() public {
+        address fb = makeAddr("fbController");
+        _activateFeedbackController(fb);
+        vm.prank(stranger);
+        vm.expectRevert(abi.encodeWithSelector(IPerpEngine.OnlyFeedbackController.selector, stranger));
+        engine.applyImpulse(SUBJECT_ID, int256(500));
+    }
 }

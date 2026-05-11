@@ -201,14 +201,7 @@ contract ChainlinkAdapter is Initializable, UUPSUpgradeable, IOracleAdapter {
     /// @param metricId      The composite metric identifier (e.g. keccak(subjectId, metricKindId)).
     /// @param aggregator    Chainlink AggregatorV3 address.
     /// @param maxStaleness  Per-metric staleness ceiling in seconds (bounds enforced).
-    function proposeRegisterFeed(
-        bytes32 metricId,
-        address aggregator,
-        uint32 maxStaleness
-    )
-        external
-        onlyGovernance
-    {
+    function proposeRegisterFeed(bytes32 metricId, address aggregator, uint32 maxStaleness) external onlyGovernance {
         if (aggregator == address(0)) revert InvalidAggregator();
         if (maxStaleness < MIN_MAX_STALENESS || maxStaleness > MAX_MAX_STALENESS) {
             revert MaxStalenessOutOfRange(maxStaleness);
@@ -273,14 +266,7 @@ contract ChainlinkAdapter is Initializable, UUPSUpgradeable, IOracleAdapter {
     /// @param metricId      Metric whose feed is being updated.
     /// @param aggregator    New Chainlink AggregatorV3 address.
     /// @param maxStaleness  New per-metric staleness window in seconds.
-    function proposeUpdateFeed(
-        bytes32 metricId,
-        address aggregator,
-        uint32 maxStaleness
-    )
-        external
-        onlyGovernance
-    {
+    function proposeUpdateFeed(bytes32 metricId, address aggregator, uint32 maxStaleness) external onlyGovernance {
         if (aggregator == address(0)) revert InvalidAggregator();
         if (maxStaleness < MIN_MAX_STALENESS || maxStaleness > MAX_MAX_STALENESS) {
             revert MaxStalenessOutOfRange(maxStaleness);

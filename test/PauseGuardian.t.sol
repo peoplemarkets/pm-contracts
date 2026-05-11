@@ -183,18 +183,16 @@ contract PauseGuardianTest is Test {
 
     function test_Initialize_RevertOnZeroGovernance() public {
         PauseGuardian impl = new PauseGuardian();
-        bytes memory initData = abi.encodeCall(
-            PauseGuardian.initialize, (address(0), address(engine), address(registry), TIMELOCK_DELAY)
-        );
+        bytes memory initData =
+            abi.encodeCall(PauseGuardian.initialize, (address(0), address(engine), address(registry), TIMELOCK_DELAY));
         vm.expectRevert(PauseGuardian.InvalidConfig.selector);
         new ERC1967Proxy(address(impl), initData);
     }
 
     function test_Initialize_RevertOnZeroPerpEngine() public {
         PauseGuardian impl = new PauseGuardian();
-        bytes memory initData = abi.encodeCall(
-            PauseGuardian.initialize, (governance, address(0), address(registry), TIMELOCK_DELAY)
-        );
+        bytes memory initData =
+            abi.encodeCall(PauseGuardian.initialize, (governance, address(0), address(registry), TIMELOCK_DELAY));
         vm.expectRevert(PauseGuardian.InvalidConfig.selector);
         new ERC1967Proxy(address(impl), initData);
     }
@@ -218,9 +216,8 @@ contract PauseGuardianTest is Test {
 
     function test_Initialize_RevertOnTimelockTooLong() public {
         PauseGuardian impl = new PauseGuardian();
-        bytes memory initData = abi.encodeCall(
-            PauseGuardian.initialize, (governance, address(engine), address(registry), uint32(60 days))
-        );
+        bytes memory initData =
+            abi.encodeCall(PauseGuardian.initialize, (governance, address(engine), address(registry), uint32(60 days)));
         vm.expectRevert(PauseGuardian.InvalidConfig.selector);
         new ERC1967Proxy(address(impl), initData);
     }
@@ -252,9 +249,7 @@ contract PauseGuardianTest is Test {
         vm.warp(firstObsTs + 4);
         _pushMark(INITIAL_MARK);
         vm.expectRevert(
-            abi.encodeWithSelector(
-                PauseGuardian.IntervalNotElapsed.selector, SUBJECT_ID, firstObsTs, firstObsTs + 5
-            )
+            abi.encodeWithSelector(PauseGuardian.IntervalNotElapsed.selector, SUBJECT_ID, firstObsTs, firstObsTs + 5)
         );
         vm.prank(keeper);
         guardian.observe(SUBJECT_ID);
@@ -307,9 +302,7 @@ contract PauseGuardianTest is Test {
         // 4% move over 30s — below 5% auto threshold.
         vm.warp(block.timestamp + 25);
         _pushAndObserve(104 * ONE_18);
-        assertEq(
-            uint8(registry.statusOf(SUBJECT_ID)), uint8(ISubjectRegistry.SubjectStatus.ACTIVE)
-        );
+        assertEq(uint8(registry.statusOf(SUBJECT_ID)), uint8(ISubjectRegistry.SubjectStatus.ACTIVE));
     }
 
     // ------------------------------------------------------------------------------------------
@@ -321,9 +314,7 @@ contract PauseGuardianTest is Test {
         // Move +5% in 20s.
         vm.warp(block.timestamp + 20);
         _pushAndObserve(105 * ONE_18);
-        assertEq(
-            uint8(registry.statusOf(SUBJECT_ID)), uint8(ISubjectRegistry.SubjectStatus.AUTO_PAUSED)
-        );
+        assertEq(uint8(registry.statusOf(SUBJECT_ID)), uint8(ISubjectRegistry.SubjectStatus.AUTO_PAUSED));
     }
 
     function test_Observe_TripsAutoPaused_OnFivePctMoveDown() public {
@@ -331,9 +322,7 @@ contract PauseGuardianTest is Test {
         // Move −5% (95 from 100, abs(diff)/cur = 5/95 ≈ 526bps).
         vm.warp(block.timestamp + 20);
         _pushAndObserve(95 * ONE_18);
-        assertEq(
-            uint8(registry.statusOf(SUBJECT_ID)), uint8(ISubjectRegistry.SubjectStatus.AUTO_PAUSED)
-        );
+        assertEq(uint8(registry.statusOf(SUBJECT_ID)), uint8(ISubjectRegistry.SubjectStatus.AUTO_PAUSED));
     }
 
     function test_Observe_DoesNotTripAutoPaused_BeyondWindow() public {
@@ -341,9 +330,7 @@ contract PauseGuardianTest is Test {
         _observe();
         vm.warp(block.timestamp + 120); // 2 min later — outside the 30s window
         _pushAndObserve(105 * ONE_18); // delta vs THIS push's history: only one new point so far
-        assertEq(
-            uint8(registry.statusOf(SUBJECT_ID)), uint8(ISubjectRegistry.SubjectStatus.ACTIVE)
-        );
+        assertEq(uint8(registry.statusOf(SUBJECT_ID)), uint8(ISubjectRegistry.SubjectStatus.ACTIVE));
     }
 
     // ------------------------------------------------------------------------------------------
@@ -424,9 +411,7 @@ contract PauseGuardianTest is Test {
         vm.expectEmit(true, false, false, true, address(guardian));
         emit PauseGuardian.BreakerTriggered(SUBJECT_ID, 3, 2500, 2000);
         _observe();
-        assertEq(
-            uint8(registry.statusOf(SUBJECT_ID)), uint8(ISubjectRegistry.SubjectStatus.FROZEN)
-        );
+        assertEq(uint8(registry.statusOf(SUBJECT_ID)), uint8(ISubjectRegistry.SubjectStatus.FROZEN));
     }
 
     // ------------------------------------------------------------------------------------------
@@ -438,15 +423,11 @@ contract PauseGuardianTest is Test {
         _observe();
         vm.warp(block.timestamp + 20);
         _pushAndObserve(105 * ONE_18);
-        assertEq(
-            uint8(registry.statusOf(SUBJECT_ID)), uint8(ISubjectRegistry.SubjectStatus.AUTO_PAUSED)
-        );
+        assertEq(uint8(registry.statusOf(SUBJECT_ID)), uint8(ISubjectRegistry.SubjectStatus.AUTO_PAUSED));
         // Now push another spike; status should not change (we are not ACTIVE anymore).
         vm.warp(block.timestamp + 10);
         _pushAndObserve(120 * ONE_18); // would otherwise trip FROZEN
-        assertEq(
-            uint8(registry.statusOf(SUBJECT_ID)), uint8(ISubjectRegistry.SubjectStatus.AUTO_PAUSED)
-        );
+        assertEq(uint8(registry.statusOf(SUBJECT_ID)), uint8(ISubjectRegistry.SubjectStatus.AUTO_PAUSED));
     }
 
     function test_Observe_Idempotent_NoOpWhenSubjectFrozen() public {
@@ -454,30 +435,22 @@ contract PauseGuardianTest is Test {
         _observe();
         vm.warp(block.timestamp + 10);
         _pushAndObserve(125 * ONE_18);
-        assertEq(
-            uint8(registry.statusOf(SUBJECT_ID)), uint8(ISubjectRegistry.SubjectStatus.FROZEN)
-        );
+        assertEq(uint8(registry.statusOf(SUBJECT_ID)), uint8(ISubjectRegistry.SubjectStatus.FROZEN));
         // Another spike — no change.
         vm.warp(block.timestamp + 30);
         _pushAndObserve(150 * ONE_18);
-        assertEq(
-            uint8(registry.statusOf(SUBJECT_ID)), uint8(ISubjectRegistry.SubjectStatus.FROZEN)
-        );
+        assertEq(uint8(registry.statusOf(SUBJECT_ID)), uint8(ISubjectRegistry.SubjectStatus.FROZEN));
     }
 
     function test_Observe_Idempotent_NoOpWhenSubjectDelisted() public {
         vm.prank(regAdmin);
         registry.involuntaryDelist(SUBJECT_ID);
-        assertEq(
-            uint8(registry.statusOf(SUBJECT_ID)), uint8(ISubjectRegistry.SubjectStatus.DELISTED)
-        );
+        assertEq(uint8(registry.statusOf(SUBJECT_ID)), uint8(ISubjectRegistry.SubjectStatus.DELISTED));
         // observe still appends the observation (does not revert) but does NOT trip a breaker on
         // a non-ACTIVE subject.
         vm.warp(block.timestamp + 10);
         _pushAndObserve(125 * ONE_18);
-        assertEq(
-            uint8(registry.statusOf(SUBJECT_ID)), uint8(ISubjectRegistry.SubjectStatus.DELISTED)
-        );
+        assertEq(uint8(registry.statusOf(SUBJECT_ID)), uint8(ISubjectRegistry.SubjectStatus.DELISTED));
     }
 
     // ------------------------------------------------------------------------------------------

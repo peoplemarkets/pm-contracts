@@ -117,6 +117,18 @@ interface IPerpEngine {
     function activateSetFundingEngine() external;
     function cancelSetFundingEngine() external;
 
+    /// @notice Wave 3B FeedbackController writer rotation. Same shape as the FundingEngine
+    ///         rotation: timelocked propose/activate/cancel via the existing `timelockDelay`.
+    ///         Until activated, `applyImpulse` reverts on every call.
+    function proposeSetFeedbackController(address newController) external;
+    function activateSetFeedbackController() external;
+    function cancelSetFeedbackController() external;
+
+    /// @notice FeedbackController-only mark bump. Caller MUST be the configured
+    ///         `feedbackController`; the subject MUST be tradeable. Multiplies the current mark
+    ///         by `(10_000 + impulseBps) / 10_000` and updates `markUpdatedAt`.
+    function applyImpulse(bytes32 subjectId, int256 impulseBps) external;
+
     /// @notice FundingEngine-only writer for the per-subject cumulative funding index. Caller MUST
     ///         be the configured `fundingEngine`; the subject MUST be tradeable (pauses freeze
     ///         funding per spec §2 line 66).
@@ -162,6 +174,15 @@ interface IPerpEngine {
 
     /// @notice Configured FundingEngine writer. `address(0)` until FundingEngine v1 ships.
     function fundingEngine() external view returns (address);
+
+    /// @notice Configured FeedbackController writer. `address(0)` until Wave 3B is wired in.
+    function feedbackController() external view returns (address);
+
+    /// @notice Pending FeedbackController rotation (zero address + zero timestamp when none).
+    function pendingFeedbackController() external view returns (address account, uint64 activatesAt);
+
+    /// @notice The configured SubjectRegistry dependency.
+    function subjectRegistry() external view returns (address);
 
     /// @notice Most recent cumulative funding index for `subjectId` (signed, 1e18 scale).
     function cumulativeFundingIndex(bytes32 subjectId) external view returns (int256);
@@ -241,6 +262,16 @@ interface IPerpEngine {
     event FundingEngineActivated(address indexed oldEngine, address indexed newEngine);
     event FundingEngineCancelled(address indexed pendingEngine);
 
+    // --- Wave 3B FeedbackController ---
+    /// @notice FeedbackController bumped the mark for `subjectId` via `applyImpulse`.
+    event MarkImpulsed(
+        bytes32 indexed subjectId, uint256 oldMark, uint256 newMark, int256 impulseBps, uint64 timestamp
+    );
+    /// @notice Timelocked rotation of the FeedbackController writer.
+    event FeedbackControllerProposed(address indexed newController, uint64 activatesAt);
+    event FeedbackControllerActivated(address indexed oldController, address indexed newController);
+    event FeedbackControllerCancelled(address indexed pendingController);
+
     // --- Tier-1 category OI cap ---
     /// @notice Governance updated the net-category OI cap.
     event CategoryNetOiCapBpsSet(uint16 oldBps, uint16 newBps);
@@ -291,4 +322,10 @@ interface IPerpEngine {
     // --- Tier-1 net-category OI cap ---
     error CategoryOiCapExceeded(bytes32 categoryId, uint256 proposedAbs, uint256 cap);
     error CategoryOiCapBpsOutOfRange();
+    // --- Wave 3B FeedbackController ---
+    error OnlyFeedbackController(address caller);
+    error MarkNotInitialized(bytes32 subjectId);
+    error ImpulseUnderflow();
+    error PendingFeedbackControllerExists();
+    error NoPendingFeedbackController();
 }

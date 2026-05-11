@@ -92,18 +92,16 @@ contract UMAAdapterTest is Test {
 
     function test_initialize_revertsOnTimelockTooLow() public {
         UMAAdapter impl = new UMAAdapter();
-        bytes memory initData = abi.encodeCall(
-            UMAAdapter.initialize, (IOptimisticOracleV3(address(oo)), governance, uint32(1 hours - 1))
-        );
+        bytes memory initData =
+            abi.encodeCall(UMAAdapter.initialize, (IOptimisticOracleV3(address(oo)), governance, uint32(1 hours - 1)));
         vm.expectRevert(UMAAdapter.InvalidConfig.selector);
         new ERC1967Proxy(address(impl), initData);
     }
 
     function test_initialize_revertsOnTimelockTooHigh() public {
         UMAAdapter impl = new UMAAdapter();
-        bytes memory initData = abi.encodeCall(
-            UMAAdapter.initialize, (IOptimisticOracleV3(address(oo)), governance, uint32(30 days + 1))
-        );
+        bytes memory initData =
+            abi.encodeCall(UMAAdapter.initialize, (IOptimisticOracleV3(address(oo)), governance, uint32(30 days + 1)));
         vm.expectRevert(UMAAdapter.InvalidConfig.selector);
         new ERC1967Proxy(address(impl), initData);
     }

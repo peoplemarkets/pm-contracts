@@ -77,28 +77,32 @@ contract ChainlinkAdapterTest is Test {
 
     function test_Initialize_RevertOnZeroRouter() public {
         ChainlinkAdapter impl = new ChainlinkAdapter();
-        bytes memory init = abi.encodeCall(ChainlinkAdapter.initialize, (IOracleRouter(address(0)), governance, TIMELOCK_DELAY));
+        bytes memory init =
+            abi.encodeCall(ChainlinkAdapter.initialize, (IOracleRouter(address(0)), governance, TIMELOCK_DELAY));
         vm.expectRevert(ChainlinkAdapter.InvalidConfig.selector);
         new ERC1967Proxy(address(impl), init);
     }
 
     function test_Initialize_RevertOnZeroGovernance() public {
         ChainlinkAdapter impl = new ChainlinkAdapter();
-        bytes memory init = abi.encodeCall(ChainlinkAdapter.initialize, (IOracleRouter(address(router)), address(0), TIMELOCK_DELAY));
+        bytes memory init =
+            abi.encodeCall(ChainlinkAdapter.initialize, (IOracleRouter(address(router)), address(0), TIMELOCK_DELAY));
         vm.expectRevert(ChainlinkAdapter.InvalidConfig.selector);
         new ERC1967Proxy(address(impl), init);
     }
 
     function test_Initialize_RevertOnTimelockTooShort() public {
         ChainlinkAdapter impl = new ChainlinkAdapter();
-        bytes memory init = abi.encodeCall(ChainlinkAdapter.initialize, (IOracleRouter(address(router)), governance, 1 minutes));
+        bytes memory init =
+            abi.encodeCall(ChainlinkAdapter.initialize, (IOracleRouter(address(router)), governance, 1 minutes));
         vm.expectRevert(ChainlinkAdapter.InvalidConfig.selector);
         new ERC1967Proxy(address(impl), init);
     }
 
     function test_Initialize_RevertOnTimelockTooLong() public {
         ChainlinkAdapter impl = new ChainlinkAdapter();
-        bytes memory init = abi.encodeCall(ChainlinkAdapter.initialize, (IOracleRouter(address(router)), governance, 60 days));
+        bytes memory init =
+            abi.encodeCall(ChainlinkAdapter.initialize, (IOracleRouter(address(router)), governance, 60 days));
         vm.expectRevert(ChainlinkAdapter.InvalidConfig.selector);
         new ERC1967Proxy(address(impl), init);
     }
@@ -504,13 +508,7 @@ contract ChainlinkAdapterTest is Test {
         _registerFeed(METRIC_8, address(feed8), MAX_STALENESS);
         uint64 ts = uint64(block.timestamp);
         // answeredInRound < roundId — stale carry-forward
-        feed8.setRound({
-            roundId_: 5,
-            answer_: 100_00000000,
-            startedAt_: ts,
-            updatedAt_: ts,
-            answeredInRound_: 4
-        });
+        feed8.setRound({roundId_: 5, answer_: 100_00000000, startedAt_: ts, updatedAt_: ts, answeredInRound_: 4});
         vm.expectRevert(abi.encodeWithSelector(ChainlinkAdapter.IncompleteRound.selector, uint80(5), uint80(4)));
         adapter.latestValue(METRIC_8);
     }

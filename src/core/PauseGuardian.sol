@@ -172,8 +172,7 @@ contract PauseGuardian is Initializable, UUPSUpgradeable {
         }
 
         // Append.
-        ring.entries[ring.head] =
-            PauseGuardianStorage.Observation({mark: uint192(mark), timestamp: uint64(updatedAt)});
+        ring.entries[ring.head] = PauseGuardianStorage.Observation({mark: uint192(mark), timestamp: uint64(updatedAt)});
         ring.head = _nextIndex(ring.head);
         if (ring.length < PauseGuardianStorage.RING_SIZE) {
             ring.length += 1;
@@ -238,9 +237,8 @@ contract PauseGuardian is Initializable, UUPSUpgradeable {
             // with a positive PerpEngine mark — but a zero would otherwise divide-by-zero).
             if (o.mark == 0) continue;
 
-            uint256 diff = currentMark >= o.mark
-                ? uint256(currentMark) - uint256(o.mark)
-                : uint256(o.mark) - uint256(currentMark);
+            uint256 diff =
+                currentMark >= o.mark ? uint256(currentMark) - uint256(o.mark) : uint256(o.mark) - uint256(currentMark);
             uint256 moveBps = (diff * uint256(BPS_DENOMINATOR)) / uint256(o.mark);
 
             if (o.timestamp >= auto5From && moveBps > maxBpsAuto5) maxBpsAuto5 = moveBps;
@@ -531,12 +529,7 @@ contract PauseGuardian is Initializable, UUPSUpgradeable {
         uint64 activatesAt
     );
     event ThresholdsActivated(
-        uint16 auto5Bps,
-        uint16 cd30Bps,
-        uint16 fz60Bps,
-        uint32 auto5Window,
-        uint32 cd30Window,
-        uint32 fz60Window
+        uint16 auto5Bps, uint16 cd30Bps, uint16 fz60Bps, uint32 auto5Window, uint32 cd30Window, uint32 fz60Window
     );
     event ThresholdsCancelled();
     event GovernanceTransferProposed(address indexed newGovernance, uint64 activatesAt);
