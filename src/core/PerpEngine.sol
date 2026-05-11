@@ -9,7 +9,7 @@ import {UUPSUpgradeable} from "@openzeppelin/contracts-upgradeable/proxy/utils/U
 import {ReentrancyGuard} from "solady/utils/ReentrancyGuard.sol";
 
 import {PositionMath} from "../libraries/PositionMath.sol";
-import {MarginStorage, PerpStorage} from "../libraries/StorageLib.sol";
+import {FundingStorage, MarginStorage, PerpStorage} from "../libraries/StorageLib.sol";
 import {ISubjectRegistry} from "../registry/ISubjectRegistry.sol";
 
 import {ILPVault} from "./ILPVault.sol";
@@ -83,6 +83,13 @@ contract PerpEngine is Initializable, UUPSUpgradeable, ReentrancyGuard, IPerpEng
     ///      uncooled to bootstrap.
     uint32 internal constant CAPPED_TVL_MIN_INTERVAL = 60 seconds;
 
+    /// @dev Tier-1: net-category OI cap. Spec §3 line 123 specifies 20% of vault TVL — the cap
+    ///      lower bound (500 bps = 5%) keeps the lever meaningful; the upper bound (5000 bps =
+    ///      50%) preserves the per-subject cap as the binding constraint at the top end.
+    uint16 internal constant DEFAULT_CATEGORY_NET_OI_CAP_BPS = 2_000;
+    uint16 internal constant MIN_CATEGORY_NET_OI_CAP_BPS = 500;
+    uint16 internal constant MAX_CATEGORY_NET_OI_CAP_BPS = 5_000;
+
     /// @custom:oz-upgrades-unsafe-allow constructor
     constructor() {
         _disableInitializers();
@@ -118,6 +125,21 @@ contract PerpEngine is Initializable, UUPSUpgradeable, ReentrancyGuard, IPerpEng
         marginS.liquidationBufferBps = 250; // 2.5%
         marginS.maxLeverageBps = 50_000; // 5×
         marginS.perSubjectSideOiCapBps = 500; // 5%
+        // Tier-1 net-category OI cap default: spec §3 line 123 — 20% of vault TVL.
+        marginS.categoryNetOiCapBps = DEFAULT_CATEGORY_NET_OI_CAP_BPS;
+    }
+
+    // ------------------------------------------------------------------------------------------
+    // Modifiers (continued)
+    // ------------------------------------------------------------------------------------------
+
+    /// @dev Restricts to the configured FundingEngine. Reverts (with the caller address baked
+    ///      into the error) if the writer is unset OR the caller is not the writer. Until
+    ///      FundingEngine v1 ships, every `pushFundingIndex` call lands here and reverts.
+    modifier onlyFundingEngine() {
+        address writer = PerpStorage.load().fundingEngine;
+        if (msg.sender != writer || writer == address(0)) revert OnlyFundingEngine(msg.sender);
+        _;
     }
 
     // ------------------------------------------------------------------------------------------
@@ -180,12 +202,18 @@ contract PerpEngine is Initializable, UUPSUpgradeable, ReentrancyGuard, IPerpEng
             positionId = keccak256(abi.encode(msg.sender, p.subjectId, perpS.nextPositionNonce++));
         }
 
+        // Tier-1 funding event stub: snapshot the cumulative funding index at open. The math is
+        // not applied in v0 (no per-position settle yet) — capturing the snapshot now means
+        // FundingEngine v1 can compute (currentIndex − entryFundingIndex) × size without a
+        // storage migration.
+        int256 entryFundingIndex = FundingStorage.load().cumulativeFundingIndex[p.subjectId];
+
         // Write position.
         perpS.positions[positionId] = Position({
             size: signedSize,
             collateral: p.collateralAmount,
             entryPrice: markNow,
-            entryFundingIndex: 0,
+            entryFundingIndex: entryFundingIndex,
             openedAt: uint64(block.timestamp),
             lastInteractionAt: uint64(block.timestamp),
             owner: msg.sender,
@@ -196,8 +224,12 @@ contract PerpEngine is Initializable, UUPSUpgradeable, ReentrancyGuard, IPerpEng
         // OI + exposure (post-delta).
         if (p.side == Side.LONG) {
             perpS.totalLongOI[p.subjectId] += p.sizeNotional;
+            // Tier-1: signed category OI accumulator (long contributes positively).
+            marginS.netCategoryOi[_categoryOf(perpS, p.subjectId)] += int256(p.sizeNotional);
         } else {
             perpS.totalShortOI[p.subjectId] += p.sizeNotional;
+            // Short contributes negatively to the net signed accumulator.
+            marginS.netCategoryOi[_categoryOf(perpS, p.subjectId)] -= int256(p.sizeNotional);
         }
         marginS.exposure[msg.sender].totalPerpNotional += p.sizeNotional;
         marginS.exposure[msg.sender].tier = MarginStorage.KycTier(tier);
@@ -264,8 +296,12 @@ contract PerpEngine is Initializable, UUPSUpgradeable, ReentrancyGuard, IPerpEng
         // OI + exposure deltas (always at OPENING notional — OI tracks contract count × open price).
         if (v.isLong) {
             perpS.totalLongOI[p.subjectId] -= v.openingNotionalDelta;
+            // Tier-1: unwind the long's positive contribution to the net category accumulator.
+            marginS.netCategoryOi[_categoryOf(perpS, p.subjectId)] -= int256(v.openingNotionalDelta);
         } else {
             perpS.totalShortOI[p.subjectId] -= v.openingNotionalDelta;
+            // Unwind the short's negative contribution (add back).
+            marginS.netCategoryOi[_categoryOf(perpS, p.subjectId)] += int256(v.openingNotionalDelta);
         }
         marginS.exposure[msg.sender].totalPerpNotional -= v.openingNotionalDelta;
 
@@ -273,6 +309,9 @@ contract PerpEngine is Initializable, UUPSUpgradeable, ReentrancyGuard, IPerpEng
             msg.sender, v.closeCollateral, v.realizedPnl, v.fee, v.lpRebate, v.insuranceShare
         );
 
+        // Tier-1 funding event stub: FundingEngine v1 has not shipped, so the funding debt at
+        // close is 0. The event is wired today so indexers can subscribe without a redeploy.
+        emit FundingSettled(positionId, msg.sender, int256(0));
         emit PositionClosed(positionId, msg.sender, p.subjectId, v.realizedPnl, v.fee, v.returned, v.fullClose);
         return v.realizedPnl;
     }
@@ -378,8 +417,11 @@ contract PerpEngine is Initializable, UUPSUpgradeable, ReentrancyGuard, IPerpEng
         delete perpS.openPositionId[msg.sender][subjectId];
         if (orig.size > 0) {
             perpS.totalLongOI[subjectId] -= openingNotional;
+            // Tier-1: unwind the long's positive contribution to the net category accumulator.
+            marginS.netCategoryOi[_categoryOf(perpS, subjectId)] -= int256(openingNotional);
         } else {
             perpS.totalShortOI[subjectId] -= openingNotional;
+            marginS.netCategoryOi[_categoryOf(perpS, subjectId)] += int256(openingNotional);
         }
         marginS.exposure[msg.sender].totalPerpNotional -= openingNotional;
 
@@ -388,6 +430,8 @@ contract PerpEngine is Initializable, UUPSUpgradeable, ReentrancyGuard, IPerpEng
         // boundary it computes returnedSigned = 0, which is fine.
         ILPVault(perpS.lpVault).settlePosition(msg.sender, orig.collateral, cappedPnl, 0, 0, 0);
 
+        // Tier-1 funding event stub: same rationale as `closePosition` — 0 delta in v0.
+        emit FundingSettled(positionId, msg.sender, int256(0));
         emit PositionClosedAtForcedSettlement(positionId, msg.sender, subjectId, cappedPnl, returned);
         return cappedPnl;
     }
@@ -511,6 +555,21 @@ contract PerpEngine is Initializable, UUPSUpgradeable, ReentrancyGuard, IPerpEng
             revert PerSubjectOiCapExceeded(subjectId, side, newSideOi, sideOiCap);
         }
 
+        // Tier-1: net-category OI cap. Spec §3 line 123 — 20% of vault TVL. Same denominator
+        // semantic as the per-subject cap (`min(cappedTvl, liveTvl)`) to keep the flash-deposit
+        // defense consistent. The prospective net is `current + signed sizeNotional`; we cap
+        // the absolute value so a trade that nets a category from +X to −X still cannot exceed
+        // the cap in either direction.
+        bytes32 categoryId = _categoryOf(perpS, subjectId);
+        int256 currentNet = marginS.netCategoryOi[categoryId];
+        int256 prospective =
+            side == Side.LONG ? currentNet + int256(sizeNotional) : currentNet - int256(sizeNotional);
+        uint256 prospectiveAbs = prospective >= 0 ? uint256(prospective) : uint256(-prospective);
+        uint256 categoryCap = (vaultTvl * marginS.categoryNetOiCapBps) / BPS_DENOMINATOR;
+        if (prospectiveAbs > categoryCap) {
+            revert CategoryOiCapExceeded(categoryId, prospectiveAbs, categoryCap);
+        }
+
         // Per-trader-per-subject cap. The one-position invariant means we know the trader has no
         // existing position on this subject, so the cap applies cleanly to `sizeNotional`.
         uint256 perSubjectCap = marginS.tierPerSubjectCap[MarginStorage.KycTier(tier)];
@@ -522,6 +581,19 @@ contract PerpEngine is Initializable, UUPSUpgradeable, ReentrancyGuard, IPerpEng
         uint256 combinedCap = marginS.tierCombinedCap[MarginStorage.KycTier(tier)];
         uint256 newCombined = marginS.exposure[msg.sender].totalPerpNotional + sizeNotional;
         if (newCombined > combinedCap) revert CombinedExposureCapExceeded(msg.sender, newCombined, combinedCap);
+    }
+
+    /// @dev Look up the category for `subjectId` from the registry. Wrapped in a private helper
+    ///      to keep the open/close paths terse and to make the cross-contract read explicit.
+    function _categoryOf(
+        PerpStorage.Layout storage perpS,
+        bytes32 subjectId
+    )
+        internal
+        view
+        returns (bytes32)
+    {
+        return ISubjectRegistry(perpS.subjectRegistry).subjectOf(subjectId).categoryId;
     }
 
     function _computeFees(
@@ -571,6 +643,31 @@ contract PerpEngine is Initializable, UUPSUpgradeable, ReentrancyGuard, IPerpEng
         perpS.markUpdatedAt[subjectId] = uint64(block.timestamp);
 
         emit MarkPushed(subjectId, oldMark, newMark, uint64(block.timestamp));
+    }
+
+    /// @inheritdoc IPerpEngine
+    /// @dev Tier-1 funding event stub. FundingEngine v1 will call this once per accrual interval
+    ///      per subject. The engine writes the new index + last-accrued timestamp and emits the
+    ///      event so indexers can compute realized funding off-chain. Pauses freeze funding per
+    ///      spec §2 line 66 — we route through `requireTradeable` to share the existing
+    ///      pause-state semantics (status == ACTIVE, no policy flag).
+    function pushFundingIndex(
+        bytes32 subjectId,
+        int256 newIndex,
+        int256 fundingRate1e18
+    )
+        external
+        onlyFundingEngine
+    {
+        PerpStorage.Layout storage perpS = PerpStorage.load();
+        ISubjectRegistry(perpS.subjectRegistry).requireTradeable(subjectId);
+
+        FundingStorage.Layout storage fundingS = FundingStorage.load();
+        int256 oldIndex = fundingS.cumulativeFundingIndex[subjectId];
+        fundingS.cumulativeFundingIndex[subjectId] = newIndex;
+        fundingS.lastFundingAt[subjectId] = uint64(block.timestamp);
+
+        emit FundingPushed(subjectId, oldIndex, newIndex, fundingRate1e18, uint64(block.timestamp));
     }
 
     /// @inheritdoc IPerpEngine
@@ -712,6 +809,62 @@ contract PerpEngine is Initializable, UUPSUpgradeable, ReentrancyGuard, IPerpEng
         uint8 old = perpS.lpRebatePct;
         perpS.lpRebatePct = pct;
         emit LpRebatePctSet(old, pct);
+    }
+
+    /// @inheritdoc IPerpEngine
+    /// @dev Tier-1 net-category OI cap. Bounds [500, 5000] bps (5% to 50%). No timelock — matches
+    ///      the existing `setLpRebatePct` / `setMarkMaxDeltaBps` pattern (parameter changes are
+    ///      lower blast radius than role grants, and the governance multi-sig is the gate).
+    function setCategoryNetOiCapBps(uint16 bps) external onlyGovernance {
+        if (bps < MIN_CATEGORY_NET_OI_CAP_BPS || bps > MAX_CATEGORY_NET_OI_CAP_BPS) {
+            revert CategoryOiCapBpsOutOfRange();
+        }
+        MarginStorage.Layout storage marginS = MarginStorage.load();
+        uint16 old = marginS.categoryNetOiCapBps;
+        marginS.categoryNetOiCapBps = bps;
+        emit CategoryNetOiCapBpsSet(old, bps);
+    }
+
+    // ------------------------------------------------------------------------------------------
+    // Governance: FundingEngine writer rotation (timelocked)
+    //
+    // Same shape as `proposeSetPerpEngine` on LPVault. Until FundingEngine v1 ships, the writer
+    // stays at `address(0)` and `pushFundingIndex` reverts.
+    // ------------------------------------------------------------------------------------------
+
+    /// @inheritdoc IPerpEngine
+    function proposeSetFundingEngine(address newEngine) external onlyGovernance {
+        if (newEngine == address(0)) revert InvalidConfig();
+        PerpStorage.Layout storage perpS = PerpStorage.load();
+        if (perpS.pendingFundingEngineActivatesAt != 0) revert PendingFundingEngineExists();
+        uint64 activatesAt = uint64(block.timestamp + perpS.timelockDelay);
+        perpS.pendingFundingEngine = newEngine;
+        perpS.pendingFundingEngineActivatesAt = activatesAt;
+        emit FundingEngineProposed(newEngine, activatesAt);
+    }
+
+    /// @inheritdoc IPerpEngine
+    function activateSetFundingEngine() external {
+        PerpStorage.Layout storage perpS = PerpStorage.load();
+        uint64 readyAt = perpS.pendingFundingEngineActivatesAt;
+        if (readyAt == 0) revert NoPendingFundingEngine();
+        if (block.timestamp < readyAt) revert TimelockNotElapsed(readyAt);
+        address oldEngine = perpS.fundingEngine;
+        address newEngine = perpS.pendingFundingEngine;
+        perpS.fundingEngine = newEngine;
+        delete perpS.pendingFundingEngine;
+        delete perpS.pendingFundingEngineActivatesAt;
+        emit FundingEngineActivated(oldEngine, newEngine);
+    }
+
+    /// @inheritdoc IPerpEngine
+    function cancelSetFundingEngine() external onlyGovernance {
+        PerpStorage.Layout storage perpS = PerpStorage.load();
+        if (perpS.pendingFundingEngineActivatesAt == 0) revert NoPendingFundingEngine();
+        address pending = perpS.pendingFundingEngine;
+        delete perpS.pendingFundingEngine;
+        delete perpS.pendingFundingEngineActivatesAt;
+        emit FundingEngineCancelled(pending);
     }
 
     // ------------------------------------------------------------------------------------------
@@ -873,6 +1026,37 @@ contract PerpEngine is Initializable, UUPSUpgradeable, ReentrancyGuard, IPerpEng
     /// @inheritdoc IPerpEngine
     function settlementMarkOf(bytes32 subjectId) external view returns (uint256) {
         return PerpStorage.load().subjectSettlementMark[subjectId];
+    }
+
+    /// @inheritdoc IPerpEngine
+    function fundingEngine() external view returns (address) {
+        return PerpStorage.load().fundingEngine;
+    }
+
+    /// @inheritdoc IPerpEngine
+    function cumulativeFundingIndex(bytes32 subjectId) external view returns (int256) {
+        return FundingStorage.load().cumulativeFundingIndex[subjectId];
+    }
+
+    /// @inheritdoc IPerpEngine
+    function lastFundingAt(bytes32 subjectId) external view returns (uint64) {
+        return FundingStorage.load().lastFundingAt[subjectId];
+    }
+
+    /// @notice Pending FundingEngine rotation (zero address + zero timestamp when none in flight).
+    function pendingFundingEngine() external view returns (address account, uint64 activatesAt) {
+        PerpStorage.Layout storage perpS = PerpStorage.load();
+        return (perpS.pendingFundingEngine, perpS.pendingFundingEngineActivatesAt);
+    }
+
+    /// @inheritdoc IPerpEngine
+    function categoryNetOiCapBps() external view returns (uint16) {
+        return MarginStorage.load().categoryNetOiCapBps;
+    }
+
+    /// @inheritdoc IPerpEngine
+    function netCategoryOiOf(bytes32 categoryId) external view returns (int256) {
+        return MarginStorage.load().netCategoryOi[categoryId];
     }
 
     function pendingMarkWriterActivatesAt(address writer) external view returns (uint64) {

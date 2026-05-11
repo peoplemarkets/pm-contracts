@@ -105,6 +105,26 @@ interface IPerpEngine {
     function setLpRebatePct(uint8 pct) external;
     function setMarkMaxDeltaBps(uint16 bps) external;
 
+    /// @notice Governance setter for the net-category OI cap. Bounds [500, 5000] bps. No timelock —
+    ///         matches `setLpRebatePct` / `setMarkMaxDeltaBps`.
+    function setCategoryNetOiCapBps(uint16 bps) external;
+
+    /// @notice Tier-1 funding event stub: timelocked rotation of the FundingEngine writer.
+    /// @dev    Until FundingEngine v1 ships, `fundingEngine` is `address(0)` and any
+    ///         `pushFundingIndex` call reverts. Rotation follows the standard propose/activate/
+    ///         cancel pattern, gated by the existing `timelockDelay`.
+    function proposeSetFundingEngine(address newEngine) external;
+    function activateSetFundingEngine() external;
+    function cancelSetFundingEngine() external;
+
+    /// @notice FundingEngine-only writer for the per-subject cumulative funding index. Caller MUST
+    ///         be the configured `fundingEngine`; the subject MUST be tradeable (pauses freeze
+    ///         funding per spec §2 line 66).
+    /// @dev    v0 SHIM: this is event-only — no PnL math, no position settle. Positions opened
+    ///         after this call inherit the new index via `entryFundingIndex` so FundingEngine v1
+    ///         can ship without a storage migration.
+    function pushFundingIndex(bytes32 subjectId, int256 newIndex, int256 fundingRate1e18) external;
+
     /// @notice Permissionless poke that snapshots the live `vault.totalAssets()` into the
     ///         `cappedTvl` field used by the per-subject OI cap. Cooldown-gated so a same-block
     ///         flash deposit cannot inflate the cap. v2-audit Fix #3.
@@ -139,6 +159,21 @@ interface IPerpEngine {
     function cappedTvl() external view returns (uint256 tvl, uint64 updatedAt);
     function isForceSettled(bytes32 subjectId) external view returns (bool);
     function settlementMarkOf(bytes32 subjectId) external view returns (uint256);
+
+    /// @notice Configured FundingEngine writer. `address(0)` until FundingEngine v1 ships.
+    function fundingEngine() external view returns (address);
+
+    /// @notice Most recent cumulative funding index for `subjectId` (signed, 1e18 scale).
+    function cumulativeFundingIndex(bytes32 subjectId) external view returns (int256);
+
+    /// @notice Timestamp (seconds) of the last `pushFundingIndex` for `subjectId`.
+    function lastFundingAt(bytes32 subjectId) external view returns (uint64);
+
+    /// @notice Current net-category OI cap, basis points of `min(cappedTvl, liveTvl)`.
+    function categoryNetOiCapBps() external view returns (uint16);
+
+    /// @notice Signed net OI for the category — sum of (longOI − shortOI) at OPENING notional.
+    function netCategoryOiOf(bytes32 categoryId) external view returns (int256);
 
     // ------------------------------------------------------------------------------------------
     // Events
@@ -190,6 +225,26 @@ interface IPerpEngine {
     event GovernanceTransferActivated(address indexed oldGovernance, address indexed newGovernance);
     event GovernanceTransferCancelled(address indexed pendingGovernance);
 
+    // --- Tier-1 funding event stub ---
+    /// @notice FundingEngine wrote a new cumulative index for `subjectId`. Indexers subscribe
+    ///         to this event today; the math lands in FundingEngine v1.
+    event FundingPushed(
+        bytes32 indexed subjectId, int256 oldIndex, int256 newIndex, int256 fundingRate1e18, uint64 timestamp
+    );
+    /// @notice Funding-debt settlement on a position close. `fundingDelta1e6` is denominated in
+    ///         USDC (6-dec) and signed (positive = paid to trader, negative = paid by trader).
+    ///         Stubbed to 0 in v0 — FundingEngine v1 computes the actual delta.
+    event FundingSettled(bytes32 indexed positionId, address indexed trader, int256 fundingDelta1e6);
+
+    /// @notice Timelocked rotation of the FundingEngine writer.
+    event FundingEngineProposed(address indexed newEngine, uint64 activatesAt);
+    event FundingEngineActivated(address indexed oldEngine, address indexed newEngine);
+    event FundingEngineCancelled(address indexed pendingEngine);
+
+    // --- Tier-1 category OI cap ---
+    /// @notice Governance updated the net-category OI cap.
+    event CategoryNetOiCapBpsSet(uint16 oldBps, uint16 newBps);
+
     // ------------------------------------------------------------------------------------------
     // Errors
     // ------------------------------------------------------------------------------------------
@@ -229,4 +284,11 @@ interface IPerpEngine {
     error SubjectAlreadyForceSettled(bytes32 subjectId);
     error SubjectNotForceSettled(bytes32 subjectId);
     error SubjectIsForceSettled(bytes32 subjectId);
+    // --- Tier-1 funding event stub ---
+    error OnlyFundingEngine(address caller);
+    error PendingFundingEngineExists();
+    error NoPendingFundingEngine();
+    // --- Tier-1 net-category OI cap ---
+    error CategoryOiCapExceeded(bytes32 categoryId, uint256 proposedAbs, uint256 cap);
+    error CategoryOiCapBpsOutOfRange();
 }

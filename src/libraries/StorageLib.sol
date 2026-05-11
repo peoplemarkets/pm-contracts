@@ -73,6 +73,15 @@ library PerpStorage {
         // freeAssets() to defeat same-block flash-deposit OI cap inflation.
         uint256 cappedTvl;
         uint64 cappedTvlUpdatedAt;
+        // ---- APPENDED: Tier-1 funding event stub — FundingEngine v1 wiring ----
+        // Authorized writer for `pushFundingIndex`. Rotated through the standard timelocked
+        // propose/activate/cancel flow (same shape as `pendingPerpEngine` on LPVault). The
+        // funding-math contract has not shipped yet; this address is `0x0` at v0 launch and
+        // populated when FundingEngine v1 deploys. Until then, `pushFundingIndex` reverts on
+        // every call and traders open positions with `entryFundingIndex = 0`.
+        address fundingEngine;
+        address pendingFundingEngine;
+        uint64 pendingFundingEngineActivatesAt;
     }
 
     function load() internal pure returns (Layout storage l) {
@@ -118,6 +127,15 @@ library MarginStorage {
         uint16 maxLeverageBps; // 50000 (5×)
         // per-subject side OI cap as basis points of vault.totalAssets(). Spec §3: 5% (500 bps).
         uint16 perSubjectSideOiCapBps;
+        // ---- APPENDED: Tier-1 net-category OI cap (spec §3 line 123: 20% of vault TVL) ----
+        // Signed accumulator per category: sum of (longOI − shortOI) at OPENING notional, across
+        // every subject sharing the category. Incremented in `openPosition` and decremented in
+        // `closePosition` / `closeAtForcedSettlement` by the position's signed contribution.
+        // The cap is enforced on |netCategoryOi| post-open.
+        mapping(bytes32 categoryId => int256) netCategoryOi;
+        // Cap as basis points of `min(cappedTvl, liveTvl)` — same TVL denominator as the
+        // per-subject side cap (v2-audit Fix #3). Default 2000 (20%), bounds [500, 5000].
+        uint16 categoryNetOiCapBps;
     }
 
     function load() internal pure returns (Layout storage l) {
@@ -230,6 +248,15 @@ library VaultStorage {
         uint256 insuranceSeedDeposited;
         // ---- APPENDED: Fix #5 pending fee withdrawal (single in-flight) ----
         PendingFeeWithdrawal pendingFeeWithdrawal;
+        // ---- APPENDED: Tier-1 insurance cap + floor (spec §3 lines 157–163) ----
+        // Cap: max insurance bookkeeper balance as basis points of `totalAssets()` (= freeAssets).
+        // Default 1000 (10%), bounds [100, 5000]. Excess accrual is left in the share pool
+        // (not booked into insuranceFundBalance), letting `freeAssets` absorb it as LP yield.
+        uint16 insuranceCapBps;
+        // Floor: informational lower-bound on the insurance bookkeeper as basis points of
+        // `totalAssets()`. Default 500 (5%), bounds [0, 1000]; MUST be strictly below the cap.
+        // Crossing emits `InsuranceFloorBreached` — no auto-debit; treasury responds off-chain.
+        uint16 insuranceFloorBps;
     }
 
     function load() internal pure returns (Layout storage l) {

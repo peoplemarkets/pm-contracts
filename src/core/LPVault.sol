@@ -51,6 +51,18 @@ contract LPVault is Initializable, UUPSUpgradeable, ERC4626Upgradeable, Reentran
     ///      this a daily lever. Lifting the cap requires a UUPS upgrade — high friction by design.
     uint256 public constant MAX_INSURANCE_SEED = 10_000_000 * 1e6;
 
+    uint16 internal constant BPS_DENOM = 10_000;
+
+    /// @dev Tier-1 insurance cap + floor (spec §3 lines 157–163).
+    ///      Cap default 10%, bounds [1%, 50%]. Floor default 5%, bounds [0, 10%]. The upper bound
+    ///      on the floor and the lower bound on the cap together preserve the invariant
+    ///      `floor < cap` after any single setter call against the defaults.
+    uint16 internal constant DEFAULT_INSURANCE_CAP_BPS = 1_000;
+    uint16 internal constant MIN_INSURANCE_CAP_BPS = 100;
+    uint16 internal constant MAX_INSURANCE_CAP_BPS = 5_000;
+    uint16 internal constant DEFAULT_INSURANCE_FLOOR_BPS = 500;
+    uint16 internal constant MAX_INSURANCE_FLOOR_BPS = 1_000;
+
     /// @custom:oz-upgrades-unsafe-allow constructor
     constructor() {
         _disableInitializers();
@@ -85,6 +97,9 @@ contract LPVault is Initializable, UUPSUpgradeable, ERC4626Upgradeable, Reentran
         s.governance = governance_;
         s.operator = operator_;
         s.timelockDelay = timelockDelay_;
+        // Tier-1 insurance cap + floor — spec §3 lines 157–163.
+        s.insuranceCapBps = DEFAULT_INSURANCE_CAP_BPS;
+        s.insuranceFloorBps = DEFAULT_INSURANCE_FLOOR_BPS;
         // perpEngine is intentionally unset at init — set later via the timelocked proposal flow.
         // This breaks the circular deploy dependency: PerpEngine needs the vault address at
         // construction; the vault sets the engine address afterwards.
@@ -254,7 +269,9 @@ contract LPVault is Initializable, UUPSUpgradeable, ERC4626Upgradeable, Reentran
         IERC20(asset()).safeTransferFrom(trader, address(this), collateralToLock + fee);
 
         s.positionCollateral += collateralToLock;
-        s.insuranceFundBalance += insuranceShare;
+        // Tier-1 insurance cap: book up to the cap; redirect any excess to the share pool by
+        // leaving it unbooked (freeAssets() absorbs the difference automatically).
+        _accrueInsuranceCapped(s, insuranceShare);
         // Residual = fee − lpRebate − insuranceShare. Subtraction-based form ensures rounding
         // dust never disappears: the sum of (lpRebate stays in freeAssets, insuranceShare,
         // residual to accruedFees) exactly equals `fee`.
@@ -303,15 +320,63 @@ contract LPVault is Initializable, UUPSUpgradeable, ERC4626Upgradeable, Reentran
         }
 
         s.positionCollateral -= collateralToRelease;
-        s.insuranceFundBalance += insuranceShare;
+        // Tier-1 insurance cap (same as open flow): excess above cap stays in the share pool.
+        _accrueInsuranceCapped(s, insuranceShare);
         s.accruedFees += fee - lpRebate - insuranceShare;
 
         if (returned > 0) {
             IERC20(asset()).safeTransfer(trader, returned);
         }
 
+        // Tier-1 insurance floor: emit an informational event if the bookkeeper is below the
+        // configured floor after the settle. The treasury responds off-chain via `seedInsurance`.
+        _emitFloorBreachIfBelow(s);
+
         emit PositionSettledOnVault(trader, collateralToRelease, pnl, fee, lpRebate, insuranceShare, returned);
         emit CollateralReleased(trader, collateralToRelease);
+    }
+
+    /// @dev Tier-1 insurance cap helper. Books at most `cap − currentBalance` into the bookkeeper;
+    ///      the unbooked excess remains in `usdc.balanceOf(this)` un-allocated, so `freeAssets()`
+    ///      (= balance − positionCollateral − insuranceFundBalance − accruedFees) absorbs it as
+    ///      a per-share boost. No bookkeeper-decrement is performed when the cap is already over —
+    ///      legacy over-cap balances stay where they are; only NEW accrual is redirected.
+    function _accrueInsuranceCapped(VaultStorage.Layout storage s, uint256 insuranceShare) internal {
+        if (insuranceShare == 0) return;
+        // `totalAssets()` returns `freeAssets()` per the override. We compute the cap against
+        // the current TVL — the same number LP shares are priced off, which is the correct
+        // denominator for "10% of TVL".
+        uint256 tvl = totalAssets();
+        uint256 cap = (tvl * uint256(s.insuranceCapBps)) / BPS_DENOM;
+        uint256 current = s.insuranceFundBalance;
+        if (current >= cap) {
+            // Already at/above cap — none of the new accrual is booked. The full insuranceShare
+            // flows to the share pool.
+            emit InsuranceCapOverflow(insuranceShare, current, tvl);
+            return;
+        }
+        uint256 room = cap - current;
+        if (insuranceShare <= room) {
+            // Fully within the cap — standard accrual.
+            s.insuranceFundBalance = current + insuranceShare;
+            return;
+        }
+        // Partial overflow: book the room, redirect the rest.
+        s.insuranceFundBalance = cap;
+        emit InsuranceCapOverflow(insuranceShare - room, cap, tvl);
+    }
+
+    /// @dev Tier-1 floor helper. Emits when the bookkeeper is strictly below the configured
+    ///      floor; silent otherwise. No-op if either the floor is 0 or the bookkeeper is empty.
+    function _emitFloorBreachIfBelow(VaultStorage.Layout storage s) internal {
+        uint16 floorBps = s.insuranceFloorBps;
+        if (floorBps == 0) return;
+        uint256 tvl = totalAssets();
+        uint256 floor = (tvl * uint256(floorBps)) / BPS_DENOM;
+        uint256 current = s.insuranceFundBalance;
+        if (current < floor) {
+            emit InsuranceFloorBreached(current, floor, tvl);
+        }
     }
 
     /// @inheritdoc ILPVault
@@ -497,6 +562,38 @@ contract LPVault is Initializable, UUPSUpgradeable, ERC4626Upgradeable, Reentran
     }
 
     // ------------------------------------------------------------------------------------------
+    // Tier-1 insurance cap + floor: governance setters + permissionless floor check
+    // ------------------------------------------------------------------------------------------
+
+    /// @inheritdoc ILPVault
+    function setInsuranceCapBps(uint16 bps) external onlyGovernance {
+        if (bps < MIN_INSURANCE_CAP_BPS || bps > MAX_INSURANCE_CAP_BPS) revert InsuranceCapBpsOutOfRange();
+        VaultStorage.Layout storage s = VaultStorage.load();
+        // Cap MUST stay strictly above the floor. We check against the on-storage floor so
+        // governance cannot accidentally drop the cap below the live floor in one call.
+        if (bps <= s.insuranceFloorBps) revert InsuranceFloorNotBelowCap();
+        uint16 old = s.insuranceCapBps;
+        s.insuranceCapBps = bps;
+        emit InsuranceCapBpsSet(old, bps);
+    }
+
+    /// @inheritdoc ILPVault
+    function setInsuranceFloorBps(uint16 bps) external onlyGovernance {
+        if (bps > MAX_INSURANCE_FLOOR_BPS) revert InsuranceFloorBpsOutOfRange();
+        VaultStorage.Layout storage s = VaultStorage.load();
+        // Floor MUST stay strictly below the cap.
+        if (bps >= s.insuranceCapBps) revert InsuranceFloorNotBelowCap();
+        uint16 old = s.insuranceFloorBps;
+        s.insuranceFloorBps = bps;
+        emit InsuranceFloorBpsSet(old, bps);
+    }
+
+    /// @inheritdoc ILPVault
+    function checkInsuranceFloor() external {
+        _emitFloorBreachIfBelow(VaultStorage.load());
+    }
+
+    // ------------------------------------------------------------------------------------------
     // Views
     // ------------------------------------------------------------------------------------------
 
@@ -569,6 +666,16 @@ contract LPVault is Initializable, UUPSUpgradeable, ERC4626Upgradeable, Reentran
     {
         VaultStorage.PendingFeeWithdrawal memory p = VaultStorage.load().pendingFeeWithdrawal;
         return (p.recipient, p.amount, p.activatesAt, p.exists);
+    }
+
+    /// @inheritdoc ILPVault
+    function insuranceCapBps() external view returns (uint16) {
+        return VaultStorage.load().insuranceCapBps;
+    }
+
+    /// @inheritdoc ILPVault
+    function insuranceFloorBps() external view returns (uint16) {
+        return VaultStorage.load().insuranceFloorBps;
     }
 
     // ------------------------------------------------------------------------------------------

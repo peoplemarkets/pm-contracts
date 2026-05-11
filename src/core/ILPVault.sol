@@ -141,6 +141,25 @@ interface ILPVault is IERC4626 {
     function setOperator(address newOperator) external; // governance-only, no timelock
 
     // ------------------------------------------------------------------------------------------
+    // Tier-1 insurance cap + floor (governance, no timelock — matches other parameter setters)
+    // ------------------------------------------------------------------------------------------
+
+    /// @notice Governance setter for the insurance bookkeeper cap, basis points of `totalAssets()`.
+    /// @dev    Spec §3 lines 157–158. Default 1000 (10%), bounds [100, 5000].
+    function setInsuranceCapBps(uint16 bps) external;
+
+    /// @notice Governance setter for the insurance bookkeeper floor, basis points of `totalAssets()`.
+    /// @dev    Spec §3 lines 161–163. Default 500 (5%), bounds [0, 1000]. MUST be strictly below
+    ///         the cap. The floor is informational — `InsuranceFloorBreached` is emitted on
+    ///         crossing; no auto-debit. Treasury responds off-chain.
+    function setInsuranceFloorBps(uint16 bps) external;
+
+    /// @notice Permissionless: emit `InsuranceFloorBreached` if the insurance bookkeeper is
+    ///         currently under the floor. Off-chain bots / the treasury multi-sig poke this
+    ///         to surface the breach without waiting for the next settle event.
+    function checkInsuranceFloor() external;
+
+    // ------------------------------------------------------------------------------------------
     // Views
     // ------------------------------------------------------------------------------------------
 
@@ -156,6 +175,12 @@ interface ILPVault is IERC4626 {
     function timelockDelay() external view returns (uint32);
     function pendingPerpEngine() external view returns (address account, uint64 activatesAt);
     function pendingGovernance() external view returns (address account, uint64 activatesAt);
+
+    /// @notice Current insurance cap, basis points of `totalAssets()`. Default 1000 (10%).
+    function insuranceCapBps() external view returns (uint16);
+
+    /// @notice Current insurance floor, basis points of `totalAssets()`. Default 500 (5%).
+    function insuranceFloorBps() external view returns (uint16);
 
     // ------------------------------------------------------------------------------------------
     // Events
@@ -192,6 +217,17 @@ interface ILPVault is IERC4626 {
     event FeeWithdrawalActivated(address indexed recipient, uint256 amount);
     event FeeWithdrawalCancelled(address indexed recipient, uint256 amount);
 
+    // --- Tier-1 insurance cap + floor ---
+    /// @notice Excess insurance accrual was redirected to the LP share pool (cap was binding).
+    event InsuranceCapOverflow(uint256 excess, uint256 newInsuranceBalance, uint256 vaultTvl);
+    /// @notice The insurance bookkeeper is currently below the configured floor. Informational —
+    ///         off-chain treasury operations respond by calling `seedInsurance`.
+    event InsuranceFloorBreached(uint256 currentBalance, uint256 floor, uint256 vaultTvl);
+    /// @notice Governance updated the insurance cap.
+    event InsuranceCapBpsSet(uint16 oldBps, uint16 newBps);
+    /// @notice Governance updated the insurance floor.
+    event InsuranceFloorBpsSet(uint16 oldBps, uint16 newBps);
+
     // ------------------------------------------------------------------------------------------
     // Errors
     // ------------------------------------------------------------------------------------------
@@ -211,4 +247,8 @@ interface ILPVault is IERC4626 {
     error TimelockNotElapsed(uint64 readyAt);
     error InsufficientAccruedFees(uint256 requested, uint256 available);
     error InsuranceSeedCapExceeded(uint256 attempted, uint256 cap);
+    // --- Tier-1 insurance cap + floor ---
+    error InsuranceCapBpsOutOfRange();
+    error InsuranceFloorBpsOutOfRange();
+    error InsuranceFloorNotBelowCap();
 }

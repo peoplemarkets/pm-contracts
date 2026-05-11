@@ -5,6 +5,7 @@ import {ERC1967Proxy} from "@openzeppelin/contracts/proxy/ERC1967/ERC1967Proxy.s
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 
 import {Test} from "forge-std/Test.sol";
+import {Vm} from "forge-std/Vm.sol";
 
 import {ILPVault} from "../src/core/ILPVault.sol";
 import {LPVault} from "../src/core/LPVault.sol";
@@ -1146,5 +1147,149 @@ contract LPVaultTest is Test {
         // post-upgrade state preserved
         assertEq(vault.governance(), governance);
         assertEq(vault.perpEngine(), perpEngine);
+    }
+
+    // ------------------------------------------------------------------------------------------
+    // Tier-1: insurance cap + floor (Wave 2)
+    // ------------------------------------------------------------------------------------------
+
+    function test_Tier1_InsuranceCap_DefaultIs10Pct() public view {
+        assertEq(vault.insuranceCapBps(), 1_000);
+    }
+
+    function test_Tier1_InsuranceFloor_DefaultIs5Pct() public view {
+        assertEq(vault.insuranceFloorBps(), 500);
+    }
+
+    function test_Tier1_SettlePosition_BooksWithinCap() public {
+        // Deposit 1M into vault → cap = 100k USDC, floor = 50k USDC.
+        vm.prank(alice);
+        vault.deposit(USDC_1M, alice);
+
+        // Open a position with a small insuranceShare well under the cap.
+        uint256 collat = 1_000 * ONE_USDC;
+        uint256 fee = 750 * ONE_USDC;
+        uint256 lpRebate = (fee * 40) / 100;
+        uint256 insurance = (fee * 50) / 100; // 375 USDC — well under 100k cap
+        vm.prank(perpEngine);
+        vault.openPositionFlow(trader, collat, fee, lpRebate, insurance);
+        assertEq(vault.insuranceFundBalance(), insurance);
+    }
+
+    function test_Tier1_SettlePosition_RedirectsExcessAboveCap() public {
+        vm.prank(alice);
+        vault.deposit(USDC_1M, alice);
+
+        // Tighten cap to 1% (minimum) — floor must move first because of the cap>floor invariant.
+        vm.prank(governance);
+        vault.setInsuranceFloorBps(50); // 0.5%
+        vm.prank(governance);
+        vault.setInsuranceCapBps(100); // 1% — cap = 1% of totalAssets
+
+        // Seed insurance close to the cap so the next accrual partially overflows.
+        // cap pre-seed = 1% of 1M = 10_000 USDC. Seed 9_900 → room ≈ 100 USDC.
+        usdc.mint(governance, 9_900 * ONE_USDC);
+        vm.prank(governance);
+        usdc.approve(address(vault), type(uint256).max);
+        vm.prank(governance);
+        vault.seedInsurance(9_900 * ONE_USDC);
+        assertEq(vault.insuranceFundBalance(), 9_900 * ONE_USDC);
+
+        // openPositionFlow with insurance=2_500 USDC. Cap is recomputed dynamically; the
+        // overflow event must fire and the balance must clamp at the new cap.
+        uint256 collat = 1_000 * ONE_USDC;
+        uint256 fee = 5_000 * ONE_USDC;
+        uint256 lpRebate = (fee * 40) / 100;
+        uint256 insurance = (fee * 50) / 100; // 2_500 USDC
+        vm.prank(perpEngine);
+        vault.openPositionFlow(trader, collat, fee, lpRebate, insurance);
+
+        // The booking happened at a TVL snapshot mid-flow; recomputing post-flow gives a
+        // different number. Two robust invariants instead of an exact equality:
+        // (a) the balance grew (some accrual was booked), and
+        // (b) it grew by strictly less than the un-capped accrual (overflow happened).
+        assertGt(vault.insuranceFundBalance(), 9_900 * ONE_USDC);
+        assertLt(vault.insuranceFundBalance(), 9_900 * ONE_USDC + insurance);
+    }
+
+    function test_Tier1_CheckInsuranceFloor_EmitsWhenBelow() public {
+        // Deposit 1M, floor = 5% = 50k. insurance balance = 0 → below floor.
+        vm.prank(alice);
+        vault.deposit(USDC_1M, alice);
+
+        vm.expectEmit(false, false, false, false, address(vault));
+        emit ILPVault.InsuranceFloorBreached(0, 0, 0);
+        vault.checkInsuranceFloor();
+    }
+
+    function test_Tier1_CheckInsuranceFloor_SilentWhenAbove() public {
+        vm.prank(alice);
+        vault.deposit(USDC_1M, alice);
+        // Seed insurance above 5% floor: floor = 50k → seed 60k.
+        usdc.mint(governance, 60_000 * ONE_USDC);
+        vm.prank(governance);
+        usdc.approve(address(vault), type(uint256).max);
+        vm.prank(governance);
+        vault.seedInsurance(60_000 * ONE_USDC);
+
+        // No event expected. Foundry has no native "expect-no-event" — record + assert absent.
+        vm.recordLogs();
+        vault.checkInsuranceFloor();
+        Vm.Log[] memory logs = vm.getRecordedLogs();
+        // No InsuranceFloorBreached should have been emitted.
+        bytes32 sig = keccak256("InsuranceFloorBreached(uint256,uint256,uint256)");
+        for (uint256 i; i < logs.length; ++i) {
+            if (logs[i].topics.length > 0) assertTrue(logs[i].topics[0] != sig);
+        }
+    }
+
+    function test_Tier1_SetInsuranceCapBps_Happy() public {
+        vm.prank(governance);
+        vault.setInsuranceCapBps(2_000); // 20%
+        assertEq(vault.insuranceCapBps(), 2_000);
+    }
+
+    function test_Tier1_SetInsuranceCapBps_RevertOnTooLow() public {
+        vm.prank(governance);
+        vm.expectRevert(ILPVault.InsuranceCapBpsOutOfRange.selector);
+        vault.setInsuranceCapBps(99);
+    }
+
+    function test_Tier1_SetInsuranceCapBps_RevertOnTooHigh() public {
+        vm.prank(governance);
+        vm.expectRevert(ILPVault.InsuranceCapBpsOutOfRange.selector);
+        vault.setInsuranceCapBps(5_001);
+    }
+
+    function test_Tier1_SetInsuranceCapBps_RevertWhenAtOrBelowFloor() public {
+        // Floor default = 500. Cap-set to 500 must revert (cap must be > floor strictly).
+        vm.prank(governance);
+        vm.expectRevert(ILPVault.InsuranceFloorNotBelowCap.selector);
+        vault.setInsuranceCapBps(500);
+    }
+
+    function test_Tier1_SetInsuranceCapBps_RevertOnNonGovernance() public {
+        vm.prank(stranger);
+        vm.expectRevert(abi.encodeWithSelector(ILPVault.Unauthorized.selector, stranger));
+        vault.setInsuranceCapBps(2_000);
+    }
+
+    function test_Tier1_SetInsuranceFloorBps_Happy() public {
+        vm.prank(governance);
+        vault.setInsuranceFloorBps(200); // 2%
+        assertEq(vault.insuranceFloorBps(), 200);
+    }
+
+    function test_Tier1_SetInsuranceFloorBps_RevertOnTooHigh() public {
+        vm.prank(governance);
+        vm.expectRevert(ILPVault.InsuranceFloorBpsOutOfRange.selector);
+        vault.setInsuranceFloorBps(1_001);
+    }
+
+    function test_Tier1_SetInsuranceFloorBps_RevertWhenAtOrAboveCap() public {
+        // Cap default = 1000. Floor-set to 1000 must revert (floor must be < cap strictly).
+        vm.prank(governance);
+        vm.expectRevert(ILPVault.InsuranceFloorNotBelowCap.selector);
+        vault.setInsuranceFloorBps(1_000);
     }
 }

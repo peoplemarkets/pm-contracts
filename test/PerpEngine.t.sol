@@ -1791,4 +1791,195 @@ contract PerpEngineTest is Test {
         engine.upgradeToAndCall(address(newImpl), "");
         assertEq(engine.governance(), governance);
     }
+
+    // ------------------------------------------------------------------------------------------
+    // Tier-1: funding event stub + entryFundingIndex snapshot (Wave 2)
+    // ------------------------------------------------------------------------------------------
+
+    function test_Tier1_PushFundingIndex_RevertWhenWriterUnset() public {
+        // fundingEngine is `address(0)` at v0 — any caller (including stranger) reverts.
+        vm.prank(stranger);
+        vm.expectRevert(abi.encodeWithSelector(IPerpEngine.OnlyFundingEngine.selector, stranger));
+        engine.pushFundingIndex(SUBJECT_ID, int256(1e18), int256(1e15));
+    }
+
+    function _wireFundingEngine(address newEngine) internal {
+        vm.prank(governance);
+        engine.proposeSetFundingEngine(newEngine);
+        vm.warp(block.timestamp + TIMELOCK_DELAY);
+        engine.activateSetFundingEngine();
+        // Refresh mark so post-warp staleness doesn't bite downstream calls.
+        _pushMarkAt(INITIAL_MARK);
+        _pushMarkAt2(INITIAL_MARK);
+    }
+
+    function test_Tier1_PushFundingIndex_Happy_AfterRotation() public {
+        address fundingWriter = makeAddr("fundingWriter");
+        _wireFundingEngine(fundingWriter);
+        assertEq(engine.fundingEngine(), fundingWriter);
+
+        vm.expectEmit(true, false, false, true, address(engine));
+        emit IPerpEngine.FundingPushed(SUBJECT_ID, 0, int256(1e18), int256(1e15), uint64(block.timestamp));
+        vm.prank(fundingWriter);
+        engine.pushFundingIndex(SUBJECT_ID, int256(1e18), int256(1e15));
+
+        assertEq(engine.cumulativeFundingIndex(SUBJECT_ID), int256(1e18));
+        assertEq(engine.lastFundingAt(SUBJECT_ID), uint64(block.timestamp));
+    }
+
+    function test_Tier1_PushFundingIndex_RevertOnPaused() public {
+        address fundingWriter = makeAddr("fundingWriter");
+        _wireFundingEngine(fundingWriter);
+
+        // Auto-pause the subject — requireTradeable should reject pushFundingIndex.
+        vm.prank(regGuardian);
+        registry.setAutoPaused(SUBJECT_ID, 5);
+
+        vm.prank(fundingWriter);
+        vm.expectRevert();
+        engine.pushFundingIndex(SUBJECT_ID, int256(1e18), int256(1e15));
+    }
+
+    function test_Tier1_OpenPosition_SnapshotsEntryFundingIndex() public {
+        // Write a non-zero cumulative index, then open a position.
+        address fundingWriter = makeAddr("fundingWriter");
+        _wireFundingEngine(fundingWriter);
+        vm.prank(fundingWriter);
+        engine.pushFundingIndex(SUBJECT_ID, int256(42e18), int256(0));
+
+        bytes32 posId = _open(_baseOpenParams());
+        // Read back the position's entryFundingIndex.
+        IPerpEngine.Position memory pos = engine.positionOf(posId);
+        assertEq(pos.entryFundingIndex, int256(42e18));
+    }
+
+    function test_Tier1_ClosePosition_EmitsFundingSettled() public {
+        bytes32 posId = _open(_baseOpenParams());
+        vm.expectEmit(true, true, false, true, address(engine));
+        emit IPerpEngine.FundingSettled(posId, trader, int256(0));
+        vm.prank(trader);
+        engine.closePosition(_baseCloseParams());
+    }
+
+    function test_Tier1_ProposeSetFundingEngine_Happy() public {
+        address w = makeAddr("w");
+        vm.prank(governance);
+        engine.proposeSetFundingEngine(w);
+        (address acct, uint64 activatesAt) = engine.pendingFundingEngine();
+        assertEq(acct, w);
+        assertEq(activatesAt, uint64(block.timestamp + TIMELOCK_DELAY));
+    }
+
+    function test_Tier1_ActivateSetFundingEngine_BeforeTimelock_Reverts() public {
+        address w = makeAddr("w");
+        vm.prank(governance);
+        engine.proposeSetFundingEngine(w);
+        vm.expectRevert();
+        engine.activateSetFundingEngine();
+    }
+
+    function test_Tier1_CancelSetFundingEngine_ClearsPending() public {
+        address w = makeAddr("w");
+        vm.prank(governance);
+        engine.proposeSetFundingEngine(w);
+        vm.prank(governance);
+        engine.cancelSetFundingEngine();
+        (address acct, uint64 activatesAt) = engine.pendingFundingEngine();
+        assertEq(acct, address(0));
+        assertEq(activatesAt, 0);
+    }
+
+    function test_Tier1_ProposeSetFundingEngine_RevertOnZeroAddress() public {
+        vm.prank(governance);
+        vm.expectRevert(IPerpEngine.InvalidConfig.selector);
+        engine.proposeSetFundingEngine(address(0));
+    }
+
+    function test_Tier1_ProposeSetFundingEngine_RevertWhenPendingExists() public {
+        address w1 = makeAddr("w1");
+        address w2 = makeAddr("w2");
+        vm.prank(governance);
+        engine.proposeSetFundingEngine(w1);
+        vm.prank(governance);
+        vm.expectRevert(IPerpEngine.PendingFundingEngineExists.selector);
+        engine.proposeSetFundingEngine(w2);
+    }
+
+    // ------------------------------------------------------------------------------------------
+    // Tier-1: net-category OI cap (Wave 2)
+    // ------------------------------------------------------------------------------------------
+
+    function test_Tier1_CategoryOiCap_DefaultIs20Pct() public view {
+        assertEq(engine.categoryNetOiCapBps(), 2_000);
+    }
+
+    function test_Tier1_CategoryOiCap_IncrementsOnOpen() public {
+        // Long open on SUBJECT_ID (in CATEGORY_ID) → net += sizeNotional.
+        IPerpEngine.OpenParams memory p = _baseOpenParams();
+        _open(p);
+        assertEq(engine.netCategoryOiOf(CATEGORY_ID), int256(p.sizeNotional));
+    }
+
+    function test_Tier1_CategoryOiCap_DecrementsOnClose() public {
+        _open(_baseOpenParams());
+        vm.prank(trader);
+        engine.closePosition(_baseCloseParams());
+        assertEq(engine.netCategoryOiOf(CATEGORY_ID), int256(0));
+    }
+
+    function test_Tier1_CategoryOiCap_RevertOnExceeded() public {
+        // Cap default = 20% of TVL. TVL = 1M USDC → cap = 200k.
+        // Tighten to 5% (= 50k) so we can hit it with a single 100k position.
+        // But MIN_CATEGORY_NET_OI_CAP_BPS = 500 (5%) — exact min works.
+        vm.prank(governance);
+        engine.setCategoryNetOiCapBps(500); // 5% = 50k cap
+
+        // First trade: 49_900 USDC long — under cap.
+        IPerpEngine.OpenParams memory p1 = _baseOpenParams();
+        p1.sizeNotional = 49_900 * ONE_USDC;
+        p1.collateralAmount = 10_000 * ONE_USDC;
+        _open(p1);
+
+        // Second trade on subject 2 (same category): 200 USDC long would tip net over 50k cap.
+        // Use trader2 to avoid one-position invariant collision on SUBJECT_ID.
+        vm.prank(kycWriter);
+        registry.setKycTier(trader2, 2);
+        IPerpEngine.OpenParams memory p2 = IPerpEngine.OpenParams({
+            subjectId: SUBJECT_ID2,
+            side: IPerpEngine.Side.LONG,
+            collateralAmount: 1_000 * ONE_USDC,
+            sizeNotional: 200 * ONE_USDC,
+            expectedMark: INITIAL_MARK,
+            maxSlippageBps: 100,
+            deadline: uint64(block.timestamp + 1 hours),
+            isMaker: false
+        });
+        vm.prank(trader2);
+        vm.expectRevert();
+        engine.openPosition(p2);
+    }
+
+    function test_Tier1_SetCategoryNetOiCapBps_Happy() public {
+        vm.prank(governance);
+        engine.setCategoryNetOiCapBps(3_000); // 30%
+        assertEq(engine.categoryNetOiCapBps(), 3_000);
+    }
+
+    function test_Tier1_SetCategoryNetOiCapBps_RevertOnTooLow() public {
+        vm.prank(governance);
+        vm.expectRevert(IPerpEngine.CategoryOiCapBpsOutOfRange.selector);
+        engine.setCategoryNetOiCapBps(499);
+    }
+
+    function test_Tier1_SetCategoryNetOiCapBps_RevertOnTooHigh() public {
+        vm.prank(governance);
+        vm.expectRevert(IPerpEngine.CategoryOiCapBpsOutOfRange.selector);
+        engine.setCategoryNetOiCapBps(5_001);
+    }
+
+    function test_Tier1_SetCategoryNetOiCapBps_RevertOnNonGovernance() public {
+        vm.prank(stranger);
+        vm.expectRevert(abi.encodeWithSelector(IPerpEngine.Unauthorized.selector, stranger));
+        engine.setCategoryNetOiCapBps(3_000);
+    }
 }
