@@ -9,8 +9,10 @@ import {Test} from "forge-std/Test.sol";
 import {FundingEngine} from "../src/core/FundingEngine.sol";
 import {IFundingEngine} from "../src/core/IFundingEngine.sol";
 import {ILPVault} from "../src/core/ILPVault.sol";
+import {IMarginEngine} from "../src/core/IMarginEngine.sol";
 import {IPerpEngine} from "../src/core/IPerpEngine.sol";
 import {LPVault} from "../src/core/LPVault.sol";
+import {MarginEngine} from "../src/core/MarginEngine.sol";
 import {PerpEngine} from "../src/core/PerpEngine.sol";
 import {IOracleRouter} from "../src/oracle/IOracleRouter.sol";
 import {OracleRouter} from "../src/oracle/OracleRouter.sol";
@@ -44,6 +46,7 @@ contract FundingEngineTest is Test {
 
     FundingEngine internal funding;
     PerpEngine internal engine;
+    MarginEngine internal marginEngine;
     LPVault internal vault;
     SubjectRegistry internal registry;
     OracleRouter internal router;
@@ -150,6 +153,14 @@ contract FundingEngineTest is Test {
             engine = PerpEngine(address(new ERC1967Proxy(address(impl), initData)));
         }
 
+        // 3b. MarginEngine behind UUPS — Wave 4 extraction.
+        {
+            MarginEngine impl = new MarginEngine();
+            bytes memory initData =
+                abi.encodeCall(MarginEngine.initialize, (governance, address(engine), TIMELOCK_DELAY));
+            marginEngine = MarginEngine(address(new ERC1967Proxy(address(impl), initData)));
+        }
+
         // 4. OracleRouter behind UUPS.
         {
             OracleRouter impl = new OracleRouter();
@@ -187,6 +198,12 @@ contract FundingEngineTest is Test {
         vm.warp(block.timestamp + TIMELOCK_DELAY);
         vault.activateSetPerpEngine();
 
+        // 7b. Wire PerpEngine.marginEngine (timelocked).
+        vm.prank(governance);
+        engine.proposeSetMarginEngine(address(marginEngine));
+        vm.warp(block.timestamp + TIMELOCK_DELAY);
+        engine.activateSetMarginEngine();
+
         // 8. Configure SubjectRegistry: list subjects + KYC tiers.
         vm.startPrank(regAdmin);
         registry.listSubject(SUBJECT_ID, CATEGORY_ID);
@@ -196,9 +213,10 @@ contract FundingEngineTest is Test {
         registry.setKycTier(traderShort, 3);
         vm.stopPrank();
 
-        // 9. Configure PerpEngine: KYC caps + mark writer + lift the delta cap for index moves.
+        // 9. KYC caps live on MarginEngine; mark writer + delta cap stay on PerpEngine.
+        vm.prank(governance);
+        marginEngine.setKycCaps(3, 1_000_000 * ONE_USDC, 4_000_000 * ONE_USDC);
         vm.startPrank(governance);
-        engine.setKycCaps(3, 1_000_000 * ONE_USDC, 4_000_000 * ONE_USDC);
         engine.setMarkMaxDeltaBps(5_000);
         engine.proposeAddMarkWriter(markWriter);
         vm.stopPrank();

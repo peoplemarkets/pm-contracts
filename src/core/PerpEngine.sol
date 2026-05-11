@@ -9,10 +9,11 @@ import {UUPSUpgradeable} from "@openzeppelin/contracts-upgradeable/proxy/utils/U
 import {ReentrancyGuard} from "solady/utils/ReentrancyGuard.sol";
 
 import {PositionMath} from "../libraries/PositionMath.sol";
-import {FundingStorage, MarginStorage, PerpStorage} from "../libraries/StorageLib.sol";
+import {FundingStorage, PerpStorage} from "../libraries/StorageLib.sol";
 import {ISubjectRegistry} from "../registry/ISubjectRegistry.sol";
 
 import {ILPVault} from "./ILPVault.sol";
+import {IMarginEngine} from "./IMarginEngine.sol";
 import {IPerpEngine} from "./IPerpEngine.sol";
 
 /// @title PerpEngine — position lifecycle for People Markets perps.
@@ -62,13 +63,6 @@ contract PerpEngine is Initializable, UUPSUpgradeable, ReentrancyGuard, IPerpEng
     uint256 internal constant MIN_MARK = 1; // strictly positive
     uint256 internal constant MAX_MARK = 1e36; // 1e18 USDC × 1e18 fixed-point
 
-    /// @dev Hard ceilings for governance-tunable params. Block obvious misconfiguration.
-    uint16 internal constant MAX_INITIAL_MARGIN_BPS = 10_000; // 100%
-    uint16 internal constant MAX_MAINTENANCE_MARGIN_BPS = 5_000; // 50%
-    uint16 internal constant MAX_LIQ_BUFFER_BPS = 2_000; // 20%
-    uint16 internal constant MAX_LEVERAGE_BPS = 60_000; // 6× (uint16 packing bound on storage)
-    uint16 internal constant MAX_OI_CAP_BPS = 5_000; // 50%
-
     /// @dev Per-update mark max-delta (v2-audit Fix #5). Defaults to 1500 bps (15% per push) — a
     ///      generous bound that doesn't block legitimate volatility but caps the damage from a
     ///      single compromised mark-writer key. Governance can tune in [100, 5_000] bps.
@@ -82,13 +76,6 @@ contract PerpEngine is Initializable, UUPSUpgradeable, ReentrancyGuard, IPerpEng
     ///      gives a clear human-readable buffer; first poke (when cappedTvlUpdatedAt == 0) is
     ///      uncooled to bootstrap.
     uint32 internal constant CAPPED_TVL_MIN_INTERVAL = 60 seconds;
-
-    /// @dev Tier-1: net-category OI cap. Spec §3 line 123 specifies 20% of vault TVL — the cap
-    ///      lower bound (500 bps = 5%) keeps the lever meaningful; the upper bound (5000 bps =
-    ///      50%) preserves the per-subject cap as the binding constraint at the top end.
-    uint16 internal constant DEFAULT_CATEGORY_NET_OI_CAP_BPS = 2_000;
-    uint16 internal constant MIN_CATEGORY_NET_OI_CAP_BPS = 500;
-    uint16 internal constant MAX_CATEGORY_NET_OI_CAP_BPS = 5_000;
 
     /// @custom:oz-upgrades-unsafe-allow constructor
     constructor() {
@@ -117,16 +104,9 @@ contract PerpEngine is Initializable, UUPSUpgradeable, ReentrancyGuard, IPerpEng
         perpS.markStaleAfter = 30 seconds; // spec §1 default
         perpS.lpRebatePct = 40; // spec §3 starting value
         perpS.markMaxDeltaBps = DEFAULT_MARK_MAX_DELTA_BPS; // v2-audit Fix #5
-
-        // Margin params seeded with spec §3 defaults; governance can tune later.
-        MarginStorage.Layout storage marginS = MarginStorage.load();
-        marginS.initialMarginBps = 2_000; // 20%
-        marginS.maintenanceMarginBps = 500; // 5%
-        marginS.liquidationBufferBps = 250; // 2.5%
-        marginS.maxLeverageBps = 50_000; // 5×
-        marginS.perSubjectSideOiCapBps = 500; // 5%
-        // Tier-1 net-category OI cap default: spec §3 line 123 — 20% of vault TVL.
-        marginS.categoryNetOiCapBps = DEFAULT_CATEGORY_NET_OI_CAP_BPS;
+        // Margin params + KYC caps + per-subject + per-category OI caps are now owned by the
+        // MarginEngine namespace and seeded in `MarginEngine.initialize`. This contract no longer
+        // touches MarginStorage on init.
     }
 
     // ------------------------------------------------------------------------------------------
@@ -166,7 +146,6 @@ contract PerpEngine is Initializable, UUPSUpgradeable, ReentrancyGuard, IPerpEng
     /// @inheritdoc IPerpEngine
     function openPosition(OpenParams calldata p) external nonReentrant returns (bytes32 positionId) {
         PerpStorage.Layout storage perpS = PerpStorage.load();
-        MarginStorage.Layout storage marginS = MarginStorage.load();
 
         if (perpS.globalHalt) revert GlobalHaltedError();
         if (block.timestamp > p.deadline) revert DeadlineExpired(p.deadline);
@@ -186,16 +165,14 @@ contract PerpEngine is Initializable, UUPSUpgradeable, ReentrancyGuard, IPerpEng
             revert PositionAlreadyOpen(msg.sender, p.subjectId);
         }
 
-        // Leverage + initial margin.
-        uint256 leverageBps = (p.sizeNotional * BPS_DENOMINATOR) / p.collateralAmount;
-        if (leverageBps > marginS.maxLeverageBps) {
-            revert LeverageTooHigh(leverageBps, marginS.maxLeverageBps);
-        }
-        uint256 reqIM = (p.sizeNotional * marginS.initialMarginBps) / BPS_DENOMINATOR;
-        if (p.collateralAmount < reqIM) revert InitialMarginShort(reqIM, p.collateralAmount);
-
-        // Caps.
-        _enforceOpenCaps(perpS, marginS, p.subjectId, p.side, p.sizeNotional, tier);
+        // Margin + cap checks — delegated to MarginEngine. The two calls below revert with the
+        // MarginEngine-side error variants (LeverageTooHigh, InitialMarginShort, PerSubjectOiCap...)
+        // matching the legacy reverts byte-for-byte from the caller's perspective.
+        IMarginEngine me = IMarginEngine(perpS.marginEngine);
+        if (address(me) == address(0)) revert MarginEngineUnset();
+        me.checkInitialMargin(p.sizeNotional, p.collateralAmount);
+        bytes32 categoryId = _categoryOf(perpS, p.subjectId);
+        _enforceOpenCaps(me, perpS, p.subjectId, categoryId, p.side, p.sizeNotional, tier);
 
         // Compute fee + split.
         (uint256 fee, uint256 lpRebate, uint256 insuranceShare) = _computeFees(p.sizeNotional, p.isMaker);
@@ -229,18 +206,14 @@ contract PerpEngine is Initializable, UUPSUpgradeable, ReentrancyGuard, IPerpEng
         });
         perpS.openPositionId[msg.sender][p.subjectId] = positionId;
 
-        // OI + exposure (post-delta).
+        // OI side-counters live on PerpStorage. Signed per-category OI + per-trader exposure live
+        // on MarginEngine — delegate the update so the canonical state stays in one place.
         if (p.side == Side.LONG) {
             perpS.totalLongOI[p.subjectId] += p.sizeNotional;
-            // Tier-1: signed category OI accumulator (long contributes positively).
-            marginS.netCategoryOi[_categoryOf(perpS, p.subjectId)] += int256(p.sizeNotional);
         } else {
             perpS.totalShortOI[p.subjectId] += p.sizeNotional;
-            // Short contributes negatively to the net signed accumulator.
-            marginS.netCategoryOi[_categoryOf(perpS, p.subjectId)] -= int256(p.sizeNotional);
         }
-        marginS.exposure[msg.sender].totalPerpNotional += p.sizeNotional;
-        marginS.exposure[msg.sender].tier = MarginStorage.KycTier(tier);
+        me.recordOpenDelta(msg.sender, categoryId, IMarginEngine.Side(uint8(p.side)), p.sizeNotional, tier);
 
         // Vault settle: pull (collateralAmount + fee) from trader, book the split.
         ILPVault(perpS.lpVault).openPositionFlow(msg.sender, p.collateralAmount, fee, lpRebate, insuranceShare);
@@ -267,7 +240,6 @@ contract PerpEngine is Initializable, UUPSUpgradeable, ReentrancyGuard, IPerpEng
     /// @inheritdoc IPerpEngine
     function closePosition(CloseParams calldata p) external nonReentrant returns (int256 realizedPnl) {
         PerpStorage.Layout storage perpS = PerpStorage.load();
-        MarginStorage.Layout storage marginS = MarginStorage.load();
 
         if (perpS.globalHalt) revert GlobalHaltedError();
         if (block.timestamp > p.deadline) revert DeadlineExpired(p.deadline);
@@ -301,17 +273,21 @@ contract PerpEngine is Initializable, UUPSUpgradeable, ReentrancyGuard, IPerpEng
             pos.lastInteractionAt = uint64(block.timestamp);
         }
 
-        // OI + exposure deltas (always at OPENING notional — OI tracks contract count × open price).
+        // OI side-counters on PerpStorage. Signed per-category OI + per-trader exposure live on
+        // MarginEngine — delegate the unwind. OI deltas use OPENING notional throughout.
         if (v.isLong) {
             perpS.totalLongOI[p.subjectId] -= v.openingNotionalDelta;
-            // Tier-1: unwind the long's positive contribution to the net category accumulator.
-            marginS.netCategoryOi[_categoryOf(perpS, p.subjectId)] -= int256(v.openingNotionalDelta);
         } else {
             perpS.totalShortOI[p.subjectId] -= v.openingNotionalDelta;
-            // Unwind the short's negative contribution (add back).
-            marginS.netCategoryOi[_categoryOf(perpS, p.subjectId)] += int256(v.openingNotionalDelta);
         }
-        marginS.exposure[msg.sender].totalPerpNotional -= v.openingNotionalDelta;
+        // marginEngine MAY be unset (legacy positions opened before Wave 4 rotation). Guard so
+        // close paths stay alive on a partially-wired engine — opens are blocked by the unset
+        // pointer, but unwinds must always succeed.
+        if (perpS.marginEngine != address(0)) {
+            IMarginEngine(perpS.marginEngine).recordCloseDelta(
+                msg.sender, _categoryOf(perpS, p.subjectId), v.openingNotionalDelta, v.isLong
+            );
+        }
 
         ILPVault(perpS.lpVault).settlePosition(
             msg.sender, v.closeCollateral, v.realizedPnl, v.fee, v.lpRebate, v.insuranceShare
@@ -389,7 +365,6 @@ contract PerpEngine is Initializable, UUPSUpgradeable, ReentrancyGuard, IPerpEng
     ///      right to the captured-mark unwind regardless of broader system state.
     function closeAtForcedSettlement(bytes32 subjectId) external nonReentrant returns (int256 realizedPnl) {
         PerpStorage.Layout storage perpS = PerpStorage.load();
-        MarginStorage.Layout storage marginS = MarginStorage.load();
         if (!perpS.subjectForceSettled[subjectId]) revert SubjectNotForceSettled(subjectId);
 
         bytes32 positionId = perpS.openPositionId[msg.sender][subjectId];
@@ -423,15 +398,17 @@ contract PerpEngine is Initializable, UUPSUpgradeable, ReentrancyGuard, IPerpEng
         // State updates BEFORE the external call (CEI).
         delete perpS.positions[positionId];
         delete perpS.openPositionId[msg.sender][subjectId];
-        if (orig.size > 0) {
+        bool isLong = orig.size > 0;
+        if (isLong) {
             perpS.totalLongOI[subjectId] -= openingNotional;
-            // Tier-1: unwind the long's positive contribution to the net category accumulator.
-            marginS.netCategoryOi[_categoryOf(perpS, subjectId)] -= int256(openingNotional);
         } else {
             perpS.totalShortOI[subjectId] -= openingNotional;
-            marginS.netCategoryOi[_categoryOf(perpS, subjectId)] += int256(openingNotional);
         }
-        marginS.exposure[msg.sender].totalPerpNotional -= openingNotional;
+        if (perpS.marginEngine != address(0)) {
+            IMarginEngine(perpS.marginEngine).recordCloseDelta(
+                msg.sender, _categoryOf(perpS, subjectId), openingNotional, isLong
+            );
+        }
 
         // Vault settle: zero fee, zero rebate, zero insurance share. cappedPnl ensures the
         // vault's own UnderwaterClose check (collateral + cappedPnl − fee ≥ 0) passes — at the
@@ -467,7 +444,6 @@ contract PerpEngine is Initializable, UUPSUpgradeable, ReentrancyGuard, IPerpEng
     function removeCollateral(bytes32 subjectId, uint256 amount) external nonReentrant {
         if (amount == 0) revert AmountZero();
         PerpStorage.Layout storage perpS = PerpStorage.load();
-        MarginStorage.Layout storage marginS = MarginStorage.load();
         if (perpS.globalHalt) revert GlobalHaltedError();
         if (perpS.subjectForceSettled[subjectId]) revert SubjectIsForceSettled(subjectId);
 
@@ -484,21 +460,17 @@ contract PerpEngine is Initializable, UUPSUpgradeable, ReentrancyGuard, IPerpEng
         uint256 absSize = pos.size > 0 ? uint256(pos.size) : uint256(-pos.size);
         uint256 currentNotional = (absSize * markNow) / ONE;
 
-        // Re-check leverage cap on the residual.
-        uint256 leverageBps = (currentNotional * BPS_DENOMINATOR) / newCollateral;
-        if (leverageBps > marginS.maxLeverageBps) {
-            revert LeverageTooHigh(leverageBps, marginS.maxLeverageBps);
-        }
-
-        // Re-check initial margin (NOT maintenance — withdrawals must leave the position
-        // genuinely safe, not just past the liquidation threshold).
+        // Negative-equity short-circuit: emits the dedicated MaintenanceMarginShort selector to
+        // preserve the pre-extraction error trail. Other IM/leverage failures route through
+        // MarginEngine.checkInitialMarginResidual which mirrors the legacy selectors.
         int256 uPnl = PositionMath.unrealizedPnl(pos.size, pos.entryPrice, markNow);
-        int256 equity = int256(newCollateral) + uPnl;
-        if (equity <= 0) revert MaintenanceMarginShort(marginS.maintenanceMarginBps, 0);
-        uint256 marginRatioBps = (uint256(equity) * BPS_DENOMINATOR) / currentNotional;
-        if (marginRatioBps < marginS.initialMarginBps) {
-            revert InitialMarginShort((currentNotional * marginS.initialMarginBps) / BPS_DENOMINATOR, uint256(equity));
-        }
+        if (int256(newCollateral) + uPnl <= 0) revert MaintenanceMarginShort(0, 0);
+
+        // Re-check leverage + IM on the residual via MarginEngine. NOT maintenance — withdrawals
+        // must leave the position genuinely safe, not just past the liquidation threshold.
+        address me = perpS.marginEngine;
+        if (me == address(0)) revert MarginEngineUnset();
+        IMarginEngine(me).checkInitialMarginResidual(newCollateral, currentNotional, uPnl);
 
         pos.collateral = newCollateral;
         pos.lastInteractionAt = uint64(block.timestamp);
@@ -537,10 +509,15 @@ contract PerpEngine is Initializable, UUPSUpgradeable, ReentrancyGuard, IPerpEng
         }
     }
 
+    /// @dev Delegates the cap enforcement to MarginEngine. PerpEngine computes the cap
+    ///      denominator (`min(cappedTvl, liveTvl)` — v2-audit Fix #3) locally so MarginEngine
+    ///      does not need a back-pointer to the LP vault. The signed-OI accumulator + side
+    ///      counters are read from PerpStorage and passed through.
     function _enforceOpenCaps(
+        IMarginEngine me,
         PerpStorage.Layout storage perpS,
-        MarginStorage.Layout storage marginS,
         bytes32 subjectId,
+        bytes32 categoryId,
         Side side,
         uint256 sizeNotional,
         uint8 tier
@@ -548,46 +525,19 @@ contract PerpEngine is Initializable, UUPSUpgradeable, ReentrancyGuard, IPerpEng
         internal
         view
     {
-        // Per-subject side OI cap. v2-audit Fix #3: cap denominator is `min(cappedTvl, liveTvl)`.
-        // - `cappedTvl` is a slow-moving snapshot updated by the permissionless `pokeCappedTvl`
-        //   under a 60s cooldown — defeats same-block flash-deposit cap inflation.
-        // - Live `freeAssets()` is still consulted so a sudden withdrawal or LP loss tightens the
-        //   cap immediately (conservative on the downside; permissive only after a delayed poke).
         uint256 liveTvl = IERC4626(perpS.lpVault).totalAssets();
         uint256 vaultTvl = perpS.cappedTvl < liveTvl ? perpS.cappedTvl : liveTvl;
-        uint256 sideOiCap = (vaultTvl * marginS.perSubjectSideOiCapBps) / BPS_DENOMINATOR;
-        uint256 newSideOi = side == Side.LONG
-            ? perpS.totalLongOI[subjectId] + sizeNotional
-            : perpS.totalShortOI[subjectId] + sizeNotional;
-        if (newSideOi > sideOiCap) {
-            revert PerSubjectOiCapExceeded(subjectId, side, newSideOi, sideOiCap);
-        }
-
-        // Tier-1: net-category OI cap. Spec §3 line 123 — 20% of vault TVL. Same denominator
-        // semantic as the per-subject cap (`min(cappedTvl, liveTvl)`) to keep the flash-deposit
-        // defense consistent. The prospective net is `current + signed sizeNotional`; we cap
-        // the absolute value so a trade that nets a category from +X to −X still cannot exceed
-        // the cap in either direction.
-        bytes32 categoryId = _categoryOf(perpS, subjectId);
-        int256 currentNet = marginS.netCategoryOi[categoryId];
-        int256 prospective = side == Side.LONG ? currentNet + int256(sizeNotional) : currentNet - int256(sizeNotional);
-        uint256 prospectiveAbs = prospective >= 0 ? uint256(prospective) : uint256(-prospective);
-        uint256 categoryCap = (vaultTvl * marginS.categoryNetOiCapBps) / BPS_DENOMINATOR;
-        if (prospectiveAbs > categoryCap) {
-            revert CategoryOiCapExceeded(categoryId, prospectiveAbs, categoryCap);
-        }
-
-        // Per-trader-per-subject cap. The one-position invariant means we know the trader has no
-        // existing position on this subject, so the cap applies cleanly to `sizeNotional`.
-        uint256 perSubjectCap = marginS.tierPerSubjectCap[MarginStorage.KycTier(tier)];
-        if (sizeNotional > perSubjectCap) {
-            revert PerTraderSubjectCapExceeded(msg.sender, subjectId, sizeNotional, perSubjectCap);
-        }
-
-        // Combined exposure cap.
-        uint256 combinedCap = marginS.tierCombinedCap[MarginStorage.KycTier(tier)];
-        uint256 newCombined = marginS.exposure[msg.sender].totalPerpNotional + sizeNotional;
-        if (newCombined > combinedCap) revert CombinedExposureCapExceeded(msg.sender, newCombined, combinedCap);
+        me.enforceOpenCaps(
+            msg.sender,
+            subjectId,
+            categoryId,
+            IMarginEngine.Side(uint8(side)),
+            sizeNotional,
+            tier,
+            perpS.totalLongOI[subjectId],
+            perpS.totalShortOI[subjectId],
+            vaultTvl
+        );
     }
 
     /// @dev Look up the category for `subjectId` from the registry. Wrapped in a private helper
@@ -753,42 +703,6 @@ contract PerpEngine is Initializable, UUPSUpgradeable, ReentrancyGuard, IPerpEng
     // ------------------------------------------------------------------------------------------
 
     /// @inheritdoc IPerpEngine
-    function setMarginParams(uint16 imBps, uint16 mmBps, uint16 bufBps, uint16 maxLevBps) external onlyGovernance {
-        if (imBps == 0 || imBps > MAX_INITIAL_MARGIN_BPS) revert InvalidConfig();
-        if (mmBps == 0 || mmBps > MAX_MAINTENANCE_MARGIN_BPS) revert InvalidConfig();
-        if (bufBps > MAX_LIQ_BUFFER_BPS) revert InvalidConfig();
-        if (maxLevBps == 0 || maxLevBps > MAX_LEVERAGE_BPS) revert InvalidConfig();
-        // Logical ordering: maintenance < initial. A position must be insolvent at MM before
-        // becoming insolvent at IM.
-        if (mmBps >= imBps) revert InvalidConfig();
-
-        MarginStorage.Layout storage marginS = MarginStorage.load();
-        marginS.initialMarginBps = imBps;
-        marginS.maintenanceMarginBps = mmBps;
-        marginS.liquidationBufferBps = bufBps;
-        marginS.maxLeverageBps = maxLevBps;
-        emit MarginParamsSet(imBps, mmBps, bufBps, maxLevBps);
-    }
-
-    /// @inheritdoc IPerpEngine
-    function setKycCaps(uint8 tier, uint256 perSubjectCap, uint256 combinedCap) external onlyGovernance {
-        if (tier == 0 || tier > 3) revert KycTierInvalid(tier);
-        if (perSubjectCap == 0 || combinedCap == 0) revert InvalidConfig();
-        if (combinedCap < perSubjectCap) revert InvalidConfig();
-        MarginStorage.Layout storage marginS = MarginStorage.load();
-        MarginStorage.KycTier t = MarginStorage.KycTier(tier);
-        marginS.tierPerSubjectCap[t] = perSubjectCap;
-        marginS.tierCombinedCap[t] = combinedCap;
-        emit KycCapsSet(tier, perSubjectCap, combinedCap);
-    }
-
-    /// @notice Governance setter for the per-subject side OI cap (basis points of vault TVL).
-    function setPerSubjectSideOiCapBps(uint16 bps) external onlyGovernance {
-        if (bps == 0 || bps > MAX_OI_CAP_BPS) revert InvalidConfig();
-        MarginStorage.load().perSubjectSideOiCapBps = bps;
-    }
-
-    /// @inheritdoc IPerpEngine
     function setMarkStaleAfter(uint32 seconds_) external onlyGovernance {
         if (seconds_ < MIN_MARK_STALE_AFTER || seconds_ > MAX_MARK_STALE_AFTER) revert InvalidConfig();
         PerpStorage.load().markStaleAfter = seconds_;
@@ -836,20 +750,6 @@ contract PerpEngine is Initializable, UUPSUpgradeable, ReentrancyGuard, IPerpEng
         uint8 old = perpS.lpRebatePct;
         perpS.lpRebatePct = pct;
         emit LpRebatePctSet(old, pct);
-    }
-
-    /// @inheritdoc IPerpEngine
-    /// @dev Tier-1 net-category OI cap. Bounds [500, 5000] bps (5% to 50%). No timelock — matches
-    ///      the existing `setLpRebatePct` / `setMarkMaxDeltaBps` pattern (parameter changes are
-    ///      lower blast radius than role grants, and the governance multi-sig is the gate).
-    function setCategoryNetOiCapBps(uint16 bps) external onlyGovernance {
-        if (bps < MIN_CATEGORY_NET_OI_CAP_BPS || bps > MAX_CATEGORY_NET_OI_CAP_BPS) {
-            revert CategoryOiCapBpsOutOfRange();
-        }
-        MarginStorage.Layout storage marginS = MarginStorage.load();
-        uint16 old = marginS.categoryNetOiCapBps;
-        marginS.categoryNetOiCapBps = bps;
-        emit CategoryNetOiCapBpsSet(old, bps);
     }
 
     // ------------------------------------------------------------------------------------------
@@ -934,6 +834,49 @@ contract PerpEngine is Initializable, UUPSUpgradeable, ReentrancyGuard, IPerpEng
         delete perpS.pendingFeedbackController;
         delete perpS.pendingFeedbackControllerActivatesAt;
         emit FeedbackControllerCancelled(pending);
+    }
+
+    // ------------------------------------------------------------------------------------------
+    // Governance: MarginEngine rotation (timelocked)
+    //
+    // Same shape as `proposeSetFundingEngine` / `proposeSetFeedbackController`. Until rotation
+    // activates, `openPosition` reverts at the `_enforceOpenCaps` delegation with
+    // `MarginEngineUnset`.
+    // ------------------------------------------------------------------------------------------
+
+    /// @inheritdoc IPerpEngine
+    function proposeSetMarginEngine(address newEngine) external onlyGovernance {
+        if (newEngine == address(0)) revert InvalidConfig();
+        PerpStorage.Layout storage perpS = PerpStorage.load();
+        if (perpS.pendingMarginEngineActivatesAt != 0) revert PendingMarginEngineExists();
+        uint64 activatesAt = uint64(block.timestamp + perpS.timelockDelay);
+        perpS.pendingMarginEngine = newEngine;
+        perpS.pendingMarginEngineActivatesAt = activatesAt;
+        emit MarginEngineProposed(newEngine, activatesAt);
+    }
+
+    /// @inheritdoc IPerpEngine
+    function activateSetMarginEngine() external {
+        PerpStorage.Layout storage perpS = PerpStorage.load();
+        uint64 readyAt = perpS.pendingMarginEngineActivatesAt;
+        if (readyAt == 0) revert NoPendingMarginEngine();
+        if (block.timestamp < readyAt) revert TimelockNotElapsed(readyAt);
+        address oldEngine = perpS.marginEngine;
+        address newEngine = perpS.pendingMarginEngine;
+        perpS.marginEngine = newEngine;
+        delete perpS.pendingMarginEngine;
+        delete perpS.pendingMarginEngineActivatesAt;
+        emit MarginEngineActivated(oldEngine, newEngine);
+    }
+
+    /// @inheritdoc IPerpEngine
+    function cancelSetMarginEngine() external onlyGovernance {
+        PerpStorage.Layout storage perpS = PerpStorage.load();
+        if (perpS.pendingMarginEngineActivatesAt == 0) revert NoPendingMarginEngine();
+        address pending = perpS.pendingMarginEngine;
+        delete perpS.pendingMarginEngine;
+        delete perpS.pendingMarginEngineActivatesAt;
+        emit MarginEngineCancelled(pending);
     }
 
     // ------------------------------------------------------------------------------------------
@@ -1034,19 +977,6 @@ contract PerpEngine is Initializable, UUPSUpgradeable, ReentrancyGuard, IPerpEng
     }
 
     /// @inheritdoc IPerpEngine
-    function isMarginOk(bytes32 positionId) external view returns (bool) {
-        Position memory pos = PerpStorage.load().positions[positionId];
-        if (pos.size == 0) return true;
-        uint256 markNow = PerpStorage.load().markPrice[pos.subjectId];
-        if (markNow == 0) return false;
-        uint256 notional_ = PositionMath.notional(pos.size, markNow);
-        int256 uPnl = PositionMath.unrealizedPnl(pos.size, pos.entryPrice, markNow);
-        int256 eq = PositionMath.equity(pos.collateral, uPnl);
-        uint256 ratio = PositionMath.marginRatioBps(eq, notional_);
-        return ratio >= MarginStorage.load().maintenanceMarginBps;
-    }
-
-    /// @inheritdoc IPerpEngine
     function isMarkWriter(address account) external view returns (bool) {
         return PerpStorage.load().markWriters[account];
     }
@@ -1129,16 +1059,6 @@ contract PerpEngine is Initializable, UUPSUpgradeable, ReentrancyGuard, IPerpEng
         return (perpS.pendingFeedbackController, perpS.pendingFeedbackControllerActivatesAt);
     }
 
-    /// @inheritdoc IPerpEngine
-    function categoryNetOiCapBps() external view returns (uint16) {
-        return MarginStorage.load().categoryNetOiCapBps;
-    }
-
-    /// @inheritdoc IPerpEngine
-    function netCategoryOiOf(bytes32 categoryId) external view returns (int256) {
-        return MarginStorage.load().netCategoryOi[categoryId];
-    }
-
     function pendingMarkWriterActivatesAt(address writer) external view returns (uint64) {
         return PerpStorage.load().pendingMarkWriterActivatesAt[writer];
     }
@@ -1156,34 +1076,18 @@ contract PerpEngine is Initializable, UUPSUpgradeable, ReentrancyGuard, IPerpEng
         return PerpStorage.load().subjectRegistry;
     }
 
-    function marginParams()
-        external
-        view
-        returns (uint16 imBps, uint16 mmBps, uint16 bufBps, uint16 maxLevBps, uint16 oiCapBps)
-    {
-        MarginStorage.Layout storage marginS = MarginStorage.load();
-        return (
-            marginS.initialMarginBps,
-            marginS.maintenanceMarginBps,
-            marginS.liquidationBufferBps,
-            marginS.maxLeverageBps,
-            marginS.perSubjectSideOiCapBps
-        );
+    /// @notice Configured MarginEngine address. `address(0)` until the timelocked rotation
+    ///         lands. While unset, every `openPosition` call reverts at the delegation site with
+    ///         `MarginEngineUnset` — the deploy script must wire MarginEngine before traders can
+    ///         open new positions.
+    function marginEngine() external view returns (address) {
+        return PerpStorage.load().marginEngine;
     }
 
-    function tierCaps(uint8 tier) external view returns (uint256 perSubjectCap, uint256 combinedCap) {
-        MarginStorage.Layout storage marginS = MarginStorage.load();
-        MarginStorage.KycTier t = MarginStorage.KycTier(tier);
-        return (marginS.tierPerSubjectCap[t], marginS.tierCombinedCap[t]);
-    }
-
-    function exposureOf(address trader)
-        external
-        view
-        returns (uint256 totalPerpNotional, uint256 totalEventExposure, uint8 tier)
-    {
-        MarginStorage.AccountExposure storage e = MarginStorage.load().exposure[trader];
-        return (e.totalPerpNotional, e.totalEventExposure, uint8(e.tier));
+    /// @notice Pending MarginEngine rotation (zero address + zero timestamp when none in flight).
+    function pendingMarginEngine() external view returns (address account, uint64 activatesAt) {
+        PerpStorage.Layout storage perpS = PerpStorage.load();
+        return (perpS.pendingMarginEngine, perpS.pendingMarginEngineActivatesAt);
     }
 
     // ------------------------------------------------------------------------------------------

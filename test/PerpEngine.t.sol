@@ -7,8 +7,10 @@ import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {Test} from "forge-std/Test.sol";
 
 import {ILPVault} from "../src/core/ILPVault.sol";
+import {IMarginEngine} from "../src/core/IMarginEngine.sol";
 import {IPerpEngine} from "../src/core/IPerpEngine.sol";
 import {LPVault} from "../src/core/LPVault.sol";
+import {MarginEngine} from "../src/core/MarginEngine.sol";
 import {PerpEngine} from "../src/core/PerpEngine.sol";
 
 import {ISubjectRegistry} from "../src/registry/ISubjectRegistry.sol";
@@ -18,6 +20,7 @@ import {MockUSDC} from "./mocks/MockUSDC.sol";
 
 contract PerpEngineTest is Test {
     PerpEngine internal engine;
+    MarginEngine internal marginEngine;
     LPVault internal vault;
     SubjectRegistry internal registry;
     MockUSDC internal usdc;
@@ -87,13 +90,27 @@ contract PerpEngineTest is Test {
             engine = PerpEngine(address(new ERC1967Proxy(address(impl), initData)));
         }
 
-        // 4. Wire LPVault.setPerpEngine to the engine address (timelocked).
+        // 4. MarginEngine behind UUPS — Wave 4 extraction.
+        {
+            MarginEngine impl = new MarginEngine();
+            bytes memory initData =
+                abi.encodeCall(MarginEngine.initialize, (governance, address(engine), TIMELOCK_DELAY));
+            marginEngine = MarginEngine(address(new ERC1967Proxy(address(impl), initData)));
+        }
+
+        // 5. Wire LPVault.setPerpEngine to the engine address (timelocked).
         vm.prank(governance);
         vault.proposeSetPerpEngine(address(engine));
         vm.warp(block.timestamp + TIMELOCK_DELAY);
         vault.activateSetPerpEngine();
 
-        // 5. Configure SubjectRegistry: list subjects, set KYC tiers.
+        // 6. Wire PerpEngine.marginEngine (timelocked).
+        vm.prank(governance);
+        engine.proposeSetMarginEngine(address(marginEngine));
+        vm.warp(block.timestamp + TIMELOCK_DELAY);
+        engine.activateSetMarginEngine();
+
+        // 7. Configure SubjectRegistry: list subjects, set KYC tiers.
         vm.startPrank(regAdmin);
         registry.listSubject(SUBJECT_ID, CATEGORY_ID);
         registry.listSubject(SUBJECT_ID2, CATEGORY_ID);
@@ -103,11 +120,11 @@ contract PerpEngineTest is Test {
         registry.setKycTier(trader2, 1); // T1 → $50K per-subject, $200K combined
         vm.stopPrank();
 
-        // 6. Configure PerpEngine: KYC caps + mark writer.
+        // 8. Configure margin caps on MarginEngine, mark writer on PerpEngine.
         vm.startPrank(governance);
-        engine.setKycCaps(1, 50_000 * ONE_USDC, 200_000 * ONE_USDC);
-        engine.setKycCaps(2, 250_000 * ONE_USDC, 1_000_000 * ONE_USDC);
-        engine.setKycCaps(3, 1_000_000 * ONE_USDC, 4_000_000 * ONE_USDC);
+        marginEngine.setKycCaps(1, 50_000 * ONE_USDC, 200_000 * ONE_USDC);
+        marginEngine.setKycCaps(2, 250_000 * ONE_USDC, 1_000_000 * ONE_USDC);
+        marginEngine.setKycCaps(3, 1_000_000 * ONE_USDC, 4_000_000 * ONE_USDC);
         // Lift the mark-delta cap to its maximum (50%) for the suite — most tests need to push
         // large mark moves to exercise PnL/underwater paths. Dedicated tests for the
         // delta-cap behavior at the default 15% live below.
@@ -196,7 +213,7 @@ contract PerpEngineTest is Test {
         assertEq(engine.subjectRegistry(), address(registry));
         assertEq(engine.lpVault(), address(vault));
         assertEq(engine.markStaleAfter(), 30 seconds);
-        (uint16 imBps, uint16 mmBps,, uint16 maxLevBps,) = engine.marginParams();
+        (uint16 imBps, uint16 mmBps,, uint16 maxLevBps,) = marginEngine.marginParams();
         assertEq(imBps, 2_000);
         assertEq(mmBps, 500);
         assertEq(maxLevBps, 50_000);
@@ -480,7 +497,7 @@ contract PerpEngineTest is Test {
         // With default params (IM=20%, maxLev=5×) the leverage check is the binding constraint —
         // it trips before IM. Strengthen IM to 30% so it becomes binding, then trigger.
         vm.prank(governance);
-        engine.setMarginParams(3_000, 500, 250, 50_000);
+        marginEngine.setMarginParams(3_000, 500, 250, 50_000);
 
         IPerpEngine.OpenParams memory p = _baseOpenParams();
         // 50K notional, IM=30% → IM = $15K. Use $14K collateral so leverage is OK (3.57×) but IM short.
@@ -509,9 +526,12 @@ contract PerpEngineTest is Test {
         p.collateralAmount = 12_000 * ONE_USDC;
 
         vm.prank(trader2);
+        // Wave 4: cap reverts now bubble up from MarginEngine with the MarginEngine error
+        // signature (PerSubjectTraderCapExceeded). PerpEngine's legacy alias is retained on the
+        // interface for source compatibility but the selector matches the MarginEngine variant.
         vm.expectRevert(
             abi.encodeWithSelector(
-                IPerpEngine.PerTraderSubjectCapExceeded.selector,
+                IMarginEngine.PerSubjectTraderCapExceeded.selector,
                 trader2,
                 SUBJECT_ID,
                 uint256(60_000 * ONE_USDC),
@@ -532,7 +552,7 @@ contract PerpEngineTest is Test {
     function test_RemoveCollateral_RevertOnIMShortBindingPath() public {
         // Lift IM to 30% so it can bind on remove without leverage tripping first.
         vm.prank(governance);
-        engine.setMarginParams(3_000, 500, 250, 50_000);
+        marginEngine.setMarginParams(3_000, 500, 250, 50_000);
 
         // Open with $20K collateral, $50K notional. Leverage 2.5×, well below cap. IM=30% = $15K.
         IPerpEngine.OpenParams memory p = _baseOpenParams();
@@ -587,7 +607,7 @@ contract PerpEngineTest is Test {
 
         // Now lift the trader's combined cap to $300K so we can hit it on the second open.
         vm.prank(governance);
-        engine.setKycCaps(2, 250_000 * ONE_USDC, 300_000 * ONE_USDC);
+        marginEngine.setKycCaps(2, 250_000 * ONE_USDC, 300_000 * ONE_USDC);
 
         // First open: $250K on SUBJECT_ID. Within combined cap.
         IPerpEngine.OpenParams memory p = _baseOpenParams();
@@ -972,8 +992,8 @@ contract PerpEngineTest is Test {
 
     function test_SetMarginParams_HappyPath() public {
         vm.prank(governance);
-        engine.setMarginParams(2_500, 600, 300, 40_000);
-        (uint16 im, uint16 mm, uint16 buf, uint16 lev,) = engine.marginParams();
+        marginEngine.setMarginParams(2_500, 600, 300, 40_000);
+        (uint16 im, uint16 mm, uint16 buf, uint16 lev,) = marginEngine.marginParams();
         assertEq(im, 2_500);
         assertEq(mm, 600);
         assertEq(buf, 300);
@@ -982,84 +1002,84 @@ contract PerpEngineTest is Test {
 
     function test_SetMarginParams_RevertOnInvalidImBps() public {
         vm.prank(governance);
-        vm.expectRevert(IPerpEngine.InvalidConfig.selector);
-        engine.setMarginParams(0, 500, 250, 50_000);
+        vm.expectRevert(abi.encodeWithSelector(IMarginEngine.InitialMarginBpsOutOfRange.selector, uint16(0)));
+        marginEngine.setMarginParams(0, 500, 250, 50_000);
 
         vm.prank(governance);
-        vm.expectRevert(IPerpEngine.InvalidConfig.selector);
-        engine.setMarginParams(10_001, 500, 250, 50_000);
+        vm.expectRevert(abi.encodeWithSelector(IMarginEngine.InitialMarginBpsOutOfRange.selector, uint16(10_001)));
+        marginEngine.setMarginParams(10_001, 500, 250, 50_000);
     }
 
     function test_SetMarginParams_RevertOnMmGteIm() public {
         vm.prank(governance);
-        vm.expectRevert(IPerpEngine.InvalidConfig.selector);
-        engine.setMarginParams(2_000, 2_000, 250, 50_000);
+        vm.expectRevert(abi.encodeWithSelector(IMarginEngine.MmGteIm.selector, uint16(2_000), uint16(2_000)));
+        marginEngine.setMarginParams(2_000, 2_000, 250, 50_000);
     }
 
     function test_SetMarginParams_RevertOnNonGovernance() public {
         vm.prank(stranger);
-        vm.expectRevert(abi.encodeWithSelector(IPerpEngine.Unauthorized.selector, stranger));
-        engine.setMarginParams(2_000, 500, 250, 50_000);
+        vm.expectRevert(abi.encodeWithSelector(IMarginEngine.Unauthorized.selector, stranger));
+        marginEngine.setMarginParams(2_000, 500, 250, 50_000);
     }
 
     function test_SetMarginParams_RevertOnInvalidMm() public {
         vm.prank(governance);
-        vm.expectRevert(IPerpEngine.InvalidConfig.selector);
-        engine.setMarginParams(2_000, 0, 250, 50_000);
+        vm.expectRevert(abi.encodeWithSelector(IMarginEngine.MaintenanceMarginBpsOutOfRange.selector, uint16(0)));
+        marginEngine.setMarginParams(2_000, 0, 250, 50_000);
 
         vm.prank(governance);
-        vm.expectRevert(IPerpEngine.InvalidConfig.selector);
-        engine.setMarginParams(2_000, 5_001, 250, 50_000);
+        vm.expectRevert(abi.encodeWithSelector(IMarginEngine.MaintenanceMarginBpsOutOfRange.selector, uint16(5_001)));
+        marginEngine.setMarginParams(2_000, 5_001, 250, 50_000);
     }
 
     function test_SetMarginParams_RevertOnInvalidBuf() public {
         vm.prank(governance);
-        vm.expectRevert(IPerpEngine.InvalidConfig.selector);
-        engine.setMarginParams(2_000, 500, 2_001, 50_000);
+        vm.expectRevert(abi.encodeWithSelector(IMarginEngine.LiquidationBufferBpsOutOfRange.selector, uint16(2_001)));
+        marginEngine.setMarginParams(2_000, 500, 2_001, 50_000);
     }
 
     function test_SetMarginParams_RevertOnInvalidLev() public {
         vm.prank(governance);
-        vm.expectRevert(IPerpEngine.InvalidConfig.selector);
-        engine.setMarginParams(2_000, 500, 250, 0);
+        vm.expectRevert(abi.encodeWithSelector(IMarginEngine.MaxLeverageBpsOutOfRange.selector, uint16(0)));
+        marginEngine.setMarginParams(2_000, 500, 250, 0);
 
         vm.prank(governance);
-        vm.expectRevert(IPerpEngine.InvalidConfig.selector);
-        engine.setMarginParams(2_000, 500, 250, 60_001);
+        vm.expectRevert(abi.encodeWithSelector(IMarginEngine.MaxLeverageBpsOutOfRange.selector, uint16(60_001)));
+        marginEngine.setMarginParams(2_000, 500, 250, 60_001);
     }
 
     function test_SetKycCaps_HappyPath() public {
         vm.prank(governance);
-        engine.setKycCaps(1, 100_000 * ONE_USDC, 400_000 * ONE_USDC);
-        (uint256 perSubject, uint256 combined) = engine.tierCaps(1);
+        marginEngine.setKycCaps(1, 100_000 * ONE_USDC, 400_000 * ONE_USDC);
+        (uint256 perSubject, uint256 combined) = marginEngine.tierCaps(1);
         assertEq(perSubject, 100_000 * ONE_USDC);
         assertEq(combined, 400_000 * ONE_USDC);
     }
 
     function test_SetKycCaps_RevertOnInvalidTier() public {
         vm.prank(governance);
-        vm.expectRevert(abi.encodeWithSelector(IPerpEngine.KycTierInvalid.selector, uint8(0)));
-        engine.setKycCaps(0, 100, 200);
+        vm.expectRevert(abi.encodeWithSelector(IMarginEngine.InvalidKycTier.selector, uint8(0)));
+        marginEngine.setKycCaps(0, 100, 200);
 
         vm.prank(governance);
-        vm.expectRevert(abi.encodeWithSelector(IPerpEngine.KycTierInvalid.selector, uint8(4)));
-        engine.setKycCaps(4, 100, 200);
+        vm.expectRevert(abi.encodeWithSelector(IMarginEngine.InvalidKycTier.selector, uint8(4)));
+        marginEngine.setKycCaps(4, 100, 200);
     }
 
     function test_SetKycCaps_RevertOnZero() public {
         vm.prank(governance);
-        vm.expectRevert(IPerpEngine.InvalidConfig.selector);
-        engine.setKycCaps(1, 0, 100);
+        vm.expectRevert(IMarginEngine.InvalidConfig.selector);
+        marginEngine.setKycCaps(1, 0, 100);
 
         vm.prank(governance);
-        vm.expectRevert(IPerpEngine.InvalidConfig.selector);
-        engine.setKycCaps(1, 100, 0);
+        vm.expectRevert(IMarginEngine.InvalidConfig.selector);
+        marginEngine.setKycCaps(1, 100, 0);
     }
 
     function test_SetKycCaps_RevertOnCombinedLessThanPerSubject() public {
         vm.prank(governance);
-        vm.expectRevert(IPerpEngine.InvalidConfig.selector);
-        engine.setKycCaps(1, 200, 100);
+        vm.expectRevert(IMarginEngine.InvalidConfig.selector);
+        marginEngine.setKycCaps(1, 200, 100);
     }
 
     function test_SetMarkStaleAfter_HappyPath() public {
@@ -1080,19 +1100,19 @@ contract PerpEngineTest is Test {
 
     function test_SetPerSubjectSideOiCapBps_HappyPath() public {
         vm.prank(governance);
-        engine.setPerSubjectSideOiCapBps(1_000); // 10%
-        (,,,, uint16 cap) = engine.marginParams();
+        marginEngine.setPerSubjectSideOiCapBps(1_000); // 10%
+        (,,,, uint16 cap) = marginEngine.marginParams();
         assertEq(cap, 1_000);
     }
 
     function test_SetPerSubjectSideOiCapBps_RevertOnOutOfRange() public {
         vm.prank(governance);
-        vm.expectRevert(IPerpEngine.InvalidConfig.selector);
-        engine.setPerSubjectSideOiCapBps(0);
+        vm.expectRevert(abi.encodeWithSelector(IMarginEngine.PerSubjectSideOiCapBpsOutOfRange.selector, uint16(0)));
+        marginEngine.setPerSubjectSideOiCapBps(0);
 
         vm.prank(governance);
-        vm.expectRevert(IPerpEngine.InvalidConfig.selector);
-        engine.setPerSubjectSideOiCapBps(5_001);
+        vm.expectRevert(abi.encodeWithSelector(IMarginEngine.PerSubjectSideOiCapBpsOutOfRange.selector, uint16(5_001)));
+        marginEngine.setPerSubjectSideOiCapBps(5_001);
     }
 
     // ------------------------------------------------------------------------------------------
@@ -1195,7 +1215,7 @@ contract PerpEngineTest is Test {
         assertGt(engine.equityOf(positionId), 0);
         assertGt(engine.marginRatioBpsOf(positionId), 0);
         assertGt(engine.leverageBpsOf(positionId), 0);
-        assertTrue(engine.isMarginOk(positionId));
+        assertTrue(marginEngine.isMarginOk(positionId));
     }
 
     function test_Views_ZeroSizePositionReturnsDefaults() public view {
@@ -1203,19 +1223,19 @@ contract PerpEngineTest is Test {
         assertEq(engine.equityOf(unknown), 0);
         assertEq(engine.marginRatioBpsOf(unknown), 0);
         assertEq(engine.leverageBpsOf(unknown), 0);
-        assertTrue(engine.isMarginOk(unknown)); // empty position is "OK"
+        assertTrue(marginEngine.isMarginOk(unknown)); // empty position is "OK"
     }
 
     function test_Views_ExposureOf() public {
         _open(_baseOpenParams());
-        (uint256 totalPerp, uint256 totalEvent, uint8 tier) = engine.exposureOf(trader);
+        (uint256 totalPerp, uint256 totalEvent, uint8 tier) = marginEngine.exposureOf(trader);
         assertEq(totalPerp, 50_000 * ONE_USDC);
         assertEq(totalEvent, 0);
         assertEq(tier, 2);
     }
 
     function test_Views_TierCaps() public view {
-        (uint256 perS, uint256 combined) = engine.tierCaps(2);
+        (uint256 perS, uint256 combined) = marginEngine.tierCaps(2);
         assertEq(perS, 250_000 * ONE_USDC);
         assertEq(combined, 1_000_000 * ONE_USDC);
     }
@@ -1476,7 +1496,7 @@ contract PerpEngineTest is Test {
         (uint256 longOI, uint256 shortOI) = engine.openInterestOf(SUBJECT_ID);
         assertEq(longOI, 0);
         assertEq(shortOI, 0);
-        (uint256 totalNotional,,) = engine.exposureOf(trader);
+        (uint256 totalNotional,,) = marginEngine.exposureOf(trader);
         assertEq(totalNotional, 0);
     }
 
@@ -1910,21 +1930,21 @@ contract PerpEngineTest is Test {
     // ------------------------------------------------------------------------------------------
 
     function test_Tier1_CategoryOiCap_DefaultIs20Pct() public view {
-        assertEq(engine.categoryNetOiCapBps(), 2_000);
+        assertEq(marginEngine.categoryNetOiCapBps(), 2_000);
     }
 
     function test_Tier1_CategoryOiCap_IncrementsOnOpen() public {
         // Long open on SUBJECT_ID (in CATEGORY_ID) → net += sizeNotional.
         IPerpEngine.OpenParams memory p = _baseOpenParams();
         _open(p);
-        assertEq(engine.netCategoryOiOf(CATEGORY_ID), int256(p.sizeNotional));
+        assertEq(marginEngine.netCategoryOiOf(CATEGORY_ID), int256(p.sizeNotional));
     }
 
     function test_Tier1_CategoryOiCap_DecrementsOnClose() public {
         _open(_baseOpenParams());
         vm.prank(trader);
         engine.closePosition(_baseCloseParams());
-        assertEq(engine.netCategoryOiOf(CATEGORY_ID), int256(0));
+        assertEq(marginEngine.netCategoryOiOf(CATEGORY_ID), int256(0));
     }
 
     function test_Tier1_CategoryOiCap_RevertOnExceeded() public {
@@ -1932,7 +1952,7 @@ contract PerpEngineTest is Test {
         // Tighten to 5% (= 50k) so we can hit it with a single 100k position.
         // But MIN_CATEGORY_NET_OI_CAP_BPS = 500 (5%) — exact min works.
         vm.prank(governance);
-        engine.setCategoryNetOiCapBps(500); // 5% = 50k cap
+        marginEngine.setCategoryNetOiCapBps(500); // 5% = 50k cap
 
         // First trade: 49_900 USDC long — under cap.
         IPerpEngine.OpenParams memory p1 = _baseOpenParams();
@@ -1961,26 +1981,26 @@ contract PerpEngineTest is Test {
 
     function test_Tier1_SetCategoryNetOiCapBps_Happy() public {
         vm.prank(governance);
-        engine.setCategoryNetOiCapBps(3_000); // 30%
-        assertEq(engine.categoryNetOiCapBps(), 3_000);
+        marginEngine.setCategoryNetOiCapBps(3_000); // 30%
+        assertEq(marginEngine.categoryNetOiCapBps(), 3_000);
     }
 
     function test_Tier1_SetCategoryNetOiCapBps_RevertOnTooLow() public {
         vm.prank(governance);
-        vm.expectRevert(IPerpEngine.CategoryOiCapBpsOutOfRange.selector);
-        engine.setCategoryNetOiCapBps(499);
+        vm.expectRevert(abi.encodeWithSelector(IMarginEngine.CategoryNetOiCapBpsOutOfRange.selector, uint16(499)));
+        marginEngine.setCategoryNetOiCapBps(499);
     }
 
     function test_Tier1_SetCategoryNetOiCapBps_RevertOnTooHigh() public {
         vm.prank(governance);
-        vm.expectRevert(IPerpEngine.CategoryOiCapBpsOutOfRange.selector);
-        engine.setCategoryNetOiCapBps(5_001);
+        vm.expectRevert(abi.encodeWithSelector(IMarginEngine.CategoryNetOiCapBpsOutOfRange.selector, uint16(5_001)));
+        marginEngine.setCategoryNetOiCapBps(5_001);
     }
 
     function test_Tier1_SetCategoryNetOiCapBps_RevertOnNonGovernance() public {
         vm.prank(stranger);
-        vm.expectRevert(abi.encodeWithSelector(IPerpEngine.Unauthorized.selector, stranger));
-        engine.setCategoryNetOiCapBps(3_000);
+        vm.expectRevert(abi.encodeWithSelector(IMarginEngine.Unauthorized.selector, stranger));
+        marginEngine.setCategoryNetOiCapBps(3_000);
     }
 
     // ------------------------------------------------------------------------------------------

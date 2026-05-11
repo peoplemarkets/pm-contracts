@@ -99,15 +99,17 @@ interface IPerpEngine {
     ///         immediately. Governance still gates the call.
     function removeMarkWriter(address writer) external;
 
-    function setMarginParams(uint16 imBps, uint16 mmBps, uint16 bufBps, uint16 maxLevBps) external;
-    function setKycCaps(uint8 tier, uint256 perSubjectCap, uint256 combinedCap) external;
     function setMarkStaleAfter(uint32 seconds_) external;
     function setLpRebatePct(uint8 pct) external;
     function setMarkMaxDeltaBps(uint16 bps) external;
 
-    /// @notice Governance setter for the net-category OI cap. Bounds [500, 5000] bps. No timelock —
-    ///         matches `setLpRebatePct` / `setMarkMaxDeltaBps`.
-    function setCategoryNetOiCapBps(uint16 bps) external;
+    /// @notice Wave 4 MarginEngine rotation. Same shape as `proposeSetFundingEngine` /
+    ///         `proposeSetFeedbackController`: timelocked propose/activate/cancel via the existing
+    ///         `timelockDelay`. Until rotation activates, `openPosition` reverts at the
+    ///         delegation site with `MarginEngineUnset`.
+    function proposeSetMarginEngine(address newEngine) external;
+    function activateSetMarginEngine() external;
+    function cancelSetMarginEngine() external;
 
     /// @notice Tier-1 funding event stub: timelocked rotation of the FundingEngine writer.
     /// @dev    Until FundingEngine v1 ships, `fundingEngine` is `address(0)` and any
@@ -159,7 +161,6 @@ interface IPerpEngine {
     function equityOf(bytes32 positionId) external view returns (int256);
     function marginRatioBpsOf(bytes32 positionId) external view returns (uint256);
     function leverageBpsOf(bytes32 positionId) external view returns (uint256);
-    function isMarginOk(bytes32 positionId) external view returns (bool);
 
     function isMarkWriter(address account) external view returns (bool);
     function globalHalt() external view returns (bool);
@@ -190,11 +191,11 @@ interface IPerpEngine {
     /// @notice Timestamp (seconds) of the last `pushFundingIndex` for `subjectId`.
     function lastFundingAt(bytes32 subjectId) external view returns (uint64);
 
-    /// @notice Current net-category OI cap, basis points of `min(cappedTvl, liveTvl)`.
-    function categoryNetOiCapBps() external view returns (uint16);
+    /// @notice Configured MarginEngine (Wave 4). `address(0)` until rotated in.
+    function marginEngine() external view returns (address);
 
-    /// @notice Signed net OI for the category — sum of (longOI − shortOI) at OPENING notional.
-    function netCategoryOiOf(bytes32 categoryId) external view returns (int256);
+    /// @notice Pending MarginEngine rotation (zero address + zero timestamp when none in flight).
+    function pendingMarginEngine() external view returns (address account, uint64 activatesAt);
 
     // ------------------------------------------------------------------------------------------
     // Events
@@ -227,8 +228,6 @@ interface IPerpEngine {
     event MarkWriterRemoved(address indexed writer);
     event MarkWriterAddProposed(address indexed writer, uint64 activatesAt);
     event MarkWriterAddCancelled(address indexed writer);
-    event MarginParamsSet(uint16 imBps, uint16 mmBps, uint16 bufBps, uint16 maxLevBps);
-    event KycCapsSet(uint8 tier, uint256 perSubjectCap, uint256 combinedCap);
     event MarkStaleAfterSet(uint32 seconds_);
     event LpRebatePctSet(uint8 oldPct, uint8 newPct);
     event MarkMaxDeltaBpsSet(uint16 oldBps, uint16 newBps);
@@ -272,9 +271,11 @@ interface IPerpEngine {
     event FeedbackControllerActivated(address indexed oldController, address indexed newController);
     event FeedbackControllerCancelled(address indexed pendingController);
 
-    // --- Tier-1 category OI cap ---
-    /// @notice Governance updated the net-category OI cap.
-    event CategoryNetOiCapBpsSet(uint16 oldBps, uint16 newBps);
+    // --- Wave 4 MarginEngine rotation ---
+    /// @notice Timelocked rotation of the MarginEngine pointer.
+    event MarginEngineProposed(address indexed newEngine, uint64 activatesAt);
+    event MarginEngineActivated(address indexed oldEngine, address indexed newEngine);
+    event MarginEngineCancelled(address indexed pendingEngine);
 
     // ------------------------------------------------------------------------------------------
     // Errors
@@ -328,4 +329,8 @@ interface IPerpEngine {
     error ImpulseUnderflow();
     error PendingFeedbackControllerExists();
     error NoPendingFeedbackController();
+    // --- Wave 4 MarginEngine ---
+    error MarginEngineUnset();
+    error PendingMarginEngineExists();
+    error NoPendingMarginEngine();
 }

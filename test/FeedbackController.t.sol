@@ -6,8 +6,10 @@ import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 
 import {Test} from "forge-std/Test.sol";
 
+import {IMarginEngine} from "../src/core/IMarginEngine.sol";
 import {IPerpEngine} from "../src/core/IPerpEngine.sol";
 import {LPVault} from "../src/core/LPVault.sol";
+import {MarginEngine} from "../src/core/MarginEngine.sol";
 import {PerpEngine} from "../src/core/PerpEngine.sol";
 import {FeedbackController} from "../src/feedback/FeedbackController.sol";
 import {IFeedbackController} from "../src/feedback/IFeedbackController.sol";
@@ -35,6 +37,7 @@ contract FeedbackControllerTest is Test {
 
     FeedbackController internal feedback;
     PerpEngine internal engine;
+    MarginEngine internal marginEngine;
     LPVault internal vault;
     SubjectRegistry internal registry;
     OracleRouter internal router;
@@ -129,6 +132,14 @@ contract FeedbackControllerTest is Test {
             engine = PerpEngine(address(new ERC1967Proxy(address(impl), initData)));
         }
 
+        // 3b. MarginEngine — Wave 4 extraction.
+        {
+            MarginEngine impl = new MarginEngine();
+            bytes memory initData =
+                abi.encodeCall(MarginEngine.initialize, (governance, address(engine), TIMELOCK_DELAY));
+            marginEngine = MarginEngine(address(new ERC1967Proxy(address(impl), initData)));
+        }
+
         // 4. OracleRouter.
         {
             OracleRouter impl = new OracleRouter();
@@ -143,6 +154,12 @@ contract FeedbackControllerTest is Test {
         vm.warp(block.timestamp + TIMELOCK_DELAY);
         vault.activateSetPerpEngine();
 
+        // 5b. Wire PerpEngine.marginEngine (timelocked).
+        vm.prank(governance);
+        engine.proposeSetMarginEngine(address(marginEngine));
+        vm.warp(block.timestamp + TIMELOCK_DELAY);
+        engine.activateSetMarginEngine();
+
         // 6. Configure SubjectRegistry: subjects + KYC.
         vm.startPrank(regAdmin);
         registry.listSubject(SUBJECT_ID, CATEGORY_ID);
@@ -152,11 +169,12 @@ contract FeedbackControllerTest is Test {
         registry.setKycTier(alice, 3);
         vm.stopPrank();
 
-        // 7. Configure PerpEngine: KYC caps + mark writer. Lift the per-push delta cap to its
-        //    max (50%) for the suite — most tests need to push small impulses that compound; we
-        //    sometimes also push live marks to set up scenarios.
+        // 7. KYC caps on MarginEngine; mark writer + delta cap on PerpEngine. Lift the per-push
+        //    delta cap to its max (50%) for the suite — most tests push small impulses that
+        //    compound; we sometimes also push live marks to set up scenarios.
+        vm.prank(governance);
+        marginEngine.setKycCaps(3, 1_000_000 * ONE_USDC, 4_000_000 * ONE_USDC);
         vm.startPrank(governance);
-        engine.setKycCaps(3, 1_000_000 * ONE_USDC, 4_000_000 * ONE_USDC);
         engine.setMarkMaxDeltaBps(5_000);
         engine.proposeAddMarkWriter(markWriter);
         vm.stopPrank();

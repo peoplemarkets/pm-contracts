@@ -9,6 +9,7 @@ import {Test} from "forge-std/Test.sol";
 import {ILPVault} from "../../src/core/ILPVault.sol";
 import {IPerpEngine} from "../../src/core/IPerpEngine.sol";
 import {LPVault} from "../../src/core/LPVault.sol";
+import {MarginEngine} from "../../src/core/MarginEngine.sol";
 import {PerpEngine} from "../../src/core/PerpEngine.sol";
 
 import {ISubjectRegistry} from "../../src/registry/ISubjectRegistry.sol";
@@ -23,6 +24,7 @@ import {MockUSDC} from "../mocks/MockUSDC.sol";
 ///         every checkpoint.
 contract PerpVaultE2ETest is Test {
     PerpEngine internal engine;
+    MarginEngine internal marginEngine;
     LPVault internal vault;
     SubjectRegistry internal registry;
     MockUSDC internal usdc;
@@ -108,17 +110,29 @@ contract PerpVaultE2ETest is Test {
         vm.warp(block.timestamp + TIMELOCK_DELAY);
         vault.activateSetPerpEngine();
 
+        // Wave 4: MarginEngine + wiring (timelocked).
+        {
+            MarginEngine impl = new MarginEngine();
+            bytes memory initData =
+                abi.encodeCall(MarginEngine.initialize, (governance, address(engine), TIMELOCK_DELAY));
+            marginEngine = MarginEngine(address(new ERC1967Proxy(address(impl), initData)));
+        }
+        vm.prank(governance);
+        engine.proposeSetMarginEngine(address(marginEngine));
+        vm.warp(block.timestamp + TIMELOCK_DELAY);
+        engine.activateSetMarginEngine();
+
         // Configure registry: list subject + KYC tier
         vm.prank(regAdmin);
         registry.listSubject(SUBJECT_ID, CATEGORY_ID);
         vm.prank(kycWriter);
         registry.setKycTier(trader, 2); // T2
 
-        // Configure engine: KYC caps + mark writer
-        vm.startPrank(governance);
-        engine.setKycCaps(2, 250_000 * ONE_USDC, 1_000_000 * ONE_USDC);
+        // KYC caps live on MarginEngine; mark writer stays on PerpEngine.
+        vm.prank(governance);
+        marginEngine.setKycCaps(2, 250_000 * ONE_USDC, 1_000_000 * ONE_USDC);
+        vm.prank(governance);
         engine.proposeAddMarkWriter(markWriter);
-        vm.stopPrank();
         vm.warp(block.timestamp + TIMELOCK_DELAY);
         engine.activateAddMarkWriter(markWriter);
 

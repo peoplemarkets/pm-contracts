@@ -9,6 +9,7 @@ import {Test} from "forge-std/Test.sol";
 import {ILPVault} from "../../src/core/ILPVault.sol";
 import {IPerpEngine} from "../../src/core/IPerpEngine.sol";
 import {LPVault} from "../../src/core/LPVault.sol";
+import {MarginEngine} from "../../src/core/MarginEngine.sol";
 import {PerpEngine} from "../../src/core/PerpEngine.sol";
 
 import {ISubjectRegistry} from "../../src/registry/ISubjectRegistry.sol";
@@ -31,6 +32,7 @@ import {PerpVaultHandler} from "./PerpVaultHandler.sol";
 ///               subject
 contract PerpVaultInvariants is Test {
     PerpEngine internal engine;
+    MarginEngine internal marginEngine;
     LPVault internal vault;
     SubjectRegistry internal registry;
     MockUSDC internal usdc;
@@ -113,6 +115,18 @@ contract PerpVaultInvariants is Test {
         vm.warp(block.timestamp + TIMELOCK_DELAY);
         vault.activateSetPerpEngine();
 
+        // Wave 4: deploy MarginEngine + wire it into PerpEngine (timelocked).
+        {
+            MarginEngine impl = new MarginEngine();
+            bytes memory initData =
+                abi.encodeCall(MarginEngine.initialize, (governance, address(engine), TIMELOCK_DELAY));
+            marginEngine = MarginEngine(address(new ERC1967Proxy(address(impl), initData)));
+        }
+        vm.prank(governance);
+        engine.proposeSetMarginEngine(address(marginEngine));
+        vm.warp(block.timestamp + TIMELOCK_DELAY);
+        engine.activateSetMarginEngine();
+
         // Build actor pools
         traders = new address[](8);
         for (uint256 i = 0; i < 8; i++) {
@@ -143,11 +157,11 @@ contract PerpVaultInvariants is Test {
         }
         vm.stopPrank();
 
-        // Engine config
+        // Engine config — KYC caps live on MarginEngine, mark writer on PerpEngine.
         vm.startPrank(governance);
-        engine.setKycCaps(1, 50_000 * ONE_USDC, 200_000 * ONE_USDC);
-        engine.setKycCaps(2, 250_000 * ONE_USDC, 1_000_000 * ONE_USDC);
-        engine.setKycCaps(3, 1_000_000 * ONE_USDC, 4_000_000 * ONE_USDC);
+        marginEngine.setKycCaps(1, 50_000 * ONE_USDC, 200_000 * ONE_USDC);
+        marginEngine.setKycCaps(2, 250_000 * ONE_USDC, 1_000_000 * ONE_USDC);
+        marginEngine.setKycCaps(3, 1_000_000 * ONE_USDC, 4_000_000 * ONE_USDC);
         engine.proposeAddMarkWriter(markWriter);
         vm.stopPrank();
         vm.warp(block.timestamp + TIMELOCK_DELAY);

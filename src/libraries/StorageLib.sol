@@ -90,6 +90,15 @@ library PerpStorage {
         address feedbackController;
         address pendingFeedbackController;
         uint64 pendingFeedbackControllerActivatesAt;
+        // ---- APPENDED: Wave 4 MarginEngine wiring ----
+        // Configured MarginEngine address. PerpEngine delegates `_enforceOpenCaps` and
+        // `_checkInitialMargin` to this address; until the rotation activates, the engine is
+        // `address(0)` and any `openPosition` call reverts at the delegated check site. Rotated
+        // through the same timelocked propose/activate/cancel flow as the FundingEngine and
+        // FeedbackController writers.
+        address marginEngine;
+        address pendingMarginEngine;
+        uint64 pendingMarginEngineActivatesAt;
     }
 
     function load() internal pure returns (Layout storage l) {
