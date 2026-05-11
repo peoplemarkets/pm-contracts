@@ -15,4 +15,8 @@ contract MockAdapter is IOracleAdapter {
     function readMetric(bytes32 metricId) external view override returns (IOracleRouter.OracleReading memory) {
         return readings[metricId];
     }
+
+    function latestTimestamp(bytes32 metricId) external view override returns (uint64) {
+        return readings[metricId].updatedAt;
+    }
 }

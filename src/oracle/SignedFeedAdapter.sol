@@ -284,6 +284,13 @@ contract SignedFeedAdapter is EIP712, IOracleAdapter {
         return IOracleRouter.OracleReading({value: r.value, updatedAt: r.valueTimestamp, degraded: false});
     }
 
+    /// @inheritdoc IOracleAdapter
+    /// @dev Lightweight accessor used by `OracleRouter.markIfStale`. Returns the stored
+    ///      `valueTimestamp` for `metricId` (0 if never pushed).
+    function latestTimestamp(bytes32 metricId) external view override returns (uint64) {
+        return latest[metricId].valueTimestamp;
+    }
+
     // ------------------------------------------------------------------------------------------
     // Governance: signer rotation (timelocked)
     // ------------------------------------------------------------------------------------------

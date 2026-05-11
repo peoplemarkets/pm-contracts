@@ -43,7 +43,8 @@ contract OracleRouterTest is Test {
             fallbackAdapter: address(fallbackAdapter),
             staleAfter: 1 hours,
             maxDeltaBps: 300, // 3%
-            degraded: false
+            degraded: false,
+            expectedCadenceSeconds: 300 // 5 min
         });
     }
 
@@ -428,5 +429,140 @@ contract OracleRouterTest is Test {
         vm.warp(block.timestamp + TIMELOCK_DELAY);
         router.activateRegister(METRIC_ID);
         assertEq(router.configOf(METRIC_ID).fallbackAdapter, address(0xBEEF));
+    }
+
+    // ------------------------------------------------------------------------------------------
+    // Stage 1 auto-degraded detection — cadence half (3× cadence missed-refresh poke)
+    //
+    // mechanismdesign.md §4 line 242: "If a Chainlink feed deviates by more than 5% from its
+    // three-source median, or stops updating for more than 3× its expected refresh cadence, the
+    // OracleRouter automatically marks the metric degraded."
+    //
+    // These tests cover the cadence half. The deviation half (3-source median) lives elsewhere.
+    // ------------------------------------------------------------------------------------------
+
+    /// @dev Cadence boundary table per spec: [60, 86400] is the legal window.
+    uint32 internal constant CADENCE_FLOOR = 60;
+    uint32 internal constant CADENCE_CEIL = 86_400;
+
+    function test_MarkIfStale_HappyPath_FlipsDegradedAndEmits() public {
+        _registerMetric(); // cadence = 300s; threshold = 900s
+        uint64 valueTs = uint64(block.timestamp);
+        primary.set(METRIC_ID, 1234e18, valueTs);
+
+        // jump strictly past 3× cadence
+        vm.warp(uint256(valueTs) + 3 * 300 + 1);
+
+        vm.expectEmit(true, false, false, true, address(router));
+        emit IOracleRouter.AutoDegraded(METRIC_ID, valueTs, 300, stranger);
+
+        vm.prank(stranger); // permissionless: anyone can poke
+        router.markIfStale(METRIC_ID);
+
+        assertTrue(router.configOf(METRIC_ID).degraded);
+    }
+
+    function test_MarkIfStale_RevertWhenNotYetStale() public {
+        _registerMetric();
+        uint64 valueTs = uint64(block.timestamp);
+        primary.set(METRIC_ID, 1234e18, valueTs);
+
+        // sit exactly at the threshold (block.timestamp == valueTs + 3*cadence)
+        // — `block.timestamp <= staleAfter` should NOT trip.
+        vm.warp(uint256(valueTs) + 3 * 300);
+
+        uint64 staleAfter = valueTs + 3 * 300;
+        vm.expectRevert(abi.encodeWithSelector(IOracleRouter.MetricNotStale.selector, METRIC_ID, valueTs, staleAfter));
+        router.markIfStale(METRIC_ID);
+        assertFalse(router.configOf(METRIC_ID).degraded);
+    }
+
+    function test_MarkIfStale_RevertOnUnregisteredMetric() public {
+        vm.expectRevert(abi.encodeWithSelector(IOracleRouter.MetricNotRegistered.selector, METRIC_ID));
+        router.markIfStale(METRIC_ID);
+    }
+
+    /// @dev Design choice: revert rather than silent no-op. Auto-degrade is a one-shot trip;
+    ///      re-poking an already-degraded metric is a caller bug and the keeper that paid gas
+    ///      deserves a deterministic signal (rather than a silent success that re-emits an
+    ///      AutoDegraded event and pollutes indexers).
+    function test_MarkIfStale_RevertWhenAlreadyDegraded() public {
+        _registerMetric();
+        primary.set(METRIC_ID, 1234e18, uint64(block.timestamp));
+        // operator pre-flips degraded via the legacy path
+        vm.prank(operator);
+        router.setDegraded(METRIC_ID, true, bytes32("preexisting"));
+
+        // even with stale data, markIfStale must revert because degraded == true
+        vm.warp(block.timestamp + 3 * 300 + 1);
+        vm.expectRevert(abi.encodeWithSelector(IOracleRouter.MetricAlreadyDegraded.selector, METRIC_ID));
+        router.markIfStale(METRIC_ID);
+    }
+
+    function test_CadenceOf_ReturnsRegisteredCadence() public {
+        _registerMetric();
+        assertEq(router.cadenceOf(METRIC_ID), 300);
+    }
+
+    function test_CadenceOf_ReturnsZeroForUnregistered() public view {
+        assertEq(router.cadenceOf(METRIC_ID), 0);
+    }
+
+    // -- Cadence boundary validation (60 <= cadence <= 86400) ----------------------------------
+
+    function test_ProposeRegister_RevertOnCadenceBelowFloor() public {
+        IOracleRouter.MetricConfig memory cfg = _baseConfig();
+        cfg.expectedCadenceSeconds = CADENCE_FLOOR - 1; // 59
+        vm.prank(governance);
+        vm.expectRevert(abi.encodeWithSelector(IOracleRouter.CadenceOutOfRange.selector, CADENCE_FLOOR - 1));
+        router.proposeRegister(METRIC_ID, cfg);
+    }
+
+    function test_ProposeRegister_CadenceAtFloorPasses() public {
+        IOracleRouter.MetricConfig memory cfg = _baseConfig();
+        cfg.expectedCadenceSeconds = CADENCE_FLOOR; // 60
+        vm.prank(governance);
+        router.proposeRegister(METRIC_ID, cfg);
+        vm.warp(block.timestamp + TIMELOCK_DELAY);
+        router.activateRegister(METRIC_ID);
+        assertEq(router.cadenceOf(METRIC_ID), CADENCE_FLOOR);
+    }
+
+    function test_ProposeRegister_CadenceAtCeilPasses() public {
+        IOracleRouter.MetricConfig memory cfg = _baseConfig();
+        cfg.expectedCadenceSeconds = CADENCE_CEIL; // 86400
+        vm.prank(governance);
+        router.proposeRegister(METRIC_ID, cfg);
+        vm.warp(block.timestamp + TIMELOCK_DELAY);
+        router.activateRegister(METRIC_ID);
+        assertEq(router.cadenceOf(METRIC_ID), CADENCE_CEIL);
+    }
+
+    function test_ProposeRegister_RevertOnCadenceAboveCeil() public {
+        IOracleRouter.MetricConfig memory cfg = _baseConfig();
+        cfg.expectedCadenceSeconds = CADENCE_CEIL + 1; // 86401
+        vm.prank(governance);
+        vm.expectRevert(abi.encodeWithSelector(IOracleRouter.CadenceOutOfRange.selector, CADENCE_CEIL + 1));
+        router.proposeRegister(METRIC_ID, cfg);
+    }
+
+    // -- Legacy operator path is untouched ------------------------------------------------------
+
+    function test_SetDegraded_LegacyOperatorPathStillWorks() public {
+        _registerMetric();
+        primary.set(METRIC_ID, 1234e18, uint64(block.timestamp));
+
+        bytes32 reasonHash = keccak256("manual operator override");
+        vm.expectEmit(true, false, false, true, address(router));
+        emit IOracleRouter.MetricDegraded(METRIC_ID, true, reasonHash);
+        vm.prank(operator);
+        router.setDegraded(METRIC_ID, true, reasonHash);
+        assertTrue(router.configOf(METRIC_ID).degraded);
+
+        // operator can also flip back to undegraded — auto-degrade has no "un-mark" path,
+        // recovery is governance/operator-driven only.
+        vm.prank(operator);
+        router.setDegraded(METRIC_ID, false, bytes32(0));
+        assertFalse(router.configOf(METRIC_ID).degraded);
     }
 }

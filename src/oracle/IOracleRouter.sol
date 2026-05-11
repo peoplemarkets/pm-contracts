@@ -25,6 +25,9 @@ interface IOracleRouter {
     ///      - `staleAfter` is enforced on read: a reading older than this reverts.
     ///      - `maxDeltaBps` is enforced on writes by adapters; OracleRouter does not write values.
     ///      - `degraded` flips the read path to `fallbackAdapter` if non-zero, else reverts.
+    ///      - `expectedCadenceSeconds` is the expected refresh interval for the upstream source.
+    ///        The permissionless `markIfStale` poke uses `3 * expectedCadenceSeconds` as the
+    ///        auto-degrade threshold per mechanismdesign.md §4 (Stage 1 auto-degraded detection).
     /// @dev `sourceType == UNSET` is the canonical "not registered" sentinel.
     struct MetricConfig {
         SourceType sourceType;
@@ -33,6 +36,7 @@ interface IOracleRouter {
         uint32 staleAfter;
         uint32 maxDeltaBps;
         bool degraded;
+        uint32 expectedCadenceSeconds;
     }
 
     // -- Admin (governance, behind timelock) -------------------------------------------------------
@@ -65,6 +69,20 @@ interface IOracleRouter {
     /// @notice Read the live MetricConfig.
     function configOf(bytes32 metricId) external view returns (MetricConfig memory);
 
+    /// @notice Read the configured cadence (`expectedCadenceSeconds`) for `metricId`.
+    /// @dev    Returns zero for unregistered metrics. The `3 × cadence` auto-degrade window for
+    ///         `markIfStale` is derived from this value.
+    function cadenceOf(bytes32 metricId) external view returns (uint32);
+
+    // -- Stage 1 auto-degraded detection (3× cadence) ----------------------------------------------
+
+    /// @notice Permissionless poke: flip `metricId` to degraded if its upstream adapter has not
+    ///         produced a fresh value for more than `3 × expectedCadenceSeconds`.
+    /// @dev    Per mechanismdesign.md §4, the cadence half of Stage 1 auto-degraded detection is
+    ///         a missed-refresh trigger. The deviation half (3-source median) is handled by a
+    ///         separate component and not implemented here.
+    function markIfStale(bytes32 metricId) external;
+
     // -- Events -------------------------------------------------------------------------------------
 
     event MetricProposed(bytes32 indexed metricId, MetricConfig config, uint64 activatesAt);
@@ -73,6 +91,9 @@ interface IOracleRouter {
     event MetricDegraded(bytes32 indexed metricId, bool degraded, bytes32 reasonHash);
     event FallbackProposed(bytes32 indexed metricId, address fallbackAdapter, uint64 activatesAt);
     event FallbackActivated(bytes32 indexed metricId, address fallbackAdapter);
+    /// @notice Emitted when `markIfStale` flips a metric to degraded because the adapter's last
+    ///         `valueTimestamp` is older than `3 × cadence` seconds.
+    event AutoDegraded(bytes32 indexed metricId, uint64 valueTimestamp, uint32 cadence, address triggerer);
 
     // -- Errors -------------------------------------------------------------------------------------
 
@@ -84,4 +105,11 @@ interface IOracleRouter {
     error StaleReading(bytes32 metricId, uint64 updatedAt, uint64 staleAfter);
     error DegradedAndNoFallback(bytes32 metricId);
     error Unauthorized(address caller);
+    /// @dev Thrown by `proposeRegister` when `expectedCadenceSeconds` is out of [60, 86400].
+    error CadenceOutOfRange(uint32 value);
+    /// @dev Thrown by `markIfStale` when the metric is already degraded. Auto-degrade is a
+    ///      one-shot trip — reusing it on an already-degraded metric is a caller bug.
+    error MetricAlreadyDegraded(bytes32 metricId);
+    /// @dev Thrown by `markIfStale` when the metric has refreshed inside its 3×cadence window.
+    error MetricNotStale(bytes32 metricId, uint64 valueTimestamp, uint64 staleAfter);
 }

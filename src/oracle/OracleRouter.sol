@@ -42,6 +42,17 @@ contract OracleRouter is Initializable, UUPSUpgradeable, IOracleRouter {
     uint32 public constant MIN_TIMELOCK_DELAY = 1 hours;
     uint32 public constant MAX_TIMELOCK_DELAY = 30 days;
 
+    /// @dev Bounds on `expectedCadenceSeconds`. Lower bound mirrors the fastest realistic upstream
+    ///      refresh (1 min). Upper bound (24h) is the slowest metric class in the spec catalog.
+    ///      Outside [60, 86400] is almost certainly a misconfiguration; the `3×` poke threshold
+    ///      would either be unreasonably aggressive or effectively never trip.
+    uint32 public constant MIN_CADENCE_SECONDS = 60;
+    uint32 public constant MAX_CADENCE_SECONDS = 86_400;
+
+    /// @dev Multiplier applied to `expectedCadenceSeconds` to derive the auto-degrade window.
+    ///      Spec §4: "stops updating for more than 3× its expected refresh cadence".
+    uint32 public constant STALE_CADENCE_MULTIPLIER = 3;
+
     /// @custom:oz-upgrades-unsafe-allow constructor
     constructor() {
         _disableInitializers();
@@ -127,6 +138,40 @@ contract OracleRouter is Initializable, UUPSUpgradeable, IOracleRouter {
     }
 
     // ------------------------------------------------------------------------------------------
+    // Permissionless: Stage 1 auto-degraded detection (3× cadence)
+    // ------------------------------------------------------------------------------------------
+
+    /// @inheritdoc IOracleRouter
+    /// @dev Permissionless by design: the trigger condition is fully on-chain (compare adapter's
+    ///      `latestTimestamp(metricId)` with `block.timestamp`), so anyone — keeper bot, MEV
+    ///      searcher, or a curious user — can poke it. Restricting this to the operator multi-sig
+    ///      would re-introduce a human-in-the-loop latency that the auto-degrade rule is explicitly
+    ///      designed to remove. The operator path (`setDegraded`) remains the canonical lever for
+    ///      every other class of degradation (deviation, source compromise, etc.) and for un-
+    ///      degrading after recovery.
+    ///
+    /// @dev Reverts on `MetricAlreadyDegraded` rather than silently no-op'ing, so the caller (and
+    ///      any keeper that pays gas for this) gets a deterministic signal. Idempotent no-ops here
+    ///      would also re-emit an `AutoDegraded` event each time, polluting indexers.
+    function markIfStale(bytes32 metricId) external {
+        OracleStorage.Layout storage s = OracleStorage.load();
+        MetricConfig storage c = s.configs[metricId];
+        if (c.sourceType == SourceType.UNSET) revert MetricNotRegistered(metricId);
+        if (c.degraded) revert MetricAlreadyDegraded(metricId);
+
+        uint32 cadence = c.expectedCadenceSeconds;
+        uint64 valueTs = IOracleAdapter(c.adapter).latestTimestamp(metricId);
+        // overflow-safe in uint64: cadence ≤ 86_400, multiplier = 3 → ≤ 259_200
+        uint64 staleAfter = valueTs + uint64(STALE_CADENCE_MULTIPLIER) * uint64(cadence);
+        if (uint64(block.timestamp) <= staleAfter) {
+            revert MetricNotStale(metricId, valueTs, staleAfter);
+        }
+
+        c.degraded = true;
+        emit AutoDegraded(metricId, valueTs, cadence, msg.sender);
+    }
+
+    // ------------------------------------------------------------------------------------------
     // Governance: fallback adapter (timelocked, narrower than full config replace)
     // ------------------------------------------------------------------------------------------
 
@@ -188,6 +233,11 @@ contract OracleRouter is Initializable, UUPSUpgradeable, IOracleRouter {
         return OracleStorage.load().configs[metricId];
     }
 
+    /// @inheritdoc IOracleRouter
+    function cadenceOf(bytes32 metricId) external view returns (uint32) {
+        return OracleStorage.load().configs[metricId].expectedCadenceSeconds;
+    }
+
     function pendingOf(bytes32 metricId) external view returns (OracleStorage.PendingChange memory) {
         return OracleStorage.load().pending[metricId];
     }
@@ -220,6 +270,12 @@ contract OracleRouter is Initializable, UUPSUpgradeable, IOracleRouter {
             revert InvalidConfig();
         }
         if (config.maxDeltaBps == 0 || config.maxDeltaBps > MAX_DELTA_BPS_CEILING) revert InvalidConfig();
+        if (
+            config.expectedCadenceSeconds < MIN_CADENCE_SECONDS
+                || config.expectedCadenceSeconds > MAX_CADENCE_SECONDS
+        ) {
+            revert CadenceOutOfRange(config.expectedCadenceSeconds);
+        }
         // `degraded` may be either; setting it true at registration is a valid pre-staging move.
         // `fallbackAdapter == address(0)` is allowed; reads will revert if degraded is true and no
         // fallback is configured, which is the conservative fail-closed behavior.

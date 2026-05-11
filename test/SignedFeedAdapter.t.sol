@@ -51,7 +51,8 @@ contract SignedFeedAdapterTest is Test {
             fallbackAdapter: address(0),
             staleAfter: 1 hours,
             maxDeltaBps: MAX_DELTA_BPS,
-            degraded: false
+            degraded: false,
+            expectedCadenceSeconds: 300
         });
         vm.prank(governance);
         router.proposeRegister(METRIC_ID, cfg);
@@ -238,7 +239,8 @@ contract SignedFeedAdapterTest is Test {
             fallbackAdapter: address(0),
             staleAfter: 1 hours,
             maxDeltaBps: MAX_DELTA_BPS,
-            degraded: false
+            degraded: false,
+            expectedCadenceSeconds: 300
         });
         vm.prank(governance);
         router.proposeRegister(otherMetric, cfg);
