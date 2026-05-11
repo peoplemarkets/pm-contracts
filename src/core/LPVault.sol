@@ -15,6 +15,7 @@ import {UUPSUpgradeable} from "@openzeppelin/contracts-upgradeable/proxy/utils/U
 import {ReentrancyGuard} from "solady/utils/ReentrancyGuard.sol";
 
 import {VaultStorage} from "../libraries/StorageLib.sol";
+import {IInsuranceFund} from "./IInsuranceFund.sol";
 import {ILPVault} from "./ILPVault.sol";
 
 /// @title LPVault — single global ERC-4626 USDC counterparty vault.
@@ -341,6 +342,13 @@ contract LPVault is Initializable, UUPSUpgradeable, ERC4626Upgradeable, Reentran
     ///      (= balance − positionCollateral − insuranceFundBalance − accruedFees) absorbs it as
     ///      a per-share boost. No bookkeeper-decrement is performed when the cap is already over —
     ///      legacy over-cap balances stay where they are; only NEW accrual is redirected.
+    ///
+    /// @dev Post-migration (`s.insuranceFund != address(0)`), the bookkeeper view is the live
+    ///      `IInsuranceFund.balance()`; the booked amount is `accrue()`'d through to the fund,
+    ///      which `transferFrom`s the USDC out of this vault. The local `insuranceFundBalance`
+    ///      field stays at zero post-migration (set by `migrateInsuranceFund`), so the freeAssets
+    ///      identity continues to hold (the USDC has physically left the vault, and the bookkeeper
+    ///      is zero — both deltas match).
     function _accrueInsuranceCapped(VaultStorage.Layout storage s, uint256 insuranceShare) internal {
         if (insuranceShare == 0) return;
         // `totalAssets()` returns `freeAssets()` per the override. We compute the cap against
@@ -348,7 +356,7 @@ contract LPVault is Initializable, UUPSUpgradeable, ERC4626Upgradeable, Reentran
         // denominator for "10% of TVL".
         uint256 tvl = totalAssets();
         uint256 cap = (tvl * uint256(s.insuranceCapBps)) / BPS_DENOM;
-        uint256 current = s.insuranceFundBalance;
+        uint256 current = _insuranceBalanceFor(s);
         if (current >= cap) {
             // Already at/above cap — none of the new accrual is booked. The full insuranceShare
             // flows to the share pool.
@@ -356,27 +364,42 @@ contract LPVault is Initializable, UUPSUpgradeable, ERC4626Upgradeable, Reentran
             return;
         }
         uint256 room = cap - current;
-        if (insuranceShare <= room) {
-            // Fully within the cap — standard accrual.
-            s.insuranceFundBalance = current + insuranceShare;
-            return;
+        uint256 toBook = insuranceShare <= room ? insuranceShare : room;
+        if (toBook < insuranceShare) {
+            // Partial overflow: emit the excess.
+            emit InsuranceCapOverflow(insuranceShare - room, cap, tvl);
         }
-        // Partial overflow: book the room, redirect the rest.
-        s.insuranceFundBalance = cap;
-        emit InsuranceCapOverflow(insuranceShare - room, cap, tvl);
+        if (s.insuranceFund != address(0)) {
+            // Post-migration: route the booked portion to the standalone fund. The fund pulls the
+            // USDC out of this vault via the pre-approved allowance. The legacy bookkeeper stays
+            // at zero — `_insuranceBalanceFor` reads from the fund.
+            IInsuranceFund(s.insuranceFund).accrue(toBook);
+        } else {
+            // Pre-migration: book into the local bookkeeper. USDC stays in the vault.
+            s.insuranceFundBalance = current + toBook;
+        }
     }
 
-    /// @dev Tier-1 floor helper. Emits when the bookkeeper is strictly below the configured
-    ///      floor; silent otherwise. No-op if either the floor is 0 or the bookkeeper is empty.
+    /// @dev Tier-1 floor helper. Emits when the live insurance balance is strictly below the
+    ///      configured floor; silent otherwise. No-op if either the floor is 0 or the bookkeeper
+    ///      is empty. Reads from the InsuranceFund post-migration via `_insuranceBalanceFor`.
     function _emitFloorBreachIfBelow(VaultStorage.Layout storage s) internal {
         uint16 floorBps = s.insuranceFloorBps;
         if (floorBps == 0) return;
         uint256 tvl = totalAssets();
         uint256 floor = (tvl * uint256(floorBps)) / BPS_DENOM;
-        uint256 current = s.insuranceFundBalance;
+        uint256 current = _insuranceBalanceFor(s);
         if (current < floor) {
             emit InsuranceFloorBreached(current, floor, tvl);
         }
+    }
+
+    /// @dev Returns the live insurance balance — pre-migration this is the in-vault bookkeeper,
+    ///      post-migration it reads `IInsuranceFund.balance()` from the standalone fund.
+    function _insuranceBalanceFor(VaultStorage.Layout storage s) internal view returns (uint256) {
+        address fund = s.insuranceFund;
+        if (fund == address(0)) return s.insuranceFundBalance;
+        return IInsuranceFund(fund).balance();
     }
 
     /// @inheritdoc ILPVault
@@ -405,6 +428,10 @@ contract LPVault is Initializable, UUPSUpgradeable, ERC4626Upgradeable, Reentran
     function seedInsurance(uint256 amount) external nonReentrant onlyGovernance {
         if (amount == 0) revert AmountZero();
         VaultStorage.Layout storage s = VaultStorage.load();
+        // Post-migration the in-vault bookkeeper is sealed at zero; treasury must seed the
+        // standalone fund directly via `IInsuranceFund.deposit()`. Reverting here makes the
+        // migration-day handoff explicit for operators.
+        if (s.insuranceFund != address(0)) revert InsuranceFundAlreadyMigrated();
         uint256 newCumulative = s.insuranceSeedDeposited + amount;
         if (newCumulative > MAX_INSURANCE_SEED) {
             revert InsuranceSeedCapExceeded(newCumulative, MAX_INSURANCE_SEED);
@@ -413,6 +440,61 @@ contract LPVault is Initializable, UUPSUpgradeable, ERC4626Upgradeable, Reentran
         s.insuranceFundBalance += amount;
         s.insuranceSeedDeposited = newCumulative;
         emit InsuranceSeeded(msg.sender, amount, newCumulative);
+    }
+
+    // ------------------------------------------------------------------------------------------
+    // Wave 6A — InsuranceFund migration (spec §3 line 162)
+    // ------------------------------------------------------------------------------------------
+
+    /// @inheritdoc ILPVault
+    /// @dev    One-shot. Transfers the legacy `insuranceFundBalance` USDC into `newFund`, zeroes
+    ///         the bookkeeper, and stores the fund address. After this call:
+    ///           - Insurance accruals are pushed to the fund via `IInsuranceFund.accrue(amount)`.
+    ///           - `insuranceFundBalance()` view reads `IInsuranceFund.balance()`.
+    ///           - `seedInsurance` reverts; use `IInsuranceFund.deposit()`.
+    ///
+    /// @dev    Governance MUST call `approveInsuranceFund()` separately to grant the fund the
+    ///         allowance it needs for `accrue`. The migration call itself does not approve, to
+    ///         keep the storage write and the token approval visible as two distinct on-chain
+    ///         actions in the deployment runbook.
+    function migrateInsuranceFund(address newFund) external onlyGovernance {
+        if (newFund == address(0)) revert InvalidConfig();
+        VaultStorage.Layout storage s = VaultStorage.load();
+        if (s.insuranceFund != address(0)) revert InsuranceFundAlreadySet();
+        uint256 toMove = s.insuranceFundBalance;
+        // Seal the legacy bookkeeper BEFORE the external call. The InsuranceFund pulls via
+        // `safeTransferFrom(this, address(fund), amount)` if we routed through `accrue`, but here
+        // we hand-off the legacy reserve through a direct `safeTransfer` and `deposit` is not
+        // appropriate (the fund's `accrue` is gated to `onlyLPVault`, and `deposit` would need a
+        // pre-approval). We use `safeTransfer` + a manual `trackedBalance` bump via `accrue`.
+        s.insuranceFundBalance = 0;
+        s.insuranceFund = newFund;
+        if (toMove > 0) {
+            // Grant a one-shot allowance for the InsuranceFund to pull `toMove` USDC via its
+            // `accrue` entrypoint. This is the legacy reserve handoff; the permanent unlimited
+            // allowance is set later via `approveInsuranceFund`. Two-call pattern keeps the
+            // migration auditable: the on-chain trace shows (a) the legacy USDC moving via
+            // `accrue`, and (b) the permanent allowance grant as a separate action.
+            IERC20(asset()).forceApprove(newFund, toMove);
+            IInsuranceFund(newFund).accrue(toMove);
+            // forceApprove with `toMove` was consumed by `accrue`; clean any dust to zero before
+            // the explicit `approveInsuranceFund` call sets the long-term unlimited allowance.
+            IERC20(asset()).forceApprove(newFund, 0);
+        }
+        emit InsuranceFundMigrated(toMove, newFund);
+    }
+
+    /// @inheritdoc ILPVault
+    /// @dev    Governance-only, no timelock. Grants the configured `InsuranceFund` an unlimited
+    ///         USDC allowance so future `_accrueInsuranceCapped` calls can flow without a fresh
+    ///         approval. The InsuranceFund's `accrue` entrypoint is `onlyLPVault` gated, so
+    ///         unlimited approval cannot be drained by anyone else.
+    function approveInsuranceFund() external onlyGovernance {
+        VaultStorage.Layout storage s = VaultStorage.load();
+        address fund = s.insuranceFund;
+        if (fund == address(0)) revert InsuranceFundNotSet();
+        IERC20(asset()).forceApprove(fund, type(uint256).max);
+        emit InsuranceFundApproved(fund);
     }
 
     // ------------------------------------------------------------------------------------------
@@ -613,8 +695,18 @@ contract LPVault is Initializable, UUPSUpgradeable, ERC4626Upgradeable, Reentran
         return VaultStorage.load().positionCollateral;
     }
 
+    /// @inheritdoc ILPVault
+    /// @dev Post-migration this returns `IInsuranceFund.balance()` — the standalone fund's
+    ///      bookkeeper. Pre-migration it returns the in-vault `insuranceFundBalance`. The view
+    ///      stays the source of truth for off-chain callers regardless of which side holds the
+    ///      USDC.
     function insuranceFundBalance() external view returns (uint256) {
-        return VaultStorage.load().insuranceFundBalance;
+        return _insuranceBalanceFor(VaultStorage.load());
+    }
+
+    /// @inheritdoc ILPVault
+    function insuranceFund() external view returns (address) {
+        return VaultStorage.load().insuranceFund;
     }
 
     function accruedFees() external view returns (uint256) {

@@ -274,6 +274,12 @@ library VaultStorage {
         // `totalAssets()`. Default 500 (5%), bounds [0, 1000]; MUST be strictly below the cap.
         // Crossing emits `InsuranceFloorBreached` — no auto-debit; treasury responds off-chain.
         uint16 insuranceFloorBps;
+        // ---- APPENDED: Wave 6A InsuranceFund standalone contract (spec §3 line 162) ----
+        // After `migrateInsuranceFund` runs, the USDC reserve lives in this address (a separate
+        // UUPS proxy under a distinct governance multi-sig) and `insuranceFundBalance` resets to 0.
+        // Cap/floor math switches to reading `IInsuranceFund.balance()` once `insuranceFund != 0`.
+        // Pre-migration this stays `address(0)` and all the legacy in-vault accounting applies.
+        address insuranceFund;
     }
 
     function load() internal pure returns (Layout storage l) {

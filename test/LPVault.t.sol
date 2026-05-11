@@ -7,7 +7,9 @@ import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {Test} from "forge-std/Test.sol";
 import {Vm} from "forge-std/Vm.sol";
 
+import {IInsuranceFund} from "../src/core/IInsuranceFund.sol";
 import {ILPVault} from "../src/core/ILPVault.sol";
+import {InsuranceFund} from "../src/core/InsuranceFund.sol";
 import {LPVault} from "../src/core/LPVault.sol";
 
 import {MockUSDC} from "./mocks/MockUSDC.sol";
@@ -1291,5 +1293,247 @@ contract LPVaultTest is Test {
         vm.prank(governance);
         vm.expectRevert(ILPVault.InsuranceFloorNotBelowCap.selector);
         vault.setInsuranceFloorBps(1_000);
+    }
+
+    // ------------------------------------------------------------------------------------------
+    // Wave 6A — InsuranceFund migration
+    // ------------------------------------------------------------------------------------------
+
+    address internal insuranceGov = makeAddr("insuranceGov");
+
+    /// @dev Deploys a fresh InsuranceFund proxy wired to the current LPVault.
+    function _deployInsuranceFund() internal returns (InsuranceFund f) {
+        InsuranceFund impl = new InsuranceFund();
+        bytes memory initData = abi.encodeCall(
+            InsuranceFund.initialize, (insuranceGov, address(vault), IERC20(address(usdc)), TIMELOCK_DELAY)
+        );
+        f = InsuranceFund(address(new ERC1967Proxy(address(impl), initData)));
+    }
+
+    function test_Migration_MigrateInsuranceFund_HappyPath() public {
+        // Pre-seed the legacy bookkeeper with 1M USDC.
+        usdc.mint(governance, USDC_1M);
+        vm.prank(governance);
+        usdc.approve(address(vault), type(uint256).max);
+        vm.prank(governance);
+        vault.seedInsurance(USDC_1M);
+        assertEq(vault.insuranceFundBalance(), USDC_1M);
+        uint256 vaultBalBefore = usdc.balanceOf(address(vault));
+
+        // Deploy the standalone fund and migrate.
+        InsuranceFund fund = _deployInsuranceFund();
+        vm.expectEmit(false, true, false, true, address(vault));
+        emit ILPVault.InsuranceFundMigrated(USDC_1M, address(fund));
+        vm.prank(governance);
+        vault.migrateInsuranceFund(address(fund));
+
+        // The legacy USDC moved into the fund.
+        assertEq(fund.balance(), USDC_1M);
+        assertEq(usdc.balanceOf(address(fund)), USDC_1M);
+        // The legacy bookkeeper is zeroed; the view now reads the fund.
+        assertEq(vault.insuranceFundBalance(), USDC_1M);
+        assertEq(vault.insuranceFund(), address(fund));
+        // Vault's USDC balance dropped by the migrated amount.
+        assertEq(usdc.balanceOf(address(vault)), vaultBalBefore - USDC_1M);
+        // Allowance was cleaned to zero after the legacy move.
+        assertEq(usdc.allowance(address(vault), address(fund)), 0);
+    }
+
+    function test_Migration_MigrateInsuranceFund_WithEmptyBookkeeper() public {
+        // Migrate while the bookkeeper is empty — should still wire the fund and zero state.
+        InsuranceFund fund = _deployInsuranceFund();
+        vm.prank(governance);
+        vault.migrateInsuranceFund(address(fund));
+        assertEq(vault.insuranceFund(), address(fund));
+        assertEq(vault.insuranceFundBalance(), 0);
+        assertEq(fund.balance(), 0);
+    }
+
+    function test_Migration_MigrateInsuranceFund_RevertOnNonGovernance() public {
+        InsuranceFund fund = _deployInsuranceFund();
+        vm.prank(stranger);
+        vm.expectRevert(abi.encodeWithSelector(ILPVault.Unauthorized.selector, stranger));
+        vault.migrateInsuranceFund(address(fund));
+    }
+
+    function test_Migration_MigrateInsuranceFund_RevertOnZeroAddress() public {
+        vm.prank(governance);
+        vm.expectRevert(ILPVault.InvalidConfig.selector);
+        vault.migrateInsuranceFund(address(0));
+    }
+
+    function test_Migration_MigrateInsuranceFund_RevertOnSecondCall() public {
+        InsuranceFund fund1 = _deployInsuranceFund();
+        vm.prank(governance);
+        vault.migrateInsuranceFund(address(fund1));
+
+        InsuranceFund fund2 = _deployInsuranceFund();
+        vm.prank(governance);
+        vm.expectRevert(ILPVault.InsuranceFundAlreadySet.selector);
+        vault.migrateInsuranceFund(address(fund2));
+    }
+
+    function test_Migration_ApproveInsuranceFund_HappyPath() public {
+        InsuranceFund fund = _deployInsuranceFund();
+        vm.prank(governance);
+        vault.migrateInsuranceFund(address(fund));
+
+        vm.expectEmit(true, false, false, false, address(vault));
+        emit ILPVault.InsuranceFundApproved(address(fund));
+        vm.prank(governance);
+        vault.approveInsuranceFund();
+
+        assertEq(usdc.allowance(address(vault), address(fund)), type(uint256).max);
+    }
+
+    function test_Migration_ApproveInsuranceFund_RevertWhenFundNotSet() public {
+        vm.prank(governance);
+        vm.expectRevert(ILPVault.InsuranceFundNotSet.selector);
+        vault.approveInsuranceFund();
+    }
+
+    function test_Migration_ApproveInsuranceFund_RevertOnNonGovernance() public {
+        InsuranceFund fund = _deployInsuranceFund();
+        vm.prank(governance);
+        vault.migrateInsuranceFund(address(fund));
+        vm.prank(stranger);
+        vm.expectRevert(abi.encodeWithSelector(ILPVault.Unauthorized.selector, stranger));
+        vault.approveInsuranceFund();
+    }
+
+    function test_Migration_SeedInsurance_RevertsPostMigration() public {
+        InsuranceFund fund = _deployInsuranceFund();
+        vm.prank(governance);
+        vault.migrateInsuranceFund(address(fund));
+
+        usdc.mint(governance, USDC_1M);
+        vm.prank(governance);
+        usdc.approve(address(vault), type(uint256).max);
+        vm.prank(governance);
+        vm.expectRevert(ILPVault.InsuranceFundAlreadyMigrated.selector);
+        vault.seedInsurance(USDC_1M);
+    }
+
+    function test_Migration_AccrualRoutesToFundPostMigration() public {
+        // Set up: 1M LP capital, migrate, approve. Then open a position with insurance share.
+        vm.prank(alice);
+        vault.deposit(USDC_1M, alice);
+
+        InsuranceFund fund = _deployInsuranceFund();
+        vm.prank(governance);
+        vault.migrateInsuranceFund(address(fund));
+        vm.prank(governance);
+        vault.approveInsuranceFund();
+        assertEq(fund.balance(), 0);
+
+        uint256 freeBefore = vault.freeAssets();
+        uint256 collat = 1_000 * ONE_USDC;
+        uint256 fee = 750 * ONE_USDC;
+        uint256 lpRebate = (fee * 40) / 100; // 300
+        uint256 insurance = (fee * 50) / 100; // 375
+
+        vm.prank(perpEngine);
+        vault.openPositionFlow(trader, collat, fee, lpRebate, insurance);
+
+        // The insurance share landed in the standalone fund.
+        assertEq(fund.balance(), insurance);
+        assertEq(usdc.balanceOf(address(fund)), insurance);
+        // insuranceFundBalance() view reads from the fund (legacy bookkeeper stays at 0).
+        assertEq(vault.insuranceFundBalance(), insurance);
+
+        // freeAssets reflects the LP rebate (and excludes the insurance USDC which has left the vault).
+        assertEq(vault.freeAssets(), freeBefore + lpRebate);
+    }
+
+    function test_Migration_FreeAssetsInvariantPostMigration() public {
+        vm.prank(alice);
+        vault.deposit(USDC_1M, alice);
+
+        InsuranceFund fund = _deployInsuranceFund();
+        vm.prank(governance);
+        vault.migrateInsuranceFund(address(fund));
+        vm.prank(governance);
+        vault.approveInsuranceFund();
+
+        // Open + settle to exercise insurance accrual on both sides of the flow.
+        vm.prank(perpEngine);
+        vault.openPositionFlow(trader, 1_000 * ONE_USDC, 100 * ONE_USDC, 40 * ONE_USDC, 50 * ONE_USDC);
+        vm.prank(perpEngine);
+        vault.settlePosition(trader, 1_000 * ONE_USDC, 0, 100 * ONE_USDC, 40 * ONE_USDC, 50 * ONE_USDC);
+
+        // Post-migration the in-vault bookkeeper is zero; freeAssets identity becomes
+        // balance(USDC) == freeAssets + positionCollateral + accruedFees.
+        assertEq(
+            usdc.balanceOf(address(vault)),
+            vault.freeAssets() + vault.positionCollateral() + vault.accruedFees(),
+            "post-migration: balance != freeAssets + positionCollateral + accruedFees"
+        );
+    }
+
+    function test_Migration_DrawShortfall_HappyPath() public {
+        // Set up: migrate, accrue, then have the LPVault initiate a draw.
+        // For v0 there is no direct LPVault entrypoint that calls drawShortfall — the fund-side
+        // permission gate is `onlyLPVault`, which we exercise here by impersonating the vault.
+        InsuranceFund fund = _deployInsuranceFund();
+        usdc.mint(governance, USDC_1M);
+        vm.prank(governance);
+        usdc.approve(address(vault), type(uint256).max);
+        vm.prank(governance);
+        vault.seedInsurance(USDC_1M);
+        vm.prank(governance);
+        vault.migrateInsuranceFund(address(fund));
+
+        // The vault is now the only address allowed to call `drawShortfall` on the fund.
+        address shortfallRecipient = makeAddr("shortfall");
+        vm.prank(address(vault));
+        fund.drawShortfall(shortfallRecipient, 100 * ONE_USDC);
+        assertEq(usdc.balanceOf(shortfallRecipient), 100 * ONE_USDC);
+        assertEq(fund.balance(), USDC_1M - 100 * ONE_USDC);
+        // The view follows the fund.
+        assertEq(vault.insuranceFundBalance(), USDC_1M - 100 * ONE_USDC);
+    }
+
+    function test_Migration_CapMath_ReadsFromFund() public {
+        // 1M LP, cap default 10% = 100k. Migrate, set the fund to 90k via deposit + then accrue
+        // a 15k insurance share. We expect 10k booked (room) and 5k redirected via overflow.
+        vm.prank(alice);
+        vault.deposit(USDC_1M, alice);
+
+        InsuranceFund fund = _deployInsuranceFund();
+        vm.prank(governance);
+        vault.migrateInsuranceFund(address(fund));
+        vm.prank(governance);
+        vault.approveInsuranceFund();
+
+        // Pre-fill the fund close to the cap via deposit.
+        usdc.mint(stranger, 90_000 * ONE_USDC);
+        vm.prank(stranger);
+        usdc.approve(address(fund), type(uint256).max);
+        vm.prank(stranger);
+        fund.deposit(90_000 * ONE_USDC);
+        assertEq(fund.balance(), 90_000 * ONE_USDC);
+
+        // Open with an oversized insurance share. cap_postOpen recomputes against new TVL; both
+        // robust invariants from the legacy overflow test apply: balance grew, and grew by less
+        // than the full share.
+        uint256 fee = 30_000 * ONE_USDC;
+        uint256 lpRebate = 0;
+        uint256 insurance = 15_000 * ONE_USDC;
+        vm.prank(perpEngine);
+        vault.openPositionFlow(trader, 1_000 * ONE_USDC, fee, lpRebate, insurance);
+
+        assertGt(fund.balance(), 90_000 * ONE_USDC);
+        assertLt(fund.balance(), 90_000 * ONE_USDC + insurance);
+    }
+
+    function test_Migration_InsuranceFundView_PreMigrationReturnsLegacy() public {
+        usdc.mint(governance, 500_000 * ONE_USDC);
+        vm.prank(governance);
+        usdc.approve(address(vault), type(uint256).max);
+        vm.prank(governance);
+        vault.seedInsurance(500_000 * ONE_USDC);
+        // Pre-migration the view should match the legacy field exactly.
+        assertEq(vault.insuranceFundBalance(), 500_000 * ONE_USDC);
+        assertEq(vault.insuranceFund(), address(0));
     }
 }

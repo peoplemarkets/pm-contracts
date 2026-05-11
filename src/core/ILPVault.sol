@@ -78,9 +78,35 @@ interface ILPVault is IERC4626 {
     ///         allows treasury top-up when the fund drops below 5% of TVL. Both flows go through
     ///         this function. Cumulative cap is the contract-level `MAX_INSURANCE_SEED`; lifting
     ///         it requires a UUPS upgrade.
+    /// @dev    Reverts `InsuranceFundMigrated` after `migrateInsuranceFund` has run — treasury
+    ///         operators must use `IInsuranceFund.deposit()` directly on the new fund contract.
     function seedInsurance(uint256 amount) external;
 
     function insuranceSeedDeposited() external view returns (uint256);
+
+    // ------------------------------------------------------------------------------------------
+    // Wave 6A — InsuranceFund migration (spec §3 line 162)
+    // ------------------------------------------------------------------------------------------
+
+    /// @notice One-shot migration of the legacy in-vault `insuranceFundBalance` bookkeeper into
+    ///         a standalone `InsuranceFund` contract.
+    /// @dev    Governance-only, NO timelock — the destination fund is itself timelocked under a
+    ///         separate multi-sig. Transfers `insuranceFundBalance` USDC to `newFund`, zeroes the
+    ///         bookkeeper, and stores `newFund`. After this call:
+    ///           - `insuranceFundBalance()` view returns `IInsuranceFund.balance()` from the fund.
+    ///           - Insurance accruals during `openPositionFlow` / `settlePosition` route into the
+    ///             fund via `IInsuranceFund.accrue(amount)`.
+    ///           - `seedInsurance` reverts; treasury top-ups go through `IInsuranceFund.deposit()`.
+    ///         Reverts `AlreadyMigrated` on the second call.
+    function migrateInsuranceFund(address newFund) external;
+
+    /// @notice One-time post-migration approval for the InsuranceFund to `transferFrom` accruals
+    ///         out of the LPVault. Governance-only, no timelock.
+    /// @dev    Sets the USDC allowance to `type(uint256).max`. The InsuranceFund is `onlyLPVault`
+    ///         gated on its `accrue` entrypoint so unlimited approval is safe.
+    function approveInsuranceFund() external;
+
+    function insuranceFund() external view returns (address);
 
     // ------------------------------------------------------------------------------------------
     // Treasury fee withdrawal (Fix #5) — governance, timelocked
@@ -228,6 +254,15 @@ interface ILPVault is IERC4626 {
     /// @notice Governance updated the insurance floor.
     event InsuranceFloorBpsSet(uint16 oldBps, uint16 newBps);
 
+    // --- Wave 6A: InsuranceFund migration ---
+    /// @notice The in-vault bookkeeper has been migrated to the standalone `InsuranceFund`.
+    ///         Pre-call `insuranceFundBalance` USDC was transferred to `newFund` and the local
+    ///         bookkeeper was zeroed.
+    event InsuranceFundMigrated(uint256 amount, address indexed newFund);
+    /// @notice LPVault granted the `InsuranceFund` an unlimited USDC allowance so subsequent
+    ///         insurance accruals can be pulled atomically.
+    event InsuranceFundApproved(address indexed fund);
+
     // ------------------------------------------------------------------------------------------
     // Errors
     // ------------------------------------------------------------------------------------------
@@ -251,4 +286,12 @@ interface ILPVault is IERC4626 {
     error InsuranceCapBpsOutOfRange();
     error InsuranceFloorBpsOutOfRange();
     error InsuranceFloorNotBelowCap();
+    // --- Wave 6A: InsuranceFund migration ---
+    /// @notice Thrown when a legacy in-vault insurance entrypoint (e.g. `seedInsurance`) is called
+    ///         after `migrateInsuranceFund` has run. Use `IInsuranceFund.deposit()` instead.
+    error InsuranceFundAlreadyMigrated();
+    /// @notice Thrown by `migrateInsuranceFund` on the second call. One-shot.
+    error InsuranceFundAlreadySet();
+    /// @notice Thrown when an operation requires the InsuranceFund to be wired but it isn't.
+    error InsuranceFundNotSet();
 }
