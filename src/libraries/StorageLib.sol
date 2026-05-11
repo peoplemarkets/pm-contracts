@@ -341,3 +341,78 @@ library RegistryStorage {
         }
     }
 }
+
+library PauseGuardianStorage {
+    bytes32 internal constant SLOT = keccak256("people.markets.pauseguardian.v1");
+
+    /// @dev Number of slots in the per-subject mark-observation ring buffer. Sized so that, in
+    ///      normal operation (mark pushes every ~30s under the spec §1 default `markStaleAfter`),
+    ///      the buffer spans roughly 60 minutes — the longest breaker window. With the 5-second
+    ///      minimum-interval rate-limit, the worst-case buffer span is 128 × 5s = 10.6 minutes,
+    ///      which still covers the 30-second and 30-minute windows. Operators who push marks at
+    ///      a higher cadence may briefly under-cover the 1-hour window during ramp-up; this is an
+    ///      explicit tradeoff against per-subject storage cost (a denser buffer costs more gas on
+    ///      every `observe`).
+    uint16 internal constant RING_SIZE = 128;
+
+    /// @dev Single observation of a subject's mark. Packed so each entry occupies one storage slot
+    ///      (uint192 mark + uint64 timestamp = 256 bits). MAX_MARK in PerpEngine is 1e36 which fits
+    ///      comfortably in uint192 (~6.3e57).
+    struct Observation {
+        uint192 mark;
+        uint64 timestamp;
+    }
+
+    /// @dev Per-subject ring buffer. `head` is the index of the next slot to write. `length` is the
+    ///      number of valid entries (saturates at RING_SIZE). When `length == RING_SIZE`, oldest
+    ///      entry is at `head` (the slot we are about to overwrite).
+    struct Ring {
+        uint16 head;
+        uint16 length;
+        Observation[RING_SIZE] entries;
+    }
+
+    /// @dev Pending threshold/window change (one in-flight). Single struct because all three tiers
+    ///      change together — operators reason about the full breaker schedule at once, not slice
+    ///      by slice.
+    struct PendingThresholds {
+        uint16 auto5MinBps;
+        uint16 cooldown30MinBps;
+        uint16 frozen60MinBps;
+        uint32 auto5WindowSeconds;
+        uint32 cooldown30WindowSeconds;
+        uint32 frozen60WindowSeconds;
+        uint64 activatesAt;
+        bool exists;
+    }
+
+    struct Layout {
+        // dependencies — set in initialize, immutable after
+        address perpEngine;
+        address subjectRegistry;
+        // governance + timelock (matches the OracleRouter / PerpEngine pattern)
+        address governance;
+        uint32 timelockDelay;
+        address pendingGovernance;
+        uint64 pendingGovernanceActivatesAt;
+        // breaker thresholds (basis points of the reference mark; defaults 500 / 1000 / 2000)
+        uint16 auto5MinBps;
+        uint16 cooldown30MinBps;
+        uint16 frozen60MinBps;
+        // breaker windows (seconds; defaults 30 / 1800 / 3600)
+        uint32 auto5WindowSeconds;
+        uint32 cooldown30WindowSeconds;
+        uint32 frozen60WindowSeconds;
+        // pending threshold / window change (single in-flight)
+        PendingThresholds pendingThresholds;
+        // per-subject mark observation history
+        mapping(bytes32 subjectId => Ring) rings;
+    }
+
+    function load() internal pure returns (Layout storage l) {
+        bytes32 slot = SLOT;
+        assembly ("memory-safe") {
+            l.slot := slot
+        }
+    }
+}
