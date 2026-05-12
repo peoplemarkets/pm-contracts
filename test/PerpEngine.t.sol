@@ -2158,4 +2158,163 @@ contract PerpEngineTest is Test {
         vm.expectRevert(abi.encodeWithSelector(IPerpEngine.OnlyFeedbackController.selector, stranger));
         engine.applyImpulse(SUBJECT_ID, int256(500));
     }
+
+    // ------------------------------------------------------------------------------------------
+    // Wave 5B — LiquidationEngine rotation + liquidateClose entrypoint
+    // ------------------------------------------------------------------------------------------
+
+    function _activateLiquidationEngine(address le) internal {
+        vm.prank(governance);
+        engine.proposeSetLiquidationEngine(le);
+        vm.warp(block.timestamp + TIMELOCK_DELAY);
+        engine.activateSetLiquidationEngine();
+        // Refresh mark so subsequent opens / interactions don't trip MarkStale.
+        _pushMarkAt(INITIAL_MARK);
+        _pushMarkAt2(INITIAL_MARK);
+    }
+
+    function test_ProposeSetLiquidationEngine_HappyPath() public {
+        address le = makeAddr("liqEngine");
+        vm.prank(governance);
+        engine.proposeSetLiquidationEngine(le);
+        (address pending, uint64 ts) = engine.pendingLiquidationEngine();
+        assertEq(pending, le);
+        assertEq(ts, uint64(block.timestamp + TIMELOCK_DELAY));
+        assertEq(engine.liquidationEngine(), address(0)); // not yet active
+    }
+
+    function test_ProposeSetLiquidationEngine_RevertOnZero() public {
+        vm.prank(governance);
+        vm.expectRevert(IPerpEngine.InvalidConfig.selector);
+        engine.proposeSetLiquidationEngine(address(0));
+    }
+
+    function test_ProposeSetLiquidationEngine_RevertOnPending() public {
+        address le = makeAddr("liqEngine");
+        vm.prank(governance);
+        engine.proposeSetLiquidationEngine(le);
+        vm.prank(governance);
+        vm.expectRevert(IPerpEngine.PendingLiquidationEngineExists.selector);
+        engine.proposeSetLiquidationEngine(le);
+    }
+
+    function test_ActivateSetLiquidationEngine_HappyPath() public {
+        address le = makeAddr("liqEngine");
+        _activateLiquidationEngine(le);
+        assertEq(engine.liquidationEngine(), le);
+        (address pending, uint64 ts) = engine.pendingLiquidationEngine();
+        assertEq(pending, address(0));
+        assertEq(ts, 0);
+    }
+
+    function test_ActivateSetLiquidationEngine_RevertOnNoPending() public {
+        vm.expectRevert(IPerpEngine.NoPendingLiquidationEngine.selector);
+        engine.activateSetLiquidationEngine();
+    }
+
+    function test_ActivateSetLiquidationEngine_RevertOnTimelock() public {
+        address le = makeAddr("liqEngine");
+        vm.prank(governance);
+        engine.proposeSetLiquidationEngine(le);
+        uint64 readyAt = uint64(block.timestamp + TIMELOCK_DELAY);
+        vm.expectRevert(abi.encodeWithSelector(IPerpEngine.TimelockNotElapsed.selector, readyAt));
+        engine.activateSetLiquidationEngine();
+    }
+
+    function test_CancelSetLiquidationEngine_HappyPath() public {
+        address le = makeAddr("liqEngine");
+        vm.prank(governance);
+        engine.proposeSetLiquidationEngine(le);
+        vm.prank(governance);
+        engine.cancelSetLiquidationEngine();
+        (address pending,) = engine.pendingLiquidationEngine();
+        assertEq(pending, address(0));
+    }
+
+    function test_CancelSetLiquidationEngine_RevertOnNoPending() public {
+        vm.prank(governance);
+        vm.expectRevert(IPerpEngine.NoPendingLiquidationEngine.selector);
+        engine.cancelSetLiquidationEngine();
+    }
+
+    function test_LiquidateClose_RevertOnUnsetEngine() public {
+        IPerpEngine.OpenParams memory p = _baseOpenParams();
+        bytes32 positionId = _open(p);
+        // No liquidation engine wired ⇒ reverts at the modifier.
+        vm.prank(stranger);
+        vm.expectRevert(abi.encodeWithSelector(IPerpEngine.OnlyLiquidationEngine.selector, stranger));
+        engine.liquidateClose(positionId, 1, 0, 0, 0, stranger, 1);
+    }
+
+    function test_LiquidateClose_RevertOnNonEngineCaller() public {
+        address le = makeAddr("liqEngine");
+        _activateLiquidationEngine(le);
+        IPerpEngine.OpenParams memory p = _baseOpenParams();
+        bytes32 positionId = _open(p);
+        vm.prank(stranger);
+        vm.expectRevert(abi.encodeWithSelector(IPerpEngine.OnlyLiquidationEngine.selector, stranger));
+        engine.liquidateClose(positionId, 1, 0, 0, 0, stranger, 1);
+    }
+
+    function test_LiquidateClose_HappyFullClose() public {
+        address le = makeAddr("liqEngine");
+        // We need a real LiquidationEngine address that the vault also accepts. Use the same
+        // address; for the purposes of this test, the LiquidationEngine is `le` and we use
+        // `vm.prank(le)` to call `liquidateClose`. We also need the LPVault to allow
+        // `settleLiquidation` from PerpEngine, which it already does.
+        _activateLiquidationEngine(le);
+
+        IPerpEngine.OpenParams memory p = _baseOpenParams();
+        bytes32 positionId = _open(p);
+        IPerpEngine.Position memory pos = engine.positionOf(positionId);
+
+        // Full close at entry — pnl = 0; trader gets back the collateral minus bounty.
+        // Payout-conservation: traderPayout + bounty = collateral + signedPnl
+        //                     = $10K + 0 = $10K
+        // Choose: bounty = $100, traderPayout = $9,900 → signedPnl = $100 + $9,900 - $10K = 0.
+        uint256 bounty = 100 * ONE_USDC;
+        uint256 traderPayout = pos.collateral - bounty;
+
+        uint256 traderBalBefore = usdc.balanceOf(trader);
+        uint256 liquidatorBalBefore = usdc.balanceOf(le);
+
+        vm.prank(le);
+        engine.liquidateClose(positionId, pos.size, traderPayout, bounty, int256(0), le, 2);
+
+        // Position deleted.
+        assertEq(engine.positionOf(positionId).size, 0);
+        assertEq(engine.positionIdOf(trader, SUBJECT_ID), bytes32(0));
+
+        // OI cleared.
+        (uint256 longOI,) = engine.openInterestOf(SUBJECT_ID);
+        assertEq(longOI, 0);
+
+        // Trader got back traderPayout, liquidator got bounty.
+        assertEq(usdc.balanceOf(trader), traderBalBefore + traderPayout);
+        assertEq(usdc.balanceOf(le), liquidatorBalBefore + bounty);
+    }
+
+    function test_LiquidateClose_HappyPartialClose() public {
+        address le = makeAddr("liqEngine");
+        _activateLiquidationEngine(le);
+
+        IPerpEngine.OpenParams memory p = _baseOpenParams();
+        bytes32 positionId = _open(p);
+        IPerpEngine.Position memory pos = engine.positionOf(positionId);
+        int256 halfSize = pos.size / 2;
+
+        // Partial close at entry — pnl on the half-slice = 0; slice collateral = $5K.
+        // bounty + traderPayout = sliceCollateral + signedPnl = $5K. Bounty = $50,
+        // traderPayout = $4,950, signedPnl = 0.
+        uint256 bounty = 50 * ONE_USDC;
+        uint256 traderPayout = (pos.collateral / 2) - bounty;
+
+        vm.prank(le);
+        engine.liquidateClose(positionId, halfSize, traderPayout, bounty, int256(0), le, 1);
+
+        // Position still open with half the size + half the collateral.
+        IPerpEngine.Position memory residual = engine.positionOf(positionId);
+        assertEq(residual.size, pos.size - halfSize);
+        assertEq(residual.collateral, pos.collateral - (pos.collateral / 2));
+    }
 }

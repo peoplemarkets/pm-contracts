@@ -111,6 +111,43 @@ interface IPerpEngine {
     function activateSetMarginEngine() external;
     function cancelSetMarginEngine() external;
 
+    /// @notice Wave 5B LiquidationEngine rotation. Same shape as MarginEngine rotation: timelocked
+    ///         propose/activate/cancel via the existing `timelockDelay`. Until rotation activates,
+    ///         `liquidateClose` reverts with `OnlyLiquidationEngine`.
+    function proposeSetLiquidationEngine(address newEngine) external;
+    function activateSetLiquidationEngine() external;
+    function cancelSetLiquidationEngine() external;
+
+    /// @notice LiquidationEngine-only atomic close used by the 5-tier waterfall. Reduces a
+    ///         position's signed size by `sizeToClose` (or deletes it if equal to the full size),
+    ///         decrements OI accumulators, routes (`collateralToReturn`, `signedPnl`,
+    ///         `bountyToPay`) through `LPVault.settlePosition`, and emits `PositionLiquidated`.
+    /// @dev    The vault settles a 3-way payout: the trader receives `collateralToReturn`, the
+    ///         liquidator receives `bountyToPay`, and the LP/insurance side absorbs the pnl.
+    ///         The caller (LiquidationEngine) has already drawn any insurance covering BEFORE
+    ///         this call so the vault has the USDC to pay both legs in one go.
+    /// @param  positionId         Target position. MUST exist (size != 0).
+    /// @param  sizeToClose        Signed close size; must have the same sign as the position's
+    ///                            current size and absolute magnitude in (0, |position.size|].
+    /// @param  collateralToReturn 6-decimal USDC to send to the trader. Vault verifies solvency.
+    /// @param  bountyToPay        6-decimal USDC to send to the liquidator (msg.sender on the
+    ///                            engine side, but the LiquidationEngine address forwards the
+    ///                            target via parameter).
+    /// @param  signedPnl          Signed pnl applied to the slice. Negative on losses.
+    /// @param  liquidator         EOA that receives the bounty.
+    /// @param  tierCode           Enum-coded liquidation tier reached. Echoed in the event so
+    ///                            indexers can categorise without a second lookup.
+    function liquidateClose(
+        bytes32 positionId,
+        int256 sizeToClose,
+        uint256 collateralToReturn,
+        uint256 bountyToPay,
+        int256 signedPnl,
+        address liquidator,
+        uint8 tierCode
+    )
+        external;
+
     /// @notice Tier-1 funding event stub: timelocked rotation of the FundingEngine writer.
     /// @dev    Until FundingEngine v1 ships, `fundingEngine` is `address(0)` and any
     ///         `pushFundingIndex` call reverts. Rotation follows the standard propose/activate/
@@ -197,6 +234,13 @@ interface IPerpEngine {
     /// @notice Pending MarginEngine rotation (zero address + zero timestamp when none in flight).
     function pendingMarginEngine() external view returns (address account, uint64 activatesAt);
 
+    /// @notice Configured LiquidationEngine (Wave 5B). `address(0)` until rotated in. Until set,
+    ///         `liquidateClose` reverts with `OnlyLiquidationEngine`.
+    function liquidationEngine() external view returns (address);
+
+    /// @notice Pending LiquidationEngine rotation (zero address + zero timestamp when none).
+    function pendingLiquidationEngine() external view returns (address account, uint64 activatesAt);
+
     // ------------------------------------------------------------------------------------------
     // Events
     // ------------------------------------------------------------------------------------------
@@ -277,6 +321,25 @@ interface IPerpEngine {
     event MarginEngineActivated(address indexed oldEngine, address indexed newEngine);
     event MarginEngineCancelled(address indexed pendingEngine);
 
+    // --- Wave 5B LiquidationEngine rotation ---
+    /// @notice Timelocked rotation of the LiquidationEngine pointer.
+    event LiquidationEngineProposed(address indexed newEngine, uint64 activatesAt);
+    event LiquidationEngineActivated(address indexed oldEngine, address indexed newEngine);
+    event LiquidationEngineCancelled(address indexed pendingEngine);
+
+    /// @notice Emitted on every successful `liquidateClose`. `tierCode` matches the
+    ///         `ILiquidationEngine.Tier` enum (PARTIAL=1, FULL=2, INSURANCE=3, SOCIALIZATION=4).
+    event PositionLiquidated(
+        bytes32 indexed positionId,
+        address indexed trader,
+        address indexed liquidator,
+        int256 sizeClosed,
+        uint256 collateralReturned,
+        uint256 bountyPaid,
+        int256 signedPnl,
+        uint8 tierCode
+    );
+
     // ------------------------------------------------------------------------------------------
     // Errors
     // ------------------------------------------------------------------------------------------
@@ -333,4 +396,10 @@ interface IPerpEngine {
     error MarginEngineUnset();
     error PendingMarginEngineExists();
     error NoPendingMarginEngine();
+    // --- Wave 5B LiquidationEngine ---
+    error OnlyLiquidationEngine(address caller);
+    error PendingLiquidationEngineExists();
+    error NoPendingLiquidationEngine();
+    error LiquidationSizeMismatch(int256 positionSize, int256 sizeToClose);
+    error LiquidationSizeZero();
 }

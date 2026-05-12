@@ -127,6 +127,15 @@ contract LPVault is Initializable, UUPSUpgradeable, ERC4626Upgradeable, Reentran
         _;
     }
 
+    /// @dev Wave 5B. Gates `drawFromInsuranceForLiquidation` to the configured LiquidationEngine.
+    ///      Until the rotation activates, every call reverts.
+    modifier onlyLiquidationEngine() {
+        VaultStorage.Layout storage s = VaultStorage.load();
+        if (s.liquidationEngine == address(0)) revert LiquidationEngineNotSet();
+        if (msg.sender != s.liquidationEngine) revert OnlyLiquidationEngine(msg.sender);
+        _;
+    }
+
     // ------------------------------------------------------------------------------------------
     // ERC-4626 overrides
     // ------------------------------------------------------------------------------------------
@@ -403,6 +412,96 @@ contract LPVault is Initializable, UUPSUpgradeable, ERC4626Upgradeable, Reentran
     }
 
     /// @inheritdoc ILPVault
+    /// @dev Wave 5B. The 3-way settle path for the LiquidationEngine. Decrements
+    ///      `positionCollateral` by `collateralReleased`, books `signedPnl` to the LP side,
+    ///      and transfers `traderPayout` + `liquidatorBounty` out of the vault.
+    ///
+    ///      Invariant enforced: `traderPayout + liquidatorBounty == collateralReleased +
+    ///      signedPnl`. Anything else implies a LiquidationEngine accounting bug — we revert
+    ///      `LiquidationPayoutMismatch` so the broken state never lands on-chain.
+    ///
+    ///      Solvency: when the slice is in deficit (`signedPnl < 0` and the deficit exceeds the
+    ///      released collateral), the vault's `freeAssets` covers the deficit. The
+    ///      LiquidationEngine pre-funds via `drawFromInsuranceForLiquidation` for any shortfall
+    ///      before calling here. We rely on the inherited `freeAssets` arithmetic in
+    ///      `_withdraw` to ensure that locked collateral / fees / insurance buckets are never
+    ///      drained by the trader/bounty payouts — instead this function's `freeAssets()` check
+    ///      after the state mutations catches any solvency violation.
+    function settleLiquidation(
+        address trader,
+        address liquidator,
+        uint256 collateralReleased,
+        uint256 traderPayout,
+        uint256 liquidatorBounty,
+        int256 signedPnl
+    )
+        external
+        nonReentrant
+        onlyPerpEngine
+    {
+        if (collateralReleased == 0) revert AmountZero();
+        if (trader == liquidator) revert LiquidatorIsTrader(trader);
+
+        VaultStorage.Layout storage s = VaultStorage.load();
+        if (collateralReleased > s.positionCollateral) {
+            revert InsufficientPositionCollateral(collateralReleased, s.positionCollateral);
+        }
+
+        // ---- Payout-conservation invariant. ----
+        int256 expectedTotal = int256(collateralReleased) + signedPnl;
+        int256 actualTotal = int256(traderPayout) + int256(liquidatorBounty);
+        if (expectedTotal != actualTotal) {
+            revert LiquidationPayoutMismatch(expectedTotal, actualTotal);
+        }
+
+        // ---- State mutation BEFORE external calls (CEI). ----
+        s.positionCollateral -= collateralReleased;
+
+        // Solvency check: if total payout exceeds released collateral, the difference must be
+        // backed by `freeAssets`. This protects locked collateral / insurance / accruedFees from
+        // being silently drained.
+        uint256 totalPayout = traderPayout + liquidatorBounty;
+        if (totalPayout > collateralReleased) {
+            uint256 deficit = totalPayout - collateralReleased;
+            uint256 free = freeAssets();
+            if (deficit > free) revert InsufficientFreeAssets(deficit, free);
+        }
+
+        if (traderPayout > 0) IERC20(asset()).safeTransfer(trader, traderPayout);
+        if (liquidatorBounty > 0) IERC20(asset()).safeTransfer(liquidator, liquidatorBounty);
+
+        // Floor breach check on the way out.
+        _emitFloorBreachIfBelow(s);
+
+        emit LiquidationSettledOnVault(
+            trader, liquidator, collateralReleased, traderPayout, liquidatorBounty, signedPnl
+        );
+        emit CollateralReleased(trader, collateralReleased);
+    }
+
+    /// @inheritdoc ILPVault
+    /// @dev Wave 5B. Draws `amount` USDC from the standalone InsuranceFund into this vault. The
+    ///      LiquidationEngine calls this BEFORE `liquidateClose` so the vault has the USDC to
+    ///      cover the trader payout when the slice is in deficit.
+    ///
+    ///      `recipient` of the draw is `address(this)` — the InsuranceFund transfers USDC to the
+    ///      vault. The vault tracks the inbound flow via `_emitFloorBreachIfBelow` for the
+    ///      informational floor event, but does NOT increment `positionCollateral` /
+    ///      `insuranceFundBalance` / `accruedFees` (the InsuranceFund's `drawShortfall` already
+    ///      decremented its own `trackedBalance`).
+    function drawFromInsuranceForLiquidation(uint256 amount) external nonReentrant onlyLiquidationEngine {
+        if (amount == 0) revert AmountZero();
+        VaultStorage.Layout storage s = VaultStorage.load();
+        address fund = s.insuranceFund;
+        if (fund == address(0)) revert InsuranceFundNotSet();
+        // Pull via the InsuranceFund's existing `drawShortfall` — gated `onlyLPVault` already, so
+        // this is the canonical path. Recipient is the vault itself: the USDC lands here and
+        // boosts `freeAssets` for the subsequent `settleLiquidation` payout.
+        IInsuranceFund(fund).drawShortfall(address(this), amount);
+        emit InsuranceDrawnForLiquidation(amount, IInsuranceFund(fund).balance());
+    }
+
+    /// @inheritdoc ILPVault
     function lockCollateral(address from, uint256 amount) external nonReentrant onlyPerpEngine {
         if (amount == 0) revert AmountZero();
         IERC20(asset()).safeTransferFrom(from, address(this), amount);
@@ -583,6 +682,42 @@ contract LPVault is Initializable, UUPSUpgradeable, ERC4626Upgradeable, Reentran
     }
 
     // ------------------------------------------------------------------------------------------
+    // Governance: setLiquidationEngine (timelocked) — Wave 5B
+    // ------------------------------------------------------------------------------------------
+
+    function proposeSetLiquidationEngine(address newEngine) external onlyGovernance {
+        if (newEngine == address(0)) revert InvalidConfig();
+        VaultStorage.Layout storage s = VaultStorage.load();
+        if (s.pendingLiquidationEngineActivatesAt != 0) revert PendingProposalExists();
+        uint64 activatesAt = uint64(block.timestamp + s.timelockDelay);
+        s.pendingLiquidationEngine = newEngine;
+        s.pendingLiquidationEngineActivatesAt = activatesAt;
+        emit LiquidationEngineProposed(newEngine, activatesAt);
+    }
+
+    function activateSetLiquidationEngine() external {
+        VaultStorage.Layout storage s = VaultStorage.load();
+        uint64 readyAt = s.pendingLiquidationEngineActivatesAt;
+        if (readyAt == 0) revert NoPendingProposal();
+        if (block.timestamp < readyAt) revert TimelockNotElapsed(readyAt);
+        address oldEngine = s.liquidationEngine;
+        address newEngine = s.pendingLiquidationEngine;
+        s.liquidationEngine = newEngine;
+        delete s.pendingLiquidationEngine;
+        delete s.pendingLiquidationEngineActivatesAt;
+        emit LiquidationEngineActivated(oldEngine, newEngine);
+    }
+
+    function cancelSetLiquidationEngine() external onlyGovernance {
+        VaultStorage.Layout storage s = VaultStorage.load();
+        if (s.pendingLiquidationEngineActivatesAt == 0) revert NoPendingProposal();
+        address pending = s.pendingLiquidationEngine;
+        delete s.pendingLiquidationEngine;
+        delete s.pendingLiquidationEngineActivatesAt;
+        emit LiquidationEngineCancelled(pending);
+    }
+
+    // ------------------------------------------------------------------------------------------
     // Governance: governance transfer (timelocked)
     // ------------------------------------------------------------------------------------------
 
@@ -740,6 +875,17 @@ contract LPVault is Initializable, UUPSUpgradeable, ERC4626Upgradeable, Reentran
     function pendingPerpEngine() external view returns (address account, uint64 activatesAt) {
         VaultStorage.Layout storage s = VaultStorage.load();
         return (s.pendingPerpEngine, s.pendingPerpEngineActivatesAt);
+    }
+
+    /// @inheritdoc ILPVault
+    function liquidationEngine() external view returns (address) {
+        return VaultStorage.load().liquidationEngine;
+    }
+
+    /// @inheritdoc ILPVault
+    function pendingLiquidationEngine() external view returns (address account, uint64 activatesAt) {
+        VaultStorage.Layout storage s = VaultStorage.load();
+        return (s.pendingLiquidationEngine, s.pendingLiquidationEngineActivatesAt);
     }
 
     function pendingGovernance() external view returns (address account, uint64 activatesAt) {

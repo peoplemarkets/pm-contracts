@@ -99,6 +99,12 @@ library PerpStorage {
         address marginEngine;
         address pendingMarginEngine;
         uint64 pendingMarginEngineActivatesAt;
+        // ---- APPENDED: Wave 5B LiquidationEngine wiring ----
+        // Configured LiquidationEngine address. Sole authorised caller of `liquidateClose`.
+        // Rotated through the same timelocked propose/activate/cancel flow.
+        address liquidationEngine;
+        address pendingLiquidationEngine;
+        uint64 pendingLiquidationEngineActivatesAt;
     }
 
     function load() internal pure returns (Layout storage l) {
@@ -280,6 +286,13 @@ library VaultStorage {
         // Cap/floor math switches to reading `IInsuranceFund.balance()` once `insuranceFund != 0`.
         // Pre-migration this stays `address(0)` and all the legacy in-vault accounting applies.
         address insuranceFund;
+        // ---- APPENDED: Wave 5B LiquidationEngine wiring ----
+        // Configured LiquidationEngine address. Sole authorised caller of
+        // `drawFromInsuranceForLiquidation`. Rotated through a timelocked propose/activate/cancel
+        // flow on the LPVault.
+        address liquidationEngine;
+        address pendingLiquidationEngine;
+        uint64 pendingLiquidationEngineActivatesAt;
     }
 
     function load() internal pure returns (Layout storage l) {

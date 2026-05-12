@@ -62,6 +62,35 @@ interface ILPVault is IERC4626 {
     )
         external;
 
+    /// @notice 3-way settle from the LiquidationEngine via PerpEngine. Releases
+    ///         `collateralReleased` from `positionCollateral`, books `signedPnl` against the LP
+    ///         side, transfers `traderPayout` to the trader, and transfers `liquidatorBounty` to
+    ///         the liquidator. All in one atomic call.
+    /// @dev    Caller MUST be the configured `perpEngine`. The LPVault enforces
+    ///         `traderPayout + liquidatorBounty == collateralReleased + signedPnl`
+    ///         (where `signedPnl` may be negative). Negative pnl that exceeds the released
+    ///         collateral implies a shortfall — the LiquidationEngine has already pre-drawn
+    ///         InsuranceFund into the vault so `freeAssets` covers any payout above the released
+    ///         collateral. The vault reverts `InsufficientFreeAssets` if that pre-funding was
+    ///         insufficient.
+    function settleLiquidation(
+        address trader,
+        address liquidator,
+        uint256 collateralReleased,
+        uint256 traderPayout,
+        uint256 liquidatorBounty,
+        int256 signedPnl
+    )
+        external;
+
+    /// @notice LiquidationEngine entrypoint to draw insurance funding into the vault BEFORE
+    ///         `settleLiquidation` runs. The vault forwards the draw to `InsuranceFund` and
+    ///         the USDC lands in this contract's balance.
+    /// @dev    Caller MUST be the configured `liquidationEngine`. The vault MUST have an
+    ///         attached `insuranceFund` (post-migration); pre-migration callers must use a
+    ///         different code path (the legacy in-vault bookkeeper is sealed at zero).
+    function drawFromInsuranceForLiquidation(uint256 amount) external;
+
     /// @notice Add collateral to an existing position. No fee, no PnL.
     function lockCollateral(address from, uint256 amount) external;
 
@@ -154,6 +183,12 @@ interface ILPVault is IERC4626 {
     function activateSetPerpEngine() external;
     function cancelSetPerpEngine() external;
 
+    /// @notice Timelocked rotation of the LiquidationEngine pointer. Until activated,
+    ///         `drawFromInsuranceForLiquidation` reverts at the `onlyLiquidationEngine` modifier.
+    function proposeSetLiquidationEngine(address newEngine) external;
+    function activateSetLiquidationEngine() external;
+    function cancelSetLiquidationEngine() external;
+
     function proposeGovernanceTransfer(address newGovernance) external;
     function activateGovernanceTransfer() external;
     function cancelGovernanceTransfer() external;
@@ -202,6 +237,12 @@ interface ILPVault is IERC4626 {
     function pendingPerpEngine() external view returns (address account, uint64 activatesAt);
     function pendingGovernance() external view returns (address account, uint64 activatesAt);
 
+    /// @notice Configured LiquidationEngine (Wave 5B). `address(0)` until rotated in.
+    function liquidationEngine() external view returns (address);
+
+    /// @notice Pending LiquidationEngine rotation (zero address + zero timestamp when none).
+    function pendingLiquidationEngine() external view returns (address account, uint64 activatesAt);
+
     /// @notice Current insurance cap, basis points of `totalAssets()`. Default 1000 (10%).
     function insuranceCapBps() external view returns (uint16);
 
@@ -230,6 +271,25 @@ interface ILPVault is IERC4626 {
     event PerpEngineProposed(address indexed newEngine, uint64 activatesAt);
     event PerpEngineActivated(address indexed oldEngine, address indexed newEngine);
     event PerpEngineCancelled(address indexed pendingEngine);
+    event LiquidationEngineProposed(address indexed newEngine, uint64 activatesAt);
+    event LiquidationEngineActivated(address indexed oldEngine, address indexed newEngine);
+    event LiquidationEngineCancelled(address indexed pendingEngine);
+
+    /// @notice Emitted on every `settleLiquidation`. Mirrors `PositionSettledOnVault` but
+    ///         distinguishes the liquidator bounty payout.
+    event LiquidationSettledOnVault(
+        address indexed trader,
+        address indexed liquidator,
+        uint256 collateralReleased,
+        uint256 traderPayout,
+        uint256 liquidatorBounty,
+        int256 signedPnl
+    );
+
+    /// @notice Emitted on every `drawFromInsuranceForLiquidation`. The vault forwards the draw
+    ///         to `InsuranceFund`; the USDC lands on the vault balance available for the next
+    ///         `settleLiquidation`.
+    event InsuranceDrawnForLiquidation(uint256 amount, uint256 newInsuranceBalance);
     event GovernanceTransferProposed(address indexed newGovernance, uint64 activatesAt);
     event GovernanceTransferActivated(address indexed oldGovernance, address indexed newGovernance);
     event GovernanceTransferCancelled(address indexed pendingGovernance);
@@ -294,4 +354,15 @@ interface ILPVault is IERC4626 {
     error InsuranceFundAlreadySet();
     /// @notice Thrown when an operation requires the InsuranceFund to be wired but it isn't.
     error InsuranceFundNotSet();
+    // --- Wave 5B: LiquidationEngine wiring ---
+    error OnlyLiquidationEngine(address caller);
+    error LiquidationEngineNotSet();
+    /// @notice Thrown when `settleLiquidation` is called with `trader == liquidator`. The vault
+    ///         transfers the bounty and the trader payout in two separate sends, and a self-
+    ///         liquidation would book the same address twice. Disallowed at the boundary.
+    error LiquidatorIsTrader(address account);
+    /// @notice Thrown when `settleLiquidation` payouts (`traderPayout + liquidatorBounty`) do not
+    ///         match the slice's `collateralReleased + signedPnl`. Indicates a LiquidationEngine
+    ///         accounting bug.
+    error LiquidationPayoutMismatch(int256 expected, int256 actual);
 }

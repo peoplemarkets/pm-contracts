@@ -104,9 +104,9 @@ contract PerpEngine is Initializable, UUPSUpgradeable, ReentrancyGuard, IPerpEng
         perpS.markStaleAfter = 30 seconds; // spec §1 default
         perpS.lpRebatePct = 40; // spec §3 starting value
         perpS.markMaxDeltaBps = DEFAULT_MARK_MAX_DELTA_BPS; // v2-audit Fix #5
-        // Margin params + KYC caps + per-subject + per-category OI caps are now owned by the
-        // MarginEngine namespace and seeded in `MarginEngine.initialize`. This contract no longer
-        // touches MarginStorage on init.
+            // Margin params + KYC caps + per-subject + per-category OI caps are now owned by the
+            // MarginEngine namespace and seeded in `MarginEngine.initialize`. This contract no longer
+            // touches MarginStorage on init.
     }
 
     // ------------------------------------------------------------------------------------------
@@ -127,6 +127,14 @@ contract PerpEngine is Initializable, UUPSUpgradeable, ReentrancyGuard, IPerpEng
     modifier onlyFeedbackController() {
         address writer = PerpStorage.load().feedbackController;
         if (msg.sender != writer || writer == address(0)) revert OnlyFeedbackController(msg.sender);
+        _;
+    }
+
+    /// @dev Wave 5B. Gates `liquidateClose` to the configured LiquidationEngine. Until the
+    ///      rotation activates, the writer is `address(0)` and every call reverts.
+    modifier onlyLiquidationEngine() {
+        address writer = PerpStorage.load().liquidationEngine;
+        if (msg.sender != writer || writer == address(0)) revert OnlyLiquidationEngine(msg.sender);
         _;
     }
 
@@ -478,6 +486,105 @@ contract PerpEngine is Initializable, UUPSUpgradeable, ReentrancyGuard, IPerpEng
         ILPVault(perpS.lpVault).releaseCollateral(msg.sender, amount);
 
         emit CollateralRemoved(positionId, amount, newCollateral);
+    }
+
+    // ------------------------------------------------------------------------------------------
+    // LiquidationEngine entrypoint
+    // ------------------------------------------------------------------------------------------
+
+    /// @inheritdoc IPerpEngine
+    /// @dev Wave 5B. The LiquidationEngine has already computed the close shape via
+    ///      `LiquidationMath` and (where relevant) pre-funded the LPVault by drawing
+    ///      `InsuranceFund` for any shortfall. This call atomically:
+    ///        1. Validates `sizeToClose` sign + magnitude against the stored position.
+    ///        2. Decrements or deletes the position (per-trader-per-subject index too).
+    ///        3. Decrements OI counters by the OPENING notional contribution being unwound.
+    ///        4. Forwards a 3-way settle through `LPVault.settlePosition` — trader gets
+    ///           `collateralToReturn`, liquidator gets `bountyToPay`, and the slice's
+    ///           `signedPnl` is booked to the LP / insurance side.
+    ///      The vault's `UnderwaterClose` guard fires if `collateralReleased + pnl - fee < 0`
+    ///      (fee == bounty here). LiquidationEngine sizes the bounty to never trip that guard.
+    function liquidateClose(
+        bytes32 positionId,
+        int256 sizeToClose,
+        uint256 collateralToReturn,
+        uint256 bountyToPay,
+        int256 signedPnl,
+        address liquidator,
+        uint8 tierCode
+    )
+        external
+        nonReentrant
+        onlyLiquidationEngine
+    {
+        if (sizeToClose == 0) revert LiquidationSizeZero();
+        PerpStorage.Layout storage perpS = PerpStorage.load();
+        Position memory pos = perpS.positions[positionId];
+        if (pos.size == 0) revert PositionNotOpen(pos.subjectId);
+
+        // Sign-match: sizeToClose must share sign with pos.size. Magnitude must be in (0, |pos.size|].
+        bool isLong = pos.size > 0;
+        if ((isLong && sizeToClose <= 0) || (!isLong && sizeToClose >= 0)) {
+            revert LiquidationSizeMismatch(pos.size, sizeToClose);
+        }
+        uint256 absClose = sizeToClose > 0 ? uint256(sizeToClose) : uint256(-sizeToClose);
+        uint256 absPos = isLong ? uint256(pos.size) : uint256(-pos.size);
+        if (absClose > absPos) revert LiquidationSizeMismatch(pos.size, sizeToClose);
+        bool fullClose = absClose == absPos;
+
+        // Collateral release: proportional to size reduction on partials, full on full.
+        uint256 collateralReleased;
+        if (fullClose) {
+            collateralReleased = pos.collateral;
+        } else {
+            collateralReleased = (pos.collateral * absClose) / absPos;
+        }
+        if (collateralToReturn > collateralReleased) {
+            // Defensive: the engine cannot release more than the slice's collateral share. A
+            // mismatch here is a LiquidationEngine bug. Use InvalidConfig as a catch-all.
+            revert InvalidConfig();
+        }
+
+        // OI delta uses opening notional on the slice. `entryPrice` is the position's recorded
+        // entry; the close uses the SAME slice-of-entry-notional accounting as `_computeCloseValues`.
+        uint256 openingNotionalDelta = (absClose * pos.entryPrice) / ONE;
+
+        // ---- State mutations BEFORE the external call (CEI). ----
+        if (fullClose) {
+            delete perpS.positions[positionId];
+            delete perpS.openPositionId[pos.owner][pos.subjectId];
+        } else {
+            Position storage stored = perpS.positions[positionId];
+            // Signed subtract — `sizeToClose` shares sign with `pos.size`, so the residual
+            // shrinks in magnitude without flipping sign.
+            stored.size = pos.size - sizeToClose;
+            stored.collateral = pos.collateral - collateralReleased;
+            stored.lastInteractionAt = uint64(block.timestamp);
+        }
+
+        if (isLong) {
+            perpS.totalLongOI[pos.subjectId] -= openingNotionalDelta;
+        } else {
+            perpS.totalShortOI[pos.subjectId] -= openingNotionalDelta;
+        }
+        if (perpS.marginEngine != address(0)) {
+            IMarginEngine(perpS.marginEngine).recordCloseDelta(
+                pos.owner, _categoryOf(perpS, pos.subjectId), openingNotionalDelta, isLong
+            );
+        }
+
+        // ---- Vault settle: 3-way payout via dedicated `settleLiquidation` path. ----
+        // The vault routes `collateralToReturn` to the trader and `bountyToPay` to the liquidator
+        // atomically; the `signedPnl` is the slice's net pnl on the LP side. The LiquidationEngine
+        // has already pre-drawn `InsuranceFund` for any shortfall, so the vault has the USDC to
+        // cover both legs out of `freeAssets`.
+        ILPVault(perpS.lpVault).settleLiquidation(
+            pos.owner, liquidator, collateralReleased, collateralToReturn, bountyToPay, signedPnl
+        );
+
+        emit PositionLiquidated(
+            positionId, pos.owner, liquidator, sizeToClose, collateralToReturn, bountyToPay, signedPnl, tierCode
+        );
     }
 
     // ------------------------------------------------------------------------------------------
@@ -880,6 +987,48 @@ contract PerpEngine is Initializable, UUPSUpgradeable, ReentrancyGuard, IPerpEng
     }
 
     // ------------------------------------------------------------------------------------------
+    // Governance: LiquidationEngine rotation (timelocked) — Wave 5B
+    //
+    // Same shape as `proposeSetMarginEngine`. Until rotation activates, `liquidateClose` reverts
+    // at the `onlyLiquidationEngine` modifier with `OnlyLiquidationEngine`.
+    // ------------------------------------------------------------------------------------------
+
+    /// @inheritdoc IPerpEngine
+    function proposeSetLiquidationEngine(address newEngine) external onlyGovernance {
+        if (newEngine == address(0)) revert InvalidConfig();
+        PerpStorage.Layout storage perpS = PerpStorage.load();
+        if (perpS.pendingLiquidationEngineActivatesAt != 0) revert PendingLiquidationEngineExists();
+        uint64 activatesAt = uint64(block.timestamp + perpS.timelockDelay);
+        perpS.pendingLiquidationEngine = newEngine;
+        perpS.pendingLiquidationEngineActivatesAt = activatesAt;
+        emit LiquidationEngineProposed(newEngine, activatesAt);
+    }
+
+    /// @inheritdoc IPerpEngine
+    function activateSetLiquidationEngine() external {
+        PerpStorage.Layout storage perpS = PerpStorage.load();
+        uint64 readyAt = perpS.pendingLiquidationEngineActivatesAt;
+        if (readyAt == 0) revert NoPendingLiquidationEngine();
+        if (block.timestamp < readyAt) revert TimelockNotElapsed(readyAt);
+        address oldEngine = perpS.liquidationEngine;
+        address newEngine = perpS.pendingLiquidationEngine;
+        perpS.liquidationEngine = newEngine;
+        delete perpS.pendingLiquidationEngine;
+        delete perpS.pendingLiquidationEngineActivatesAt;
+        emit LiquidationEngineActivated(oldEngine, newEngine);
+    }
+
+    /// @inheritdoc IPerpEngine
+    function cancelSetLiquidationEngine() external onlyGovernance {
+        PerpStorage.Layout storage perpS = PerpStorage.load();
+        if (perpS.pendingLiquidationEngineActivatesAt == 0) revert NoPendingLiquidationEngine();
+        address pending = perpS.pendingLiquidationEngine;
+        delete perpS.pendingLiquidationEngine;
+        delete perpS.pendingLiquidationEngineActivatesAt;
+        emit LiquidationEngineCancelled(pending);
+    }
+
+    // ------------------------------------------------------------------------------------------
     // Governance: transfer (timelocked)
     // ------------------------------------------------------------------------------------------
 
@@ -1088,6 +1237,17 @@ contract PerpEngine is Initializable, UUPSUpgradeable, ReentrancyGuard, IPerpEng
     function pendingMarginEngine() external view returns (address account, uint64 activatesAt) {
         PerpStorage.Layout storage perpS = PerpStorage.load();
         return (perpS.pendingMarginEngine, perpS.pendingMarginEngineActivatesAt);
+    }
+
+    /// @inheritdoc IPerpEngine
+    function liquidationEngine() external view returns (address) {
+        return PerpStorage.load().liquidationEngine;
+    }
+
+    /// @inheritdoc IPerpEngine
+    function pendingLiquidationEngine() external view returns (address account, uint64 activatesAt) {
+        PerpStorage.Layout storage perpS = PerpStorage.load();
+        return (perpS.pendingLiquidationEngine, perpS.pendingLiquidationEngineActivatesAt);
     }
 
     // ------------------------------------------------------------------------------------------
