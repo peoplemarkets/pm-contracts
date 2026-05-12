@@ -57,6 +57,15 @@ interface IPerpEngine {
     ///         so closed-position events stay correlatable in indexers.
     function openPosition(OpenParams calldata p) external returns (bytes32 positionId);
 
+    /// @notice Trusted-router entrypoint: open a position on behalf of `trader`. Caller MUST be
+    ///         in the `routers` set (timelocked add, immediate remove). The router orchestrates
+    ///         multi-leg trades (e.g. atomic pair trades) while the trader remains the position
+    ///         owner, KYC subject, and counterparty for collateral + fee debits via the LPVault.
+    /// @dev    Body shape is identical to `openPosition` but uses `trader` instead of `msg.sender`
+    ///         everywhere. Both entry points delegate to the same internal helper so future
+    ///         changes to the open path apply uniformly.
+    function openPositionFor(address trader, OpenParams calldata p) external returns (bytes32 positionId);
+
     /// @notice Close (or partially close) the caller's position on `subjectId`. Returns signed
     ///         realized PnL on the closed slice.
     function closePosition(CloseParams calldata p) external returns (int256 realizedPnl);
@@ -98,6 +107,16 @@ interface IPerpEngine {
     /// @notice Removing a mark writer is fast (no timelock) so a compromised writer can be cut off
     ///         immediately. Governance still gates the call.
     function removeMarkWriter(address writer) external;
+
+    /// @notice Propose a new trusted router. Timelocked — matches the mark-writer add pattern.
+    ///         Until `activateAddRouter` runs, the router cannot call `openPositionFor`.
+    function proposeAddRouter(address router) external;
+    function activateAddRouter(address router) external;
+    function cancelAddRouter(address router) external;
+
+    /// @notice Removing a router is immediate (no timelock) so a compromised router can be cut off
+    ///         without delay. Governance still gates the call.
+    function removeRouter(address router) external;
 
     function setMarkStaleAfter(uint32 seconds_) external;
     function setLpRebatePct(uint8 pct) external;
@@ -200,6 +219,12 @@ interface IPerpEngine {
     function leverageBpsOf(bytes32 positionId) external view returns (uint256);
 
     function isMarkWriter(address account) external view returns (bool);
+
+    /// @notice Whether `account` is a registered trusted router cleared to call `openPositionFor`.
+    function isRouter(address account) external view returns (bool);
+
+    /// @notice Pending router activation timestamp. Zero if `router` has no add proposal in flight.
+    function pendingRouterActivatesAt(address router) external view returns (uint64);
     function globalHalt() external view returns (bool);
     function governance() external view returns (address);
     function timelockDelay() external view returns (uint32);
@@ -272,6 +297,10 @@ interface IPerpEngine {
     event MarkWriterRemoved(address indexed writer);
     event MarkWriterAddProposed(address indexed writer, uint64 activatesAt);
     event MarkWriterAddCancelled(address indexed writer);
+    event RouterProposed(address indexed router, uint64 activatesAt);
+    event RouterActivated(address indexed router);
+    event RouterCancelled(address indexed router);
+    event RouterRemoved(address indexed router);
     event MarkStaleAfterSet(uint32 seconds_);
     event LpRebatePctSet(uint8 oldPct, uint8 newPct);
     event MarkMaxDeltaBpsSet(uint16 oldBps, uint16 newBps);
@@ -402,4 +431,10 @@ interface IPerpEngine {
     error NoPendingLiquidationEngine();
     error LiquidationSizeMismatch(int256 positionSize, int256 sizeToClose);
     error LiquidationSizeZero();
+    // --- Wave 7 Trusted-router set ---
+    error OnlyRouter(address caller);
+    error PendingRouterExists(address router);
+    error NoPendingRouter(address router);
+    error RouterAlreadySet(address router);
+    error RouterNotSet(address router);
 }

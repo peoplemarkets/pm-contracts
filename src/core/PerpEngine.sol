@@ -138,6 +138,14 @@ contract PerpEngine is Initializable, UUPSUpgradeable, ReentrancyGuard, IPerpEng
         _;
     }
 
+    /// @dev Wave 7. Gates `openPositionFor` to the trusted-router set. Adds are timelocked,
+    ///      removes are immediate (same shape as `markWriters`). Until governance registers a
+    ///      router, every call lands here and reverts.
+    modifier onlyRouter() {
+        if (!PerpStorage.load().routers[msg.sender]) revert OnlyRouter(msg.sender);
+        _;
+    }
+
     // ------------------------------------------------------------------------------------------
     // Modifiers
     // ------------------------------------------------------------------------------------------
@@ -153,6 +161,31 @@ contract PerpEngine is Initializable, UUPSUpgradeable, ReentrancyGuard, IPerpEng
 
     /// @inheritdoc IPerpEngine
     function openPosition(OpenParams calldata p) external nonReentrant returns (bytes32 positionId) {
+        return _openPositionFor(msg.sender, p);
+    }
+
+    /// @inheritdoc IPerpEngine
+    /// @dev Wave 7. Trusted-router entrypoint. Body is identical to `openPosition` but the
+    ///      acting trader is the `trader` parameter rather than `msg.sender`. The trader still
+    ///      must have approved the LPVault for `collateralAmount + fee`; the router never holds
+    ///      funds. Routers are timelocked-added and immediately removable via governance.
+    function openPositionFor(
+        address trader,
+        OpenParams calldata p
+    )
+        external
+        nonReentrant
+        onlyRouter
+        returns (bytes32 positionId)
+    {
+        if (trader == address(0)) revert InvalidConfig();
+        return _openPositionFor(trader, p);
+    }
+
+    /// @dev Shared open-path implementation. Both `openPosition` (where `trader == msg.sender`)
+    ///      and `openPositionFor` (where `trader` is supplied by a trusted router) delegate here
+    ///      so the open-side semantics stay in lockstep.
+    function _openPositionFor(address trader, OpenParams calldata p) internal returns (bytes32 positionId) {
         PerpStorage.Layout storage perpS = PerpStorage.load();
 
         if (perpS.globalHalt) revert GlobalHaltedError();
@@ -162,15 +195,15 @@ contract PerpEngine is Initializable, UUPSUpgradeable, ReentrancyGuard, IPerpEng
         // Subject + KYC gate — registry's requireTradeable reverts on UNREGISTERED, paused,
         // delisted, or any policy flag.
         ISubjectRegistry(perpS.subjectRegistry).requireTradeable(p.subjectId);
-        uint8 tier = ISubjectRegistry(perpS.subjectRegistry).kycTierOf(msg.sender);
-        if (tier == 0) revert KycTierMissing(msg.sender);
+        uint8 tier = ISubjectRegistry(perpS.subjectRegistry).kycTierOf(trader);
+        if (tier == 0) revert KycTierMissing(trader);
 
         uint256 markNow = _readFreshMark(perpS, p.subjectId);
         _checkSlippage(markNow, p.expectedMark, p.maxSlippageBps);
 
         // One-position-per-(trader, subject) invariant.
-        if (perpS.openPositionId[msg.sender][p.subjectId] != bytes32(0)) {
-            revert PositionAlreadyOpen(msg.sender, p.subjectId);
+        if (perpS.openPositionId[trader][p.subjectId] != bytes32(0)) {
+            revert PositionAlreadyOpen(trader, p.subjectId);
         }
 
         // Margin + cap checks — delegated to MarginEngine. The two calls below revert with the
@@ -180,7 +213,7 @@ contract PerpEngine is Initializable, UUPSUpgradeable, ReentrancyGuard, IPerpEng
         if (address(me) == address(0)) revert MarginEngineUnset();
         me.checkInitialMargin(p.sizeNotional, p.collateralAmount);
         bytes32 categoryId = _categoryOf(perpS, p.subjectId);
-        _enforceOpenCaps(me, perpS, p.subjectId, categoryId, p.side, p.sizeNotional, tier);
+        _enforceOpenCaps(me, perpS, trader, p.subjectId, categoryId, p.side, p.sizeNotional, tier);
 
         // Compute fee + split.
         (uint256 fee, uint256 lpRebate, uint256 insuranceShare) = _computeFees(p.sizeNotional, p.isMaker);
@@ -192,7 +225,7 @@ contract PerpEngine is Initializable, UUPSUpgradeable, ReentrancyGuard, IPerpEng
 
         // Allocate positionId from monotonic nonce.
         unchecked {
-            positionId = keccak256(abi.encode(msg.sender, p.subjectId, perpS.nextPositionNonce++));
+            positionId = keccak256(abi.encode(trader, p.subjectId, perpS.nextPositionNonce++));
         }
 
         // Tier-1 funding event stub: snapshot the cumulative funding index at open. The math is
@@ -209,10 +242,10 @@ contract PerpEngine is Initializable, UUPSUpgradeable, ReentrancyGuard, IPerpEng
             entryFundingIndex: entryFundingIndex,
             openedAt: uint64(block.timestamp),
             lastInteractionAt: uint64(block.timestamp),
-            owner: msg.sender,
+            owner: trader,
             subjectId: p.subjectId
         });
-        perpS.openPositionId[msg.sender][p.subjectId] = positionId;
+        perpS.openPositionId[trader][p.subjectId] = positionId;
 
         // OI side-counters live on PerpStorage. Signed per-category OI + per-trader exposure live
         // on MarginEngine — delegate the update so the canonical state stays in one place.
@@ -221,12 +254,14 @@ contract PerpEngine is Initializable, UUPSUpgradeable, ReentrancyGuard, IPerpEng
         } else {
             perpS.totalShortOI[p.subjectId] += p.sizeNotional;
         }
-        me.recordOpenDelta(msg.sender, categoryId, IMarginEngine.Side(uint8(p.side)), p.sizeNotional, tier);
+        me.recordOpenDelta(trader, categoryId, IMarginEngine.Side(uint8(p.side)), p.sizeNotional, tier);
 
-        // Vault settle: pull (collateralAmount + fee) from trader, book the split.
-        ILPVault(perpS.lpVault).openPositionFlow(msg.sender, p.collateralAmount, fee, lpRebate, insuranceShare);
+        // Vault settle: pull (collateralAmount + fee) from trader, book the split. The trader
+        // (not the router or msg.sender) is the funds source — they must have pre-approved the
+        // LPVault for `collateralAmount + fee`.
+        ILPVault(perpS.lpVault).openPositionFlow(trader, p.collateralAmount, fee, lpRebate, insuranceShare);
 
-        emit PositionOpened(positionId, msg.sender, p.subjectId, p.side, signedSize, markNow, p.collateralAmount, fee);
+        emit PositionOpened(positionId, trader, p.subjectId, p.side, signedSize, markNow, p.collateralAmount, fee);
     }
 
     /// @dev Local-only struct used to thread close-flow values out of the helper. Keeps
@@ -623,6 +658,7 @@ contract PerpEngine is Initializable, UUPSUpgradeable, ReentrancyGuard, IPerpEng
     function _enforceOpenCaps(
         IMarginEngine me,
         PerpStorage.Layout storage perpS,
+        address trader,
         bytes32 subjectId,
         bytes32 categoryId,
         Side side,
@@ -635,7 +671,7 @@ contract PerpEngine is Initializable, UUPSUpgradeable, ReentrancyGuard, IPerpEng
         uint256 liveTvl = IERC4626(perpS.lpVault).totalAssets();
         uint256 vaultTvl = perpS.cappedTvl < liveTvl ? perpS.cappedTvl : liveTvl;
         me.enforceOpenCaps(
-            msg.sender,
+            trader,
             subjectId,
             categoryId,
             IMarginEngine.Side(uint8(side)),
@@ -803,6 +839,52 @@ contract PerpEngine is Initializable, UUPSUpgradeable, ReentrancyGuard, IPerpEng
         if (!perpS.markWriters[writer]) revert MarkWriterNotFound(writer);
         delete perpS.markWriters[writer];
         emit MarkWriterRemoved(writer);
+    }
+
+    // ------------------------------------------------------------------------------------------
+    // Governance: trusted-router set (Wave 7)
+    //
+    // Mirrors the mark-writer pattern: adds timelocked, removes immediate. Routers gain access
+    // to `openPositionFor` on activation; a compromised router is cut off without delay via
+    // `removeRouter`.
+    // ------------------------------------------------------------------------------------------
+
+    /// @inheritdoc IPerpEngine
+    function proposeAddRouter(address router) external onlyGovernance {
+        if (router == address(0)) revert InvalidConfig();
+        PerpStorage.Layout storage perpS = PerpStorage.load();
+        if (perpS.routers[router]) revert RouterAlreadySet(router);
+        if (perpS.pendingRouterActivatesAt[router] != 0) revert PendingRouterExists(router);
+        uint64 activatesAt = uint64(block.timestamp + perpS.timelockDelay);
+        perpS.pendingRouterActivatesAt[router] = activatesAt;
+        emit RouterProposed(router, activatesAt);
+    }
+
+    /// @inheritdoc IPerpEngine
+    function activateAddRouter(address router) external {
+        PerpStorage.Layout storage perpS = PerpStorage.load();
+        uint64 readyAt = perpS.pendingRouterActivatesAt[router];
+        if (readyAt == 0) revert NoPendingRouter(router);
+        if (block.timestamp < readyAt) revert TimelockNotElapsed(readyAt);
+        delete perpS.pendingRouterActivatesAt[router];
+        perpS.routers[router] = true;
+        emit RouterActivated(router);
+    }
+
+    /// @inheritdoc IPerpEngine
+    function cancelAddRouter(address router) external onlyGovernance {
+        PerpStorage.Layout storage perpS = PerpStorage.load();
+        if (perpS.pendingRouterActivatesAt[router] == 0) revert NoPendingRouter(router);
+        delete perpS.pendingRouterActivatesAt[router];
+        emit RouterCancelled(router);
+    }
+
+    /// @inheritdoc IPerpEngine
+    function removeRouter(address router) external onlyGovernance {
+        PerpStorage.Layout storage perpS = PerpStorage.load();
+        if (!perpS.routers[router]) revert RouterNotSet(router);
+        delete perpS.routers[router];
+        emit RouterRemoved(router);
     }
 
     // ------------------------------------------------------------------------------------------
@@ -1210,6 +1292,16 @@ contract PerpEngine is Initializable, UUPSUpgradeable, ReentrancyGuard, IPerpEng
 
     function pendingMarkWriterActivatesAt(address writer) external view returns (uint64) {
         return PerpStorage.load().pendingMarkWriterActivatesAt[writer];
+    }
+
+    /// @inheritdoc IPerpEngine
+    function isRouter(address account) external view returns (bool) {
+        return PerpStorage.load().routers[account];
+    }
+
+    /// @inheritdoc IPerpEngine
+    function pendingRouterActivatesAt(address router) external view returns (uint64) {
+        return PerpStorage.load().pendingRouterActivatesAt[router];
     }
 
     function pendingGovernance() external view returns (address account, uint64 activatesAt) {

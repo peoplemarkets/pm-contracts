@@ -2317,4 +2317,216 @@ contract PerpEngineTest is Test {
         assertEq(residual.size, pos.size - halfSize);
         assertEq(residual.collateral, pos.collateral - (pos.collateral / 2));
     }
+
+    // ------------------------------------------------------------------------------------------
+    // Router governance (Wave 7: trusted-router set)
+    // ------------------------------------------------------------------------------------------
+
+    function _activateRouter(address router) internal {
+        vm.prank(governance);
+        engine.proposeAddRouter(router);
+        vm.warp(block.timestamp + TIMELOCK_DELAY);
+        engine.activateAddRouter(router);
+        // Refresh marks — they go stale during the timelock warp.
+        vm.prank(markWriter);
+        engine.pushMark(SUBJECT_ID, INITIAL_MARK);
+        vm.prank(markWriter);
+        engine.pushMark(SUBJECT_ID2, INITIAL_MARK);
+    }
+
+    function test_Router_ProposeAddIsTimelocked() public {
+        address router = makeAddr("router");
+        vm.prank(governance);
+        engine.proposeAddRouter(router);
+        assertEq(engine.pendingRouterActivatesAt(router), uint64(block.timestamp + TIMELOCK_DELAY));
+        assertFalse(engine.isRouter(router));
+
+        vm.warp(block.timestamp + TIMELOCK_DELAY);
+        engine.activateAddRouter(router);
+        assertTrue(engine.isRouter(router));
+        assertEq(engine.pendingRouterActivatesAt(router), 0);
+    }
+
+    function test_Router_RemoveIsImmediate() public {
+        address router = makeAddr("router");
+        _activateRouter(router);
+        assertTrue(engine.isRouter(router));
+
+        vm.prank(governance);
+        engine.removeRouter(router);
+        assertFalse(engine.isRouter(router));
+    }
+
+    function test_Router_ProposeRevertsOnNonGovernance() public {
+        vm.prank(stranger);
+        vm.expectRevert(abi.encodeWithSelector(IPerpEngine.Unauthorized.selector, stranger));
+        engine.proposeAddRouter(makeAddr("router"));
+    }
+
+    function test_Router_ProposeRevertsOnZero() public {
+        vm.prank(governance);
+        vm.expectRevert(IPerpEngine.InvalidConfig.selector);
+        engine.proposeAddRouter(address(0));
+    }
+
+    function test_Router_ProposeRevertsOnAlreadySet() public {
+        address router = makeAddr("router");
+        _activateRouter(router);
+        vm.prank(governance);
+        vm.expectRevert(abi.encodeWithSelector(IPerpEngine.RouterAlreadySet.selector, router));
+        engine.proposeAddRouter(router);
+    }
+
+    function test_Router_ProposeRevertsOnPendingExists() public {
+        address router = makeAddr("router");
+        vm.startPrank(governance);
+        engine.proposeAddRouter(router);
+        vm.expectRevert(abi.encodeWithSelector(IPerpEngine.PendingRouterExists.selector, router));
+        engine.proposeAddRouter(router);
+        vm.stopPrank();
+    }
+
+    function test_Router_ActivateRevertsOnNoPending() public {
+        address router = makeAddr("router");
+        vm.expectRevert(abi.encodeWithSelector(IPerpEngine.NoPendingRouter.selector, router));
+        engine.activateAddRouter(router);
+    }
+
+    function test_Router_ActivateRevertsOnTimelockNotElapsed() public {
+        address router = makeAddr("router");
+        vm.prank(governance);
+        engine.proposeAddRouter(router);
+        uint64 readyAt = uint64(block.timestamp + TIMELOCK_DELAY);
+        vm.warp(uint256(readyAt) - 1);
+        vm.expectRevert(abi.encodeWithSelector(IPerpEngine.TimelockNotElapsed.selector, readyAt));
+        engine.activateAddRouter(router);
+    }
+
+    function test_Router_CancelHappyPath() public {
+        address router = makeAddr("router");
+        vm.prank(governance);
+        engine.proposeAddRouter(router);
+
+        vm.prank(governance);
+        engine.cancelAddRouter(router);
+        assertEq(engine.pendingRouterActivatesAt(router), 0);
+        assertFalse(engine.isRouter(router));
+    }
+
+    function test_Router_CancelRevertsOnNoPending() public {
+        vm.prank(governance);
+        vm.expectRevert(abi.encodeWithSelector(IPerpEngine.NoPendingRouter.selector, stranger));
+        engine.cancelAddRouter(stranger);
+    }
+
+    function test_Router_RemoveRevertsOnNonGovernance() public {
+        address router = makeAddr("router");
+        _activateRouter(router);
+        vm.prank(stranger);
+        vm.expectRevert(abi.encodeWithSelector(IPerpEngine.Unauthorized.selector, stranger));
+        engine.removeRouter(router);
+    }
+
+    function test_Router_RemoveRevertsOnNotSet() public {
+        vm.prank(governance);
+        vm.expectRevert(abi.encodeWithSelector(IPerpEngine.RouterNotSet.selector, stranger));
+        engine.removeRouter(stranger);
+    }
+
+    // ------------------------------------------------------------------------------------------
+    // openPositionFor — onlyRouter + behavioural parity with openPosition
+    // ------------------------------------------------------------------------------------------
+
+    function test_OpenPositionFor_RevertsOnNonRouter() public {
+        IPerpEngine.OpenParams memory p = _baseOpenParams();
+        vm.prank(stranger);
+        vm.expectRevert(abi.encodeWithSelector(IPerpEngine.OnlyRouter.selector, stranger));
+        engine.openPositionFor(trader, p);
+    }
+
+    function test_OpenPositionFor_HappyPathLong() public {
+        address router = makeAddr("router");
+        _activateRouter(router);
+
+        IPerpEngine.OpenParams memory p = _baseOpenParams();
+        vm.prank(router);
+        bytes32 positionId = engine.openPositionFor(trader, p);
+
+        // Trader owns the position even though the router was msg.sender.
+        IPerpEngine.Position memory pos = engine.positionOf(positionId);
+        assertEq(pos.owner, trader);
+        assertGt(pos.size, 0);
+        assertEq(pos.collateral, p.collateralAmount);
+        assertEq(engine.positionIdOf(trader, SUBJECT_ID), positionId);
+    }
+
+    function test_OpenPositionFor_HappyPathShort() public {
+        address router = makeAddr("router");
+        _activateRouter(router);
+
+        IPerpEngine.OpenParams memory p = _baseOpenParams();
+        p.side = IPerpEngine.Side.SHORT;
+        vm.prank(router);
+        bytes32 positionId = engine.openPositionFor(trader, p);
+        IPerpEngine.Position memory pos = engine.positionOf(positionId);
+        assertLt(pos.size, 0);
+        assertEq(pos.owner, trader);
+    }
+
+    function test_OpenPositionFor_RevertsOnZeroTrader() public {
+        address router = makeAddr("router");
+        _activateRouter(router);
+        IPerpEngine.OpenParams memory p = _baseOpenParams();
+        vm.prank(router);
+        vm.expectRevert(IPerpEngine.InvalidConfig.selector);
+        engine.openPositionFor(address(0), p);
+    }
+
+    function test_OpenPositionFor_FundsComeFromTrader() public {
+        // The collateral + fee MUST be pulled from the trader (not the router). Verify by
+        // checking the trader's USDC balance drops by collateral + fee.
+        address router = makeAddr("router");
+        _activateRouter(router);
+
+        IPerpEngine.OpenParams memory p = _baseOpenParams();
+        uint256 fee = (p.sizeNotional * 750) / 1_000_000;
+        uint256 traderBalBefore = usdc.balanceOf(trader);
+        uint256 routerBalBefore = usdc.balanceOf(router);
+
+        vm.prank(router);
+        engine.openPositionFor(trader, p);
+
+        assertEq(usdc.balanceOf(trader), traderBalBefore - p.collateralAmount - fee);
+        // Router balance unchanged — it never touches funds.
+        assertEq(usdc.balanceOf(router), routerBalBefore);
+    }
+
+    function test_OpenPositionFor_UsesTraderKycTier() public {
+        // The KYC tier check applies to `trader`, not `msg.sender`. The router doesn't need a
+        // KYC tier; the trader does. Verify by stripping the router's KYC tier (it never had
+        // one) and confirming the call still succeeds — and reverts when the *trader* loses KYC.
+        address router = makeAddr("router");
+        _activateRouter(router);
+
+        IPerpEngine.OpenParams memory p = _baseOpenParams();
+        // Strip the trader's KYC tier — call MUST revert with KycTierMissing(trader).
+        vm.prank(kycWriter);
+        registry.setKycTier(trader, 0);
+
+        vm.prank(router);
+        vm.expectRevert(abi.encodeWithSelector(IPerpEngine.KycTierMissing.selector, trader));
+        engine.openPositionFor(trader, p);
+    }
+
+    function test_OpenPositionFor_RevertsAfterRouterRemoved() public {
+        address router = makeAddr("router");
+        _activateRouter(router);
+        vm.prank(governance);
+        engine.removeRouter(router);
+
+        IPerpEngine.OpenParams memory p = _baseOpenParams();
+        vm.prank(router);
+        vm.expectRevert(abi.encodeWithSelector(IPerpEngine.OnlyRouter.selector, router));
+        engine.openPositionFor(trader, p);
+    }
 }

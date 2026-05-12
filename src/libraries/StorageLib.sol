@@ -105,6 +105,14 @@ library PerpStorage {
         address liquidationEngine;
         address pendingLiquidationEngine;
         uint64 pendingLiquidationEngineActivatesAt;
+        // ---- APPENDED: Wave 7 PairTradeRouter wiring ----
+        // Trusted-router set. Routers may call `openPositionFor(trader, params)` to open a
+        // position on behalf of `trader`; the trader (not the router) is the position owner and
+        // the collateral debit/credit counterparty. Adds are timelocked (matches `markWriters`
+        // semantics — compromised governance can't grant a malicious router instant access).
+        // Removes are immediate (compromised router can be cut off without delay).
+        mapping(address router => bool) routers;
+        mapping(address router => uint64) pendingRouterActivatesAt;
     }
 
     function load() internal pure returns (Layout storage l) {
