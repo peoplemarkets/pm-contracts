@@ -70,8 +70,23 @@ interface IPerpEngine {
     ///         realized PnL on the closed slice.
     function closePosition(CloseParams calldata p) external returns (int256 realizedPnl);
 
+    /// @notice Trusted-router entrypoint: close (or partially close) the position owned by
+    ///         `trader` on `p.subjectId`. Caller MUST be in the `routers` set. Behaviour is
+    ///         identical to `closePosition` but the acting trader is the `trader` parameter
+    ///         rather than `msg.sender`.
+    function closePositionFor(address trader, CloseParams calldata p) external returns (int256 realizedPnl);
+
     function addCollateral(bytes32 subjectId, uint256 amount) external;
     function removeCollateral(bytes32 subjectId, uint256 amount) external;
+
+    /// @notice Trusted-router entrypoint: top up `trader`'s position. Caller MUST be a router.
+    ///         `positionId` MUST exist and be owned by `trader`.
+    function addCollateralFor(address trader, bytes32 positionId, uint256 amount) external;
+
+    /// @notice Trusted-router entrypoint: pull collateral from `trader`'s position. Caller MUST
+    ///         be a router. `positionId` MUST exist and be owned by `trader`; residual leverage +
+    ///         IM checks apply.
+    function removeCollateralFor(address trader, bytes32 positionId, uint256 amount) external;
 
     // ------------------------------------------------------------------------------------------
     // Permissioned writes

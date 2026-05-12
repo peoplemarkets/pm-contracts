@@ -2529,4 +2529,153 @@ contract PerpEngineTest is Test {
         vm.expectRevert(abi.encodeWithSelector(IPerpEngine.OnlyRouter.selector, router));
         engine.openPositionFor(trader, p);
     }
+
+    // ------------------------------------------------------------------------------------------
+    // closePositionFor — onlyRouter + behavioural parity with closePosition (Wave 6C)
+    // ------------------------------------------------------------------------------------------
+
+    function test_ClosePositionFor_RevertsOnNonRouter() public {
+        IPerpEngine.CloseParams memory cp = _baseCloseParams();
+        vm.prank(stranger);
+        vm.expectRevert(abi.encodeWithSelector(IPerpEngine.OnlyRouter.selector, stranger));
+        engine.closePositionFor(trader, cp);
+    }
+
+    function test_ClosePositionFor_HappyPath_FullClose() public {
+        // Seed: open via the router so trader owns a position the router can close.
+        address router = makeAddr("router");
+        _activateRouter(router);
+
+        IPerpEngine.OpenParams memory p = _baseOpenParams();
+        vm.prank(router);
+        bytes32 positionId = engine.openPositionFor(trader, p);
+
+        // Close via the router. Mark unchanged → realized PnL is 0.
+        IPerpEngine.CloseParams memory cp = _baseCloseParams();
+        vm.prank(router);
+        int256 pnl = engine.closePositionFor(trader, cp);
+
+        assertEq(pnl, int256(0));
+        IPerpEngine.Position memory pos = engine.positionOf(positionId);
+        assertEq(pos.size, 0);
+        assertEq(engine.positionIdOf(trader, SUBJECT_ID), bytes32(0));
+    }
+
+    function test_ClosePositionFor_HappyPath_PartialClose() public {
+        address router = makeAddr("router");
+        _activateRouter(router);
+
+        IPerpEngine.OpenParams memory p = _baseOpenParams();
+        vm.prank(router);
+        bytes32 positionId = engine.openPositionFor(trader, p);
+
+        IPerpEngine.CloseParams memory cp = _baseCloseParams();
+        cp.sizeFractionBps = 5_000; // 50% partial
+        vm.prank(router);
+        engine.closePositionFor(trader, cp);
+
+        IPerpEngine.Position memory pos = engine.positionOf(positionId);
+        assertEq(pos.collateral, p.collateralAmount / 2);
+    }
+
+    function test_ClosePositionFor_RevertsAfterRouterRemoved() public {
+        address router = makeAddr("router");
+        _activateRouter(router);
+        // Seed a position for the trader.
+        IPerpEngine.OpenParams memory p = _baseOpenParams();
+        vm.prank(router);
+        engine.openPositionFor(trader, p);
+
+        vm.prank(governance);
+        engine.removeRouter(router);
+
+        IPerpEngine.CloseParams memory cp = _baseCloseParams();
+        vm.prank(router);
+        vm.expectRevert(abi.encodeWithSelector(IPerpEngine.OnlyRouter.selector, router));
+        engine.closePositionFor(trader, cp);
+    }
+
+    function test_ClosePositionFor_RevertsOnNoPosition() public {
+        address router = makeAddr("router");
+        _activateRouter(router);
+
+        IPerpEngine.CloseParams memory cp = _baseCloseParams();
+        vm.prank(router);
+        vm.expectRevert(abi.encodeWithSelector(IPerpEngine.PositionNotOpen.selector, SUBJECT_ID));
+        engine.closePositionFor(trader, cp);
+    }
+
+    // ------------------------------------------------------------------------------------------
+    // addCollateralFor / removeCollateralFor — onlyRouter + happy paths (Wave 6C)
+    // ------------------------------------------------------------------------------------------
+
+    function test_AddCollateralFor_RevertsOnNonRouter() public {
+        bytes32 positionId = _open(_baseOpenParams());
+        vm.prank(stranger);
+        vm.expectRevert(abi.encodeWithSelector(IPerpEngine.OnlyRouter.selector, stranger));
+        engine.addCollateralFor(trader, positionId, 1_000 * ONE_USDC);
+    }
+
+    function test_AddCollateralFor_HappyPath() public {
+        address router = makeAddr("router");
+        _activateRouter(router);
+        IPerpEngine.OpenParams memory p = _baseOpenParams();
+        vm.prank(router);
+        bytes32 positionId = engine.openPositionFor(trader, p);
+
+        vm.prank(router);
+        engine.addCollateralFor(trader, positionId, 5_000 * ONE_USDC);
+
+        IPerpEngine.Position memory pos = engine.positionOf(positionId);
+        assertEq(pos.collateral, 15_000 * ONE_USDC);
+    }
+
+    function test_AddCollateralFor_RevertsOnTraderNotOwner() public {
+        // A position owned by `trader` cannot be topped up under a different trader address.
+        address router = makeAddr("router");
+        _activateRouter(router);
+        bytes32 positionId = _open(_baseOpenParams());
+
+        vm.prank(router);
+        vm.expectRevert(abi.encodeWithSelector(IPerpEngine.PositionNotOpen.selector, SUBJECT_ID));
+        engine.addCollateralFor(trader2, positionId, 1_000 * ONE_USDC);
+    }
+
+    function test_RemoveCollateralFor_RevertsOnNonRouter() public {
+        bytes32 positionId = _open(_baseOpenParams());
+        vm.prank(stranger);
+        vm.expectRevert(abi.encodeWithSelector(IPerpEngine.OnlyRouter.selector, stranger));
+        engine.removeCollateralFor(trader, positionId, 1_000 * ONE_USDC);
+    }
+
+    function test_RemoveCollateralFor_HappyPath() public {
+        address router = makeAddr("router");
+        _activateRouter(router);
+
+        // Open with extra collateral so we can pull some without breaking IM.
+        IPerpEngine.OpenParams memory p = _baseOpenParams();
+        p.collateralAmount = 20_000 * ONE_USDC;
+        vm.prank(router);
+        bytes32 positionId = engine.openPositionFor(trader, p);
+
+        uint256 traderBefore = usdc.balanceOf(trader);
+        vm.prank(router);
+        engine.removeCollateralFor(trader, positionId, 9_000 * ONE_USDC);
+
+        IPerpEngine.Position memory pos = engine.positionOf(positionId);
+        assertEq(pos.collateral, 11_000 * ONE_USDC);
+        assertEq(usdc.balanceOf(trader) - traderBefore, 9_000 * ONE_USDC);
+    }
+
+    function test_RemoveCollateralFor_RevertsOnTraderNotOwner() public {
+        address router = makeAddr("router");
+        _activateRouter(router);
+        IPerpEngine.OpenParams memory p = _baseOpenParams();
+        p.collateralAmount = 20_000 * ONE_USDC;
+        bytes32 positionId = _open(p);
+
+        vm.prank(router);
+        vm.expectRevert(abi.encodeWithSelector(IPerpEngine.PositionNotOpen.selector, SUBJECT_ID));
+        engine.removeCollateralFor(trader2, positionId, 1_000 * ONE_USDC);
+    }
 }

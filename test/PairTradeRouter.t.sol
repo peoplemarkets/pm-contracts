@@ -329,10 +329,7 @@ contract PairTradeRouterTest is Test {
 
         _openPair(p);
 
-        assertEq(
-            usdc.balanceOf(trader),
-            traderBalBefore - p.longCollateral - p.shortCollateral - longFee - shortFee
-        );
+        assertEq(usdc.balanceOf(trader), traderBalBefore - p.longCollateral - p.shortCollateral - longFee - shortFee);
         // Router never touches funds.
         assertEq(usdc.balanceOf(address(router)), routerBalBefore);
     }
@@ -346,10 +343,7 @@ contract PairTradeRouterTest is Test {
 
         _openPair(p);
 
-        assertEq(
-            usdc.balanceOf(trader),
-            traderBalBefore - p.longCollateral - p.shortCollateral - longFee - shortFee
-        );
+        assertEq(usdc.balanceOf(trader), traderBalBefore - p.longCollateral - p.shortCollateral - longFee - shortFee);
     }
 
     // ------------------------------------------------------------------------------------------
@@ -658,4 +652,3 @@ contract PairTradeRouterTest is Test {
         assertEq(router.perpEngine(), address(engine));
     }
 }
-

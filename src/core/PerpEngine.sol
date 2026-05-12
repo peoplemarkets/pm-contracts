@@ -8,6 +8,7 @@ import {UUPSUpgradeable} from "@openzeppelin/contracts-upgradeable/proxy/utils/U
 
 import {ReentrancyGuard} from "solady/utils/ReentrancyGuard.sol";
 
+import {PerpInternals} from "../libraries/PerpInternals.sol";
 import {PositionMath} from "../libraries/PositionMath.sol";
 import {FundingStorage, PerpStorage} from "../libraries/StorageLib.sol";
 import {ISubjectRegistry} from "../registry/ISubjectRegistry.sol";
@@ -282,6 +283,29 @@ contract PerpEngine is Initializable, UUPSUpgradeable, ReentrancyGuard, IPerpEng
 
     /// @inheritdoc IPerpEngine
     function closePosition(CloseParams calldata p) external nonReentrant returns (int256 realizedPnl) {
+        return _closePositionFor(msg.sender, p);
+    }
+
+    /// @inheritdoc IPerpEngine
+    /// @dev Wave 6C. Trusted-router entrypoint. Body delegates to the same internal helper used by
+    ///      `closePosition` with `trader` replacing `msg.sender`. Caller MUST be a registered router.
+    ///      Zero-trader is implicitly rejected: `openPositionId[address(0)][...]` is always zero,
+    ///      so the `PositionNotOpen` revert in the shared helper handles it.
+    function closePositionFor(
+        address trader,
+        CloseParams calldata p
+    )
+        external
+        nonReentrant
+        onlyRouter
+        returns (int256 realizedPnl)
+    {
+        return _closePositionFor(trader, p);
+    }
+
+    /// @dev Shared close-path implementation. Both `closePosition` and `closePositionFor` route
+    ///      here so semantics stay in lockstep.
+    function _closePositionFor(address trader, CloseParams calldata p) internal returns (int256 realizedPnl) {
         PerpStorage.Layout storage perpS = PerpStorage.load();
 
         if (perpS.globalHalt) revert GlobalHaltedError();
@@ -293,7 +317,7 @@ contract PerpEngine is Initializable, UUPSUpgradeable, ReentrancyGuard, IPerpEng
         // the live mark are no longer meaningful — traders must use `closeAtForcedSettlement`.
         if (perpS.subjectForceSettled[p.subjectId]) revert SubjectIsForceSettled(p.subjectId);
 
-        bytes32 positionId = perpS.openPositionId[msg.sender][p.subjectId];
+        bytes32 positionId = perpS.openPositionId[trader][p.subjectId];
         if (positionId == bytes32(0)) revert PositionNotOpen(p.subjectId);
 
         // Closes are allowed during subject pauses (wind-down) — only globalHalt blocks them.
@@ -306,7 +330,7 @@ contract PerpEngine is Initializable, UUPSUpgradeable, ReentrancyGuard, IPerpEng
         // Update position state.
         if (v.fullClose) {
             delete perpS.positions[positionId];
-            delete perpS.openPositionId[msg.sender][p.subjectId];
+            delete perpS.openPositionId[trader][p.subjectId];
         } else {
             // Partial close locks in PnL via realizedPnl; entryPrice is unchanged so the residual
             // continues to reference the original entry.
@@ -328,18 +352,18 @@ contract PerpEngine is Initializable, UUPSUpgradeable, ReentrancyGuard, IPerpEng
         // pointer, but unwinds must always succeed.
         if (perpS.marginEngine != address(0)) {
             IMarginEngine(perpS.marginEngine).recordCloseDelta(
-                msg.sender, _categoryOf(perpS, p.subjectId), v.openingNotionalDelta, v.isLong
+                trader, _categoryOf(perpS, p.subjectId), v.openingNotionalDelta, v.isLong
             );
         }
 
         ILPVault(perpS.lpVault).settlePosition(
-            msg.sender, v.closeCollateral, v.realizedPnl, v.fee, v.lpRebate, v.insuranceShare
+            trader, v.closeCollateral, v.realizedPnl, v.fee, v.lpRebate, v.insuranceShare
         );
 
         // Tier-1 funding event stub: FundingEngine v1 has not shipped, so the funding debt at
         // close is 0. The event is wired today so indexers can subscribe without a redeploy.
-        emit FundingSettled(positionId, msg.sender, int256(0));
-        emit PositionClosed(positionId, msg.sender, p.subjectId, v.realizedPnl, v.fee, v.returned, v.fullClose);
+        emit FundingSettled(positionId, trader, int256(0));
+        emit PositionClosed(positionId, trader, p.subjectId, v.realizedPnl, v.fee, v.returned, v.fullClose);
         return v.realizedPnl;
     }
 
@@ -466,31 +490,64 @@ contract PerpEngine is Initializable, UUPSUpgradeable, ReentrancyGuard, IPerpEng
 
     /// @inheritdoc IPerpEngine
     function addCollateral(bytes32 subjectId, uint256 amount) external nonReentrant {
+        _addCollateralFor(msg.sender, subjectId, amount);
+    }
+
+    /// @inheritdoc IPerpEngine
+    /// @dev Wave 6C. Trusted-router entrypoint. `positionId` MUST be owned by `trader`.
+    function addCollateralFor(address trader, bytes32 positionId, uint256 amount) external nonReentrant onlyRouter {
+        _addCollateralFor(trader, _subjectIdForOwner(trader, positionId), amount);
+    }
+
+    /// @dev Shared add-collateral helper. `subjectId` looks up the open position for `trader`.
+    function _addCollateralFor(address trader, bytes32 subjectId, uint256 amount) internal {
         if (amount == 0) revert AmountZero();
         PerpStorage.Layout storage perpS = PerpStorage.load();
         if (perpS.globalHalt) revert GlobalHaltedError();
         if (perpS.subjectForceSettled[subjectId]) revert SubjectIsForceSettled(subjectId);
 
-        bytes32 positionId = perpS.openPositionId[msg.sender][subjectId];
+        bytes32 positionId = perpS.openPositionId[trader][subjectId];
         if (positionId == bytes32(0)) revert PositionNotOpen(subjectId);
 
         Position storage pos = perpS.positions[positionId];
         pos.collateral += amount;
         pos.lastInteractionAt = uint64(block.timestamp);
 
-        ILPVault(perpS.lpVault).lockCollateral(msg.sender, amount);
+        ILPVault(perpS.lpVault).lockCollateral(trader, amount);
 
         emit CollateralAdded(positionId, amount, pos.collateral);
     }
 
     /// @inheritdoc IPerpEngine
     function removeCollateral(bytes32 subjectId, uint256 amount) external nonReentrant {
+        _removeCollateralFor(msg.sender, subjectId, amount);
+    }
+
+    /// @inheritdoc IPerpEngine
+    /// @dev Wave 6C. Trusted-router entrypoint. `positionId` MUST be owned by `trader`.
+    function removeCollateralFor(address trader, bytes32 positionId, uint256 amount) external nonReentrant onlyRouter {
+        _removeCollateralFor(trader, _subjectIdForOwner(trader, positionId), amount);
+    }
+
+    /// @dev Resolve `positionId`'s subject and reject mismatches (positionId not owned by
+    ///      `trader` or pointing at a closed slot). Shared between router add/remove paths so
+    ///      both reuse a single revert site.
+    function _subjectIdForOwner(address trader, bytes32 positionId) internal view returns (bytes32) {
+        Position storage pos = PerpStorage.load().positions[positionId];
+        bytes32 subjectId = pos.subjectId;
+        if (pos.owner != trader || pos.size == 0) revert PositionNotOpen(subjectId);
+        return subjectId;
+    }
+
+    /// @dev Shared remove-collateral helper. Recomputes IM on the residual so withdrawals never
+    ///      leave a position teetering above maintenance margin.
+    function _removeCollateralFor(address trader, bytes32 subjectId, uint256 amount) internal {
         if (amount == 0) revert AmountZero();
         PerpStorage.Layout storage perpS = PerpStorage.load();
         if (perpS.globalHalt) revert GlobalHaltedError();
         if (perpS.subjectForceSettled[subjectId]) revert SubjectIsForceSettled(subjectId);
 
-        bytes32 positionId = perpS.openPositionId[msg.sender][subjectId];
+        bytes32 positionId = perpS.openPositionId[trader][subjectId];
         if (positionId == bytes32(0)) revert PositionNotOpen(subjectId);
 
         Position storage pos = perpS.positions[positionId];
@@ -518,7 +575,7 @@ contract PerpEngine is Initializable, UUPSUpgradeable, ReentrancyGuard, IPerpEng
         pos.collateral = newCollateral;
         pos.lastInteractionAt = uint64(block.timestamp);
 
-        ILPVault(perpS.lpVault).releaseCollateral(msg.sender, amount);
+        ILPVault(perpS.lpVault).releaseCollateral(trader, amount);
 
         emit CollateralRemoved(positionId, amount, newCollateral);
     }
@@ -552,73 +609,11 @@ contract PerpEngine is Initializable, UUPSUpgradeable, ReentrancyGuard, IPerpEng
         nonReentrant
         onlyLiquidationEngine
     {
-        if (sizeToClose == 0) revert LiquidationSizeZero();
-        PerpStorage.Layout storage perpS = PerpStorage.load();
-        Position memory pos = perpS.positions[positionId];
-        if (pos.size == 0) revert PositionNotOpen(pos.subjectId);
-
-        // Sign-match: sizeToClose must share sign with pos.size. Magnitude must be in (0, |pos.size|].
-        bool isLong = pos.size > 0;
-        if ((isLong && sizeToClose <= 0) || (!isLong && sizeToClose >= 0)) {
-            revert LiquidationSizeMismatch(pos.size, sizeToClose);
-        }
-        uint256 absClose = sizeToClose > 0 ? uint256(sizeToClose) : uint256(-sizeToClose);
-        uint256 absPos = isLong ? uint256(pos.size) : uint256(-pos.size);
-        if (absClose > absPos) revert LiquidationSizeMismatch(pos.size, sizeToClose);
-        bool fullClose = absClose == absPos;
-
-        // Collateral release: proportional to size reduction on partials, full on full.
-        uint256 collateralReleased;
-        if (fullClose) {
-            collateralReleased = pos.collateral;
-        } else {
-            collateralReleased = (pos.collateral * absClose) / absPos;
-        }
-        if (collateralToReturn > collateralReleased) {
-            // Defensive: the engine cannot release more than the slice's collateral share. A
-            // mismatch here is a LiquidationEngine bug. Use InvalidConfig as a catch-all.
-            revert InvalidConfig();
-        }
-
-        // OI delta uses opening notional on the slice. `entryPrice` is the position's recorded
-        // entry; the close uses the SAME slice-of-entry-notional accounting as `_computeCloseValues`.
-        uint256 openingNotionalDelta = (absClose * pos.entryPrice) / ONE;
-
-        // ---- State mutations BEFORE the external call (CEI). ----
-        if (fullClose) {
-            delete perpS.positions[positionId];
-            delete perpS.openPositionId[pos.owner][pos.subjectId];
-        } else {
-            Position storage stored = perpS.positions[positionId];
-            // Signed subtract — `sizeToClose` shares sign with `pos.size`, so the residual
-            // shrinks in magnitude without flipping sign.
-            stored.size = pos.size - sizeToClose;
-            stored.collateral = pos.collateral - collateralReleased;
-            stored.lastInteractionAt = uint64(block.timestamp);
-        }
-
-        if (isLong) {
-            perpS.totalLongOI[pos.subjectId] -= openingNotionalDelta;
-        } else {
-            perpS.totalShortOI[pos.subjectId] -= openingNotionalDelta;
-        }
-        if (perpS.marginEngine != address(0)) {
-            IMarginEngine(perpS.marginEngine).recordCloseDelta(
-                pos.owner, _categoryOf(perpS, pos.subjectId), openingNotionalDelta, isLong
-            );
-        }
-
-        // ---- Vault settle: 3-way payout via dedicated `settleLiquidation` path. ----
-        // The vault routes `collateralToReturn` to the trader and `bountyToPay` to the liquidator
-        // atomically; the `signedPnl` is the slice's net pnl on the LP side. The LiquidationEngine
-        // has already pre-drawn `InsuranceFund` for any shortfall, so the vault has the USDC to
-        // cover both legs out of `freeAssets`.
-        ILPVault(perpS.lpVault).settleLiquidation(
-            pos.owner, liquidator, collateralReleased, collateralToReturn, bountyToPay, signedPnl
-        );
-
-        emit PositionLiquidated(
-            positionId, pos.owner, liquidator, sizeToClose, collateralToReturn, bountyToPay, signedPnl, tierCode
+        // Body extracted to `PerpInternals.liquidateClose` to keep this contract under the
+        // 24,576-byte EIP-170 runtime cap. Public library function is linked at deploy and
+        // entered via DELEGATECALL — namespaced storage + msg.sender resolve unchanged.
+        PerpInternals.liquidateClose(
+            positionId, sizeToClose, collateralToReturn, bountyToPay, signedPnl, liquidator, tierCode
         );
     }
 
