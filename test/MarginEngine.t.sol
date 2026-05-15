@@ -839,4 +839,95 @@ contract MarginEngineTest is Test {
         vm.prank(governance);
         marginEngine.upgradeToAndCall(address(newImpl), "");
     }
+
+    // ------------------------------------------------------------------------------------------
+    // Wave 7 audit Fix #7 — seedNetCategoryOi (one-shot rotation helper)
+    //
+    // The seed is intended for the rotation flow: deploy fresh MarginEngine → governance
+    // computes off-chain reconciliation of the live position set → seed accumulator → activate
+    // rotation. The `seeded` flag is one-shot to prevent the accumulator from being rebased
+    // after live use.
+    // ------------------------------------------------------------------------------------------
+
+    function test_Wave7Fix7_SeedNetCategoryOi_HappyPath() public {
+        // Spin up a fresh MarginEngine — the existing `marginEngine` in setUp has already been
+        // wired into PerpEngine, so we use a fresh proxy to exercise the rotation seed in
+        // isolation.
+        MarginEngine implFresh = new MarginEngine();
+        bytes memory initData = abi.encodeCall(MarginEngine.initialize, (governance, address(engine), TIMELOCK_DELAY));
+        MarginEngine fresh = MarginEngine(address(new ERC1967Proxy(address(implFresh), initData)));
+        assertFalse(fresh.seeded());
+
+        bytes32[] memory ids = new bytes32[](2);
+        ids[0] = CATEGORY_ID;
+        ids[1] = CATEGORY_ID_ALT;
+        int256[] memory vals = new int256[](2);
+        vals[0] = int256(123 * int256(ONE_USDC));
+        vals[1] = -int256(456 * int256(ONE_USDC));
+
+        vm.expectEmit(true, false, false, true, address(fresh));
+        emit IMarginEngine.NetCategoryOiSeeded(CATEGORY_ID, vals[0]);
+        vm.expectEmit(true, false, false, true, address(fresh));
+        emit IMarginEngine.NetCategoryOiSeeded(CATEGORY_ID_ALT, vals[1]);
+        vm.expectEmit(false, false, false, false, address(fresh));
+        emit IMarginEngine.SeedingFinalized();
+        vm.prank(governance);
+        fresh.seedNetCategoryOi(ids, vals);
+
+        assertTrue(fresh.seeded());
+        assertEq(fresh.netCategoryOiOf(CATEGORY_ID), vals[0]);
+        assertEq(fresh.netCategoryOiOf(CATEGORY_ID_ALT), vals[1]);
+    }
+
+    function test_Wave7Fix7_SeedNetCategoryOi_RevertOnSecondCall() public {
+        MarginEngine implFresh = new MarginEngine();
+        bytes memory initData = abi.encodeCall(MarginEngine.initialize, (governance, address(engine), TIMELOCK_DELAY));
+        MarginEngine fresh = MarginEngine(address(new ERC1967Proxy(address(implFresh), initData)));
+
+        bytes32[] memory ids = new bytes32[](1);
+        ids[0] = CATEGORY_ID;
+        int256[] memory vals = new int256[](1);
+        vals[0] = int256(1);
+
+        vm.prank(governance);
+        fresh.seedNetCategoryOi(ids, vals);
+
+        vm.prank(governance);
+        vm.expectRevert(IMarginEngine.AlreadySeeded.selector);
+        fresh.seedNetCategoryOi(ids, vals);
+    }
+
+    function test_Wave7Fix7_SeedNetCategoryOi_RevertOnMismatchedLengths() public {
+        MarginEngine implFresh = new MarginEngine();
+        bytes memory initData = abi.encodeCall(MarginEngine.initialize, (governance, address(engine), TIMELOCK_DELAY));
+        MarginEngine fresh = MarginEngine(address(new ERC1967Proxy(address(implFresh), initData)));
+
+        bytes32[] memory ids = new bytes32[](2);
+        ids[0] = CATEGORY_ID;
+        ids[1] = CATEGORY_ID_ALT;
+        int256[] memory vals = new int256[](1);
+        vals[0] = int256(1);
+
+        vm.prank(governance);
+        vm.expectRevert(IMarginEngine.InvalidConfig.selector);
+        fresh.seedNetCategoryOi(ids, vals);
+
+        // Flag must remain false on revert.
+        assertFalse(fresh.seeded());
+    }
+
+    function test_Wave7Fix7_SeedNetCategoryOi_RevertOnNonGovernance() public {
+        MarginEngine implFresh = new MarginEngine();
+        bytes memory initData = abi.encodeCall(MarginEngine.initialize, (governance, address(engine), TIMELOCK_DELAY));
+        MarginEngine fresh = MarginEngine(address(new ERC1967Proxy(address(implFresh), initData)));
+
+        bytes32[] memory ids = new bytes32[](1);
+        ids[0] = CATEGORY_ID;
+        int256[] memory vals = new int256[](1);
+        vals[0] = int256(1);
+
+        vm.prank(stranger);
+        vm.expectRevert(abi.encodeWithSelector(IMarginEngine.Unauthorized.selector, stranger));
+        fresh.seedNetCategoryOi(ids, vals);
+    }
 }

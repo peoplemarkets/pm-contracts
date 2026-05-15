@@ -1536,4 +1536,125 @@ contract LPVaultTest is Test {
         assertEq(vault.insuranceFundBalance(), 500_000 * ONE_USDC);
         assertEq(vault.insuranceFund(), address(0));
     }
+
+    // ------------------------------------------------------------------------------------------
+    // Wave 7 audit Fix #1 — settleLiquidation solvency check ordering
+    //
+    // The pre-fix solvency probe ran AFTER `s.positionCollateral -= collateralReleased`. The
+    // just-freed collateral inflated `freeAssets()` and let the check pass when the vault
+    // genuinely could not cover the deficit — leaving `insuranceFundBalance` + `accruedFees`
+    // as phantom claims. Post-fix the probe runs BEFORE the decrement; the scenario below
+    // reverts with `InsufficientFreeAssetsForLiquidation`.
+    // ------------------------------------------------------------------------------------------
+
+    function test_Wave7Fix1_SettleLiquidation_RevertsWhenFreeAssetsCannotCoverDeficit() public {
+        // Construct the exact scenario from the audit: balance=200, positionCollateral=100,
+        // insuranceFundBalance=100, accruedFees=0 → freeAssets (pre-decrement) = 0.
+        //
+        // The vault state is built directly via setUp helpers: open a 100-USDC position to
+        // populate positionCollateral=100, seed insurance to 100, then mint nothing extra so
+        // balance == 200. positionCollateral + insuranceFundBalance == balance ⇒ freeAssets = 0.
+        vm.prank(perpEngine);
+        vault.openPositionFlow(trader, 100 * ONE_USDC, 0, 0, 0);
+
+        usdc.mint(governance, 100 * ONE_USDC);
+        vm.prank(governance);
+        usdc.approve(address(vault), type(uint256).max);
+        vm.prank(governance);
+        vault.seedInsurance(100 * ONE_USDC);
+
+        assertEq(vault.positionCollateral(), 100 * ONE_USDC);
+        assertEq(vault.insuranceFundBalance(), 100 * ONE_USDC);
+        assertEq(vault.accruedFees(), 0);
+        assertEq(vault.freeAssets(), 0);
+        assertEq(usdc.balanceOf(address(vault)), 200 * ONE_USDC);
+
+        // settleLiquidation with collateralReleased=100, traderPayout=0, liquidatorBounty=200,
+        // signedPnl=+100. Payout-conservation: 0 + 200 == 100 + 100 ✓.
+        // Deficit = (0+200) − 100 = 100 USDC. Pre-fix freeAssets POST-decrement would have been
+        // 100 (the just-freed collateral) and the check would silently pass, draining the
+        // insurance bucket. Post-fix freeAssets PRE-decrement is 0 and the call reverts.
+        address liquidator = makeAddr("liquidator");
+        vm.prank(perpEngine);
+        vm.expectRevert(
+            abi.encodeWithSelector(
+                ILPVault.InsufficientFreeAssetsForLiquidation.selector, 100 * ONE_USDC, uint256(0)
+            )
+        );
+        vault.settleLiquidation(trader, liquidator, 100 * ONE_USDC, 0, 200 * ONE_USDC, int256(100 * ONE_USDC));
+
+        // Defensive: state was not mutated.
+        assertEq(vault.positionCollateral(), 100 * ONE_USDC);
+        assertEq(vault.insuranceFundBalance(), 100 * ONE_USDC);
+    }
+
+    function test_Wave7Fix1_SettleLiquidation_HappyPathStillWorks() public {
+        // Sanity: with sufficient freeAssets, the path still completes.
+        vm.prank(alice);
+        vault.deposit(USDC_1M, alice); // freeAssets += 1M
+        vm.prank(perpEngine);
+        vault.openPositionFlow(trader, 100 * ONE_USDC, 0, 0, 0);
+
+        address liquidator = makeAddr("liquidator");
+        // collateralReleased=100, traderPayout=0, bounty=200, pnl=+100 (LP loses 100).
+        // freeAssets is 1M so the deficit of 100 is comfortably covered.
+        vm.prank(perpEngine);
+        vault.settleLiquidation(trader, liquidator, 100 * ONE_USDC, 0, 200 * ONE_USDC, int256(100 * ONE_USDC));
+
+        assertEq(vault.positionCollateral(), 0);
+        assertEq(usdc.balanceOf(liquidator), 200 * ONE_USDC);
+    }
+
+    // ------------------------------------------------------------------------------------------
+    // Wave 7 audit Fix #5 — insurance cap denominator
+    //
+    // Pre-fix the cap used `totalAssets()` (= freeAssets). At high utilisation that collapsed
+    // and effectively blocked further insurance accrual — exactly when reserves should grow.
+    // Post-fix the denominator is `balance(USDC) − accruedFees`, so positionCollateral counts
+    // as real backing for real exposure.
+    // ------------------------------------------------------------------------------------------
+
+    function test_Wave7Fix5_InsuranceCap_DenominatorIsFullVaultMinusAccruedFees() public {
+        // Build a high-utilisation snapshot. LP deposits a small float (100k); a trader then
+        // posts 900k of collateral via openPositionFlow. Post-flow: balance = 1M, positionCollateral
+        // = 900k, freeAssets = 100k. So the cap denominator difference is 10× between pre-fix
+        // (freeAssets = 100k → cap = 10k) and post-fix (balance − accruedFees = 1M → cap = 100k).
+        vm.prank(alice);
+        vault.deposit(100_000 * ONE_USDC, alice);
+        vm.prank(perpEngine);
+        vault.openPositionFlow(trader, 900_000 * ONE_USDC, 0, 0, 0);
+
+        assertEq(vault.positionCollateral(), 900_000 * ONE_USDC);
+        // freeAssets is the small pool; balance − accruedFees is the full vault.
+        assertEq(vault.freeAssets(), 100_000 * ONE_USDC);
+        assertEq(usdc.balanceOf(address(vault)), 1_000_000 * ONE_USDC);
+
+        // Seed insurance up to 99k — this exceeds the OLD cap (~10k against freeAssets) and would
+        // have been redirected to the share pool; the seed path itself bypasses _accrueInsuranceCapped,
+        // but it lets us position the bookkeeper just under the NEW cap (~100k against balance).
+        usdc.mint(governance, 99_000 * ONE_USDC);
+        vm.prank(governance);
+        usdc.approve(address(vault), type(uint256).max);
+        vm.prank(governance);
+        vault.seedInsurance(99_000 * ONE_USDC);
+
+        // Trigger a fresh accrual that, under the OLD denominator, would have been fully redirected
+        // (cap of 10k already exceeded by the 99k seed); under the NEW denominator there is room
+        // (cap ≈ 100k post-flow, bookkeeper 99k → room ≈ 1k → the 800-USDC accrual fits).
+        //
+        // Note: openPositionFlow itself pulls (collat + fee) from the trader, which grows balance
+        // and therefore grows the denominator further. Cap math is recomputed inside
+        // _accrueInsuranceCapped against the post-pull balance. The 800-USDC share fits cleanly.
+        uint256 collat = 1_000 * ONE_USDC;
+        uint256 fee = 1_500 * ONE_USDC;
+        uint256 lpRebate = 500 * ONE_USDC;
+        uint256 insurance = 800 * ONE_USDC;
+        vm.prank(perpEngine);
+        vault.openPositionFlow(trader, collat, fee, lpRebate, insurance);
+
+        // Post-fix bookkeeper grew by the full 800 USDC: 99k + 800 = 99_800. Pre-fix it would
+        // have stayed at 99k (capped against the freeAssets denominator that doesn't grow with
+        // positionCollateral).
+        assertEq(vault.insuranceFundBalance(), 99_800 * ONE_USDC);
+    }
 }

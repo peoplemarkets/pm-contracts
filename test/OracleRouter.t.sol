@@ -565,4 +565,152 @@ contract OracleRouterTest is Test {
         router.setDegraded(METRIC_ID, false, bytes32(0));
         assertFalse(router.configOf(METRIC_ID).degraded);
     }
+
+    // ------------------------------------------------------------------------------------------
+    // Wave 7 audit Fix #3 — governance transfer (timelocked) + operator rotation (immediate)
+    // ------------------------------------------------------------------------------------------
+
+    function test_Wave7Fix3_ProposeGovernanceTransfer_HappyPath() public {
+        address newGov = makeAddr("newGov");
+        uint64 expectedAt = uint64(block.timestamp + TIMELOCK_DELAY);
+        vm.expectEmit(true, false, false, true, address(router));
+        emit IOracleRouter.GovernanceTransferProposed(newGov, expectedAt);
+        vm.prank(governance);
+        router.proposeGovernanceTransfer(newGov);
+        (address pending, uint64 readyAt) = router.pendingGovernance();
+        assertEq(pending, newGov);
+        assertEq(readyAt, expectedAt);
+    }
+
+    function test_Wave7Fix3_ProposeGovernanceTransfer_RevertOnZero() public {
+        vm.prank(governance);
+        vm.expectRevert(IOracleRouter.InvalidConfig.selector);
+        router.proposeGovernanceTransfer(address(0));
+    }
+
+    function test_Wave7Fix3_ProposeGovernanceTransfer_RevertOnNonGovernance() public {
+        vm.prank(stranger);
+        vm.expectRevert(abi.encodeWithSelector(IOracleRouter.Unauthorized.selector, stranger));
+        router.proposeGovernanceTransfer(makeAddr("foo"));
+    }
+
+    function test_Wave7Fix3_ProposeGovernanceTransfer_RevertOnPendingExists() public {
+        vm.prank(governance);
+        router.proposeGovernanceTransfer(makeAddr("foo"));
+        vm.prank(governance);
+        vm.expectRevert(IOracleRouter.PendingGovernanceTransferExists.selector);
+        router.proposeGovernanceTransfer(makeAddr("bar"));
+    }
+
+    function test_Wave7Fix3_ActivateGovernanceTransfer_HappyPath() public {
+        address newGov = makeAddr("newGov");
+        vm.prank(governance);
+        router.proposeGovernanceTransfer(newGov);
+        vm.warp(block.timestamp + TIMELOCK_DELAY);
+        vm.expectEmit(true, true, false, true, address(router));
+        emit IOracleRouter.GovernanceTransferActivated(governance, newGov);
+        router.activateGovernanceTransfer();
+        assertEq(router.governance(), newGov);
+        (address pending, uint64 readyAt) = router.pendingGovernance();
+        assertEq(pending, address(0));
+        assertEq(readyAt, 0);
+    }
+
+    function test_Wave7Fix3_ActivateGovernanceTransfer_RevertBeforeTimelock() public {
+        vm.prank(governance);
+        router.proposeGovernanceTransfer(makeAddr("foo"));
+        vm.expectRevert(
+            abi.encodeWithSelector(
+                IOracleRouter.GovernanceTimelockNotElapsed.selector, uint64(block.timestamp + TIMELOCK_DELAY)
+            )
+        );
+        router.activateGovernanceTransfer();
+    }
+
+    function test_Wave7Fix3_ActivateGovernanceTransfer_RevertWhenNoPending() public {
+        vm.expectRevert(IOracleRouter.NoPendingGovernanceTransfer.selector);
+        router.activateGovernanceTransfer();
+    }
+
+    function test_Wave7Fix3_CancelGovernanceTransfer_HappyPath() public {
+        address newGov = makeAddr("newGov");
+        vm.prank(governance);
+        router.proposeGovernanceTransfer(newGov);
+        vm.expectEmit(true, false, false, true, address(router));
+        emit IOracleRouter.GovernanceTransferCancelled(newGov);
+        vm.prank(governance);
+        router.cancelGovernanceTransfer();
+        (address pending, uint64 readyAt) = router.pendingGovernance();
+        assertEq(pending, address(0));
+        assertEq(readyAt, 0);
+    }
+
+    function test_Wave7Fix3_CancelGovernanceTransfer_RevertOnNonGovernance() public {
+        vm.prank(governance);
+        router.proposeGovernanceTransfer(makeAddr("foo"));
+        vm.prank(stranger);
+        vm.expectRevert(abi.encodeWithSelector(IOracleRouter.Unauthorized.selector, stranger));
+        router.cancelGovernanceTransfer();
+    }
+
+    function test_Wave7Fix3_CancelGovernanceTransfer_RevertWhenNoPending() public {
+        vm.prank(governance);
+        vm.expectRevert(IOracleRouter.NoPendingGovernanceTransfer.selector);
+        router.cancelGovernanceTransfer();
+    }
+
+    function test_Wave7Fix3_PostTransfer_NewGovCanConfigure() public {
+        address newGov = makeAddr("newGov");
+        vm.prank(governance);
+        router.proposeGovernanceTransfer(newGov);
+        vm.warp(block.timestamp + TIMELOCK_DELAY);
+        router.activateGovernanceTransfer();
+
+        // The old governance must no longer be able to configure.
+        vm.prank(governance);
+        vm.expectRevert(abi.encodeWithSelector(IOracleRouter.Unauthorized.selector, governance));
+        router.proposeRegister(keccak256("other"), _baseConfig());
+
+        // The new governance can.
+        vm.prank(newGov);
+        router.proposeRegister(keccak256("other"), _baseConfig());
+    }
+
+    function test_Wave7Fix3_SetOperator_HappyPath() public {
+        address newOp = makeAddr("newOp");
+        vm.expectEmit(true, true, false, true, address(router));
+        emit IOracleRouter.OperatorSet(operator, newOp);
+        vm.prank(governance);
+        router.setOperator(newOp);
+        assertEq(router.operator(), newOp);
+    }
+
+    function test_Wave7Fix3_SetOperator_RevertOnZero() public {
+        vm.prank(governance);
+        vm.expectRevert(IOracleRouter.InvalidConfig.selector);
+        router.setOperator(address(0));
+    }
+
+    function test_Wave7Fix3_SetOperator_RevertOnNonGovernance() public {
+        vm.prank(stranger);
+        vm.expectRevert(abi.encodeWithSelector(IOracleRouter.Unauthorized.selector, stranger));
+        router.setOperator(makeAddr("foo"));
+    }
+
+    function test_Wave7Fix3_SetOperator_NewOperatorCanSetDegraded() public {
+        _registerMetric();
+        address newOp = makeAddr("newOp");
+        vm.prank(governance);
+        router.setOperator(newOp);
+
+        // Old operator can no longer toggle.
+        vm.prank(operator);
+        vm.expectRevert(abi.encodeWithSelector(IOracleRouter.Unauthorized.selector, operator));
+        router.setDegraded(METRIC_ID, true, bytes32(0));
+
+        // New operator can.
+        vm.prank(newOp);
+        router.setDegraded(METRIC_ID, true, bytes32(0));
+        assertTrue(router.configOf(METRIC_ID).degraded);
+    }
 }

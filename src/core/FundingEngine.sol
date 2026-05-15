@@ -257,10 +257,15 @@ contract FundingEngine is Initializable, UUPSUpgradeable, ReentrancyGuard, IFund
     // ------------------------------------------------------------------------------------------
 
     /// @inheritdoc IFundingEngine
+    /// @dev Wave 7 audit Fix #2: enforce that an index metric maps to at most one subject. Without
+    ///      this guard, a second `registerSubject(subjectB, metricX)` silently overwrites
+    ///      `metricToSubject[metricX]` (originally pointing at `subjectA`) while leaving
+    ///      `subjectIndexMetric[subjectA]` intact — breaking the reverse-lookup invariant.
     function registerSubject(bytes32 subjectId, bytes32 indexMetricId) external onlyGovernance {
         if (subjectId == bytes32(0) || indexMetricId == bytes32(0)) revert InvalidConfig();
         Layout storage s = _s();
         if (s.subjectIndexMetric[subjectId] != bytes32(0)) revert SubjectAlreadyRegistered(subjectId);
+        if (s.metricToSubject[indexMetricId] != bytes32(0)) revert MetricAlreadyBound(indexMetricId);
         s.subjectIndexMetric[subjectId] = indexMetricId;
         s.metricToSubject[indexMetricId] = subjectId;
         emit SubjectRegistered(subjectId, indexMetricId);

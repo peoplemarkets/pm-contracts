@@ -128,6 +128,9 @@ interface IFundingEngine {
 
     error SubjectNotRegistered(bytes32 subjectId);
     error SubjectAlreadyRegistered(bytes32 subjectId);
+    /// @dev Thrown by `registerSubject` when `indexMetricId` is already bound to another subject.
+    ///      Prevents the silent reverse-lookup overwrite on the `metricToSubject` mapping.
+    error MetricAlreadyBound(bytes32 metricId);
 
     error KPremiumOutOfRange(int256 value);
     error KSentimentOutOfRange(int256 value);

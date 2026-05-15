@@ -53,6 +53,13 @@ contract MarginEngine is Initializable, UUPSUpgradeable, IMarginEngine {
         uint64 pendingGovernanceActivatesAt;
         // wiring — back-pointer to PerpEngine (read-only side: position struct, mark, etc.)
         address perpEngine;
+        // ---- APPENDED: Wave 7 audit Fix #7 — one-shot seeding flag for the rotation flow ----
+        // `seedNetCategoryOi` is a governance-only helper used exactly once during the rotation
+        // flow (fresh MarginEngine deploy → off-chain reconciliation of live PerpEngine
+        // positions → seed accumulator → activate rotation). Once `seeded` flips to true, the
+        // helper reverts on every subsequent call so the accumulator cannot be rebased after
+        // live use.
+        bool seeded;
     }
 
     function _s() internal pure returns (Layout storage l) {
@@ -399,6 +406,51 @@ contract MarginEngine is Initializable, UUPSUpgradeable, IMarginEngine {
         uint16 old = marginS.categoryNetOiCapBps;
         marginS.categoryNetOiCapBps = bps;
         emit CategoryNetOiCapBpsSet(old, bps);
+    }
+
+    // ------------------------------------------------------------------------------------------
+    // Wave 7 audit Fix #7 — one-shot rotation-seed helper
+    //
+    // Rotation flow:
+    //   1. Deploy a fresh MarginEngine via UUPSProxy + `initialize(...)`. The
+    //      `MarginStorage.netCategoryOi` accumulator is zero on a fresh deploy — it does not
+    //      mirror the live set of positions held in PerpEngine, which were opened against the
+    //      OLD MarginEngine's accumulator. Without this seed, the new engine starts blind and
+    //      the first `enforceOpenCaps` call after rotation under-reports the net category OI.
+    //   2. Governance computes the per-category sum of (longOI − shortOI) at OPENING notional
+    //      across every subject sharing the category — using on-chain `PerpEngine.openInterestOf`
+    //      reads — and submits the result via this helper.
+    //   3. Governance activates the rotation on PerpEngine (via the standard timelocked dance),
+    //      pointing all open/close-path delegations at the new MarginEngine.
+    //
+    // The `seeded` flag is intentionally one-shot. Once flipped, no further calls to this
+    // helper can land — preventing a compromised or panicked governance multi-sig from
+    // rebasing the accumulator after live use (which would silently break the category cap
+    // invariant against all subsequent open/close events).
+    // ------------------------------------------------------------------------------------------
+
+    /// @notice Seed the per-category net OI accumulator. ONE-SHOT — reverts `AlreadySeeded` on
+    ///         the second call. Intended for the rotation flow only.
+    /// @param  categoryIds Per-category ID list.
+    /// @param  values      Signed net OI per category, computed off-chain from the live position
+    ///                     set held in PerpEngine. Same scale as the on-chain accumulator
+    ///                     (USDC-denominated 1e18 fixed-point, signed: +long, −short).
+    function seedNetCategoryOi(bytes32[] calldata categoryIds, int256[] calldata values) external onlyGovernance {
+        if (categoryIds.length != values.length) revert InvalidConfig();
+        Layout storage outer = _s();
+        if (outer.seeded) revert AlreadySeeded();
+        MarginStorage.Layout storage marginS = MarginStorage.load();
+        for (uint256 i; i < categoryIds.length; ++i) {
+            marginS.netCategoryOi[categoryIds[i]] = values[i];
+            emit NetCategoryOiSeeded(categoryIds[i], values[i]);
+        }
+        outer.seeded = true;
+        emit SeedingFinalized();
+    }
+
+    /// @notice Read whether the one-shot rotation seed has been applied.
+    function seeded() external view returns (bool) {
+        return _s().seeded;
     }
 
     // ------------------------------------------------------------------------------------------

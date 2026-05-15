@@ -75,17 +75,27 @@ interface IFeedbackController {
     ///         slope `[1, 100]`, maxDiscountBps `[0, 10000]`.
     function setLateMoveParams(uint64 denominator, uint64 slope, uint16 maxDiscountBps) external;
 
-    /// @notice Repoint the OracleRouter dependency. Zero address reverts.
-    function setOracleRouter(address newRouter) external;
-
-    /// @notice Repoint the PerpEngine dependency. Zero address reverts. Matches the
-    ///         sentiment-writer pattern: dependency is mutable without a timelock so an
-    ///         emergency repoint can land fast.
-    function setPerpEngine(address newEngine) external;
-
     // ------------------------------------------------------------------------------------------
     // External — governance (timelocked)
     // ------------------------------------------------------------------------------------------
+
+    /// @notice Schedule a PerpEngine repoint. Activates after `timelockDelay`. Wave 7 audit
+    ///         Fix #4: cross-cutting pointer rotations follow the standard
+    ///         propose/activate/cancel pattern (mirrors `proposeSetFundingEngine` on PerpEngine
+    ///         and `proposeSetPerpEngine` on LPVault). The PerpEngine is the consumer of
+    ///         `applyImpulse` calls; an instant swap could divert impulse-driven mark moves to
+    ///         a malicious engine before LPs see the change in the indexer.
+    function proposeSetPerpEngine(address newEngine) external;
+    function activateSetPerpEngine() external;
+    function cancelSetPerpEngine() external;
+
+    /// @notice Schedule an OracleRouter repoint. Activates after `timelockDelay`. The router is
+    ///         the dependency carried for forward-compatibility (v1 does not read it on the hot
+    ///         path); rotation still follows the timelocked pattern so the deployment graph is
+    ///         self-consistent.
+    function proposeSetOracleRouter(address newRouter) external;
+    function activateSetOracleRouter() external;
+    function cancelSetOracleRouter() external;
 
     function proposeAddResolutionWriter(address writer) external;
     function activateAddResolutionWriter(address writer) external;
@@ -115,6 +125,10 @@ interface IFeedbackController {
     function perpEngine() external view returns (address);
     function oracleRouter() external view returns (address);
     function timelockDelay() external view returns (uint32);
+    /// @notice Pending PerpEngine rotation (zero address + zero timestamp when none).
+    function pendingPerpEngine() external view returns (address account, uint64 activatesAt);
+    /// @notice Pending OracleRouter rotation (zero address + zero timestamp when none).
+    function pendingOracleRouter() external view returns (address account, uint64 activatesAt);
 
     // ------------------------------------------------------------------------------------------
     // Events
@@ -135,8 +149,14 @@ interface IFeedbackController {
     event CoefficientSet(EventClass indexed eventClass, int256 oldCoeff, int256 newCoeff);
     event ImpulseCapBpsSet(uint16 oldBps, uint16 newBps);
     event LateMoveParamsSet(uint64 denominator, uint64 slope, uint16 maxDiscountBps);
-    event PerpEngineSet(address oldEngine, address newEngine);
-    event OracleRouterSet(address oldRouter, address newRouter);
+    /// @notice Emitted by the timelocked PerpEngine pointer-rotation dance.
+    event PerpEngineProposed(address indexed newEngine, uint64 activatesAt);
+    event PerpEngineActivated(address indexed oldEngine, address indexed newEngine);
+    event PerpEngineCancelled(address indexed pendingEngine);
+    /// @notice Emitted by the timelocked OracleRouter pointer-rotation dance.
+    event OracleRouterProposed(address indexed newRouter, uint64 activatesAt);
+    event OracleRouterActivated(address indexed oldRouter, address indexed newRouter);
+    event OracleRouterCancelled(address indexed pendingRouter);
     event ResolutionWriterProposed(address indexed writer, uint64 activatesAt);
     event ResolutionWriterActivated(address indexed writer);
     event ResolutionWriterCancelled(address indexed writer);
@@ -164,4 +184,12 @@ interface IFeedbackController {
     error PendingResolutionWriterExists();
     error NoPendingResolutionWriter();
     error ResolutionWriterNotSet(address writer);
+    /// @dev Thrown by `proposeSetPerpEngine` when a rotation is already in flight.
+    error PendingPerpEngineExists();
+    /// @dev Thrown by `activateSetPerpEngine` / `cancelSetPerpEngine` when there is no pending rotation.
+    error NoPendingPerpEngine();
+    /// @dev Thrown by `proposeSetOracleRouter` when a rotation is already in flight.
+    error PendingOracleRouterExists();
+    /// @dev Thrown by `activateSetOracleRouter` / `cancelSetOracleRouter` when there is no pending rotation.
+    error NoPendingOracleRouter();
 }

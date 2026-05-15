@@ -259,6 +259,66 @@ contract OracleRouter is Initializable, UUPSUpgradeable, IOracleRouter {
         return OracleStorage.load().timelockDelay;
     }
 
+    /// @inheritdoc IOracleRouter
+    function pendingGovernance() external view returns (address account, uint64 activatesAt) {
+        OracleStorage.Layout storage s = OracleStorage.load();
+        return (s.pendingGovernance, s.pendingGovernanceActivatesAt);
+    }
+
+    // ------------------------------------------------------------------------------------------
+    // Governance transfer (timelocked) + operator rotation (immediate) — Wave 7 audit Fix #3
+    // ------------------------------------------------------------------------------------------
+
+    /// @inheritdoc IOracleRouter
+    function proposeGovernanceTransfer(address newGov) external onlyGovernance {
+        if (newGov == address(0)) revert InvalidConfig();
+        OracleStorage.Layout storage s = OracleStorage.load();
+        if (s.pendingGovernanceActivatesAt != 0) revert PendingGovernanceTransferExists();
+        uint64 activatesAt = uint64(block.timestamp) + uint64(s.timelockDelay);
+        s.pendingGovernance = newGov;
+        s.pendingGovernanceActivatesAt = activatesAt;
+        emit GovernanceTransferProposed(newGov, activatesAt);
+    }
+
+    /// @inheritdoc IOracleRouter
+    /// @dev Permissionless once the timelock has elapsed — matches the LPVault / SubjectRegistry
+    ///      pattern. The handoff was fully gated upstream by the original propose call.
+    function activateGovernanceTransfer() external {
+        OracleStorage.Layout storage s = OracleStorage.load();
+        uint64 readyAt = s.pendingGovernanceActivatesAt;
+        if (readyAt == 0) revert NoPendingGovernanceTransfer();
+        if (block.timestamp < readyAt) revert GovernanceTimelockNotElapsed(readyAt);
+        address oldGov = s.governance;
+        address newGov = s.pendingGovernance;
+        s.governance = newGov;
+        delete s.pendingGovernance;
+        delete s.pendingGovernanceActivatesAt;
+        emit GovernanceTransferActivated(oldGov, newGov);
+    }
+
+    /// @inheritdoc IOracleRouter
+    function cancelGovernanceTransfer() external onlyGovernance {
+        OracleStorage.Layout storage s = OracleStorage.load();
+        if (s.pendingGovernanceActivatesAt == 0) revert NoPendingGovernanceTransfer();
+        address pending = s.pendingGovernance;
+        delete s.pendingGovernance;
+        delete s.pendingGovernanceActivatesAt;
+        emit GovernanceTransferCancelled(pending);
+    }
+
+    /// @inheritdoc IOracleRouter
+    /// @dev Governance only, NO timelock. The operator role's blast radius is narrow
+    ///      (`setDegraded` only — toggles a per-metric flag and routes reads to a configured
+    ///      fallback) so fast rotation is the right shape if the operator multi-sig is
+    ///      compromised. Mirrors the LPVault.setOperator design.
+    function setOperator(address newOperator) external onlyGovernance {
+        if (newOperator == address(0)) revert InvalidConfig();
+        OracleStorage.Layout storage s = OracleStorage.load();
+        address old = s.operator;
+        s.operator = newOperator;
+        emit OperatorSet(old, newOperator);
+    }
+
     // ------------------------------------------------------------------------------------------
     // Internals
     // ------------------------------------------------------------------------------------------

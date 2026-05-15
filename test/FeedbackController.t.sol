@@ -922,49 +922,191 @@ contract FeedbackControllerTest is Test {
     }
 
     // ------------------------------------------------------------------------------------------
-    // setPerpEngine / setOracleRouter
+    // proposeSetPerpEngine / activateSetPerpEngine / cancelSetPerpEngine — Wave 7 audit Fix #4
     // ------------------------------------------------------------------------------------------
 
-    function test_SetPerpEngine_HappyPath() public {
+    function test_ProposeSetPerpEngine_HappyPath() public {
         address newEngine = makeAddr("newEngine");
-        vm.expectEmit(false, false, false, true, address(feedback));
-        emit IFeedbackController.PerpEngineSet(address(engine), newEngine);
+        uint64 expectedAt = uint64(block.timestamp + TIMELOCK_DELAY);
+        vm.expectEmit(true, false, false, true, address(feedback));
+        emit IFeedbackController.PerpEngineProposed(newEngine, expectedAt);
         vm.prank(governance);
-        feedback.setPerpEngine(newEngine);
-        assertEq(feedback.perpEngine(), newEngine);
+        feedback.proposeSetPerpEngine(newEngine);
+        (address pending, uint64 readyAt) = feedback.pendingPerpEngine();
+        assertEq(pending, newEngine);
+        assertEq(readyAt, expectedAt);
+        // perpEngine is unchanged until activate.
+        assertEq(feedback.perpEngine(), address(engine));
     }
 
-    function test_SetPerpEngine_RevertOnZero() public {
+    function test_ProposeSetPerpEngine_RevertOnZero() public {
         vm.prank(governance);
         vm.expectRevert(IFeedbackController.InvalidConfig.selector);
-        feedback.setPerpEngine(address(0));
+        feedback.proposeSetPerpEngine(address(0));
     }
 
-    function test_SetPerpEngine_RevertOnNonGovernance() public {
+    function test_ProposeSetPerpEngine_RevertOnNonGovernance() public {
         vm.prank(stranger);
         vm.expectRevert(abi.encodeWithSelector(IFeedbackController.Unauthorized.selector, stranger));
-        feedback.setPerpEngine(makeAddr("foo"));
+        feedback.proposeSetPerpEngine(makeAddr("foo"));
     }
 
-    function test_SetOracleRouter_HappyPath() public {
-        address newRouter = makeAddr("newRouter");
-        vm.expectEmit(false, false, false, true, address(feedback));
-        emit IFeedbackController.OracleRouterSet(address(router), newRouter);
+    function test_ProposeSetPerpEngine_RevertOnPendingExists() public {
         vm.prank(governance);
-        feedback.setOracleRouter(newRouter);
+        feedback.proposeSetPerpEngine(makeAddr("foo"));
+        vm.prank(governance);
+        vm.expectRevert(IFeedbackController.PendingPerpEngineExists.selector);
+        feedback.proposeSetPerpEngine(makeAddr("bar"));
+    }
+
+    function test_ActivateSetPerpEngine_HappyPath() public {
+        address newEngine = makeAddr("newEngine");
+        vm.prank(governance);
+        feedback.proposeSetPerpEngine(newEngine);
+        vm.warp(block.timestamp + TIMELOCK_DELAY);
+        address oldEngine = feedback.perpEngine();
+        vm.expectEmit(true, true, false, true, address(feedback));
+        emit IFeedbackController.PerpEngineActivated(oldEngine, newEngine);
+        feedback.activateSetPerpEngine();
+        assertEq(feedback.perpEngine(), newEngine);
+        (address pending, uint64 readyAt) = feedback.pendingPerpEngine();
+        assertEq(pending, address(0));
+        assertEq(readyAt, 0);
+    }
+
+    function test_ActivateSetPerpEngine_RevertBeforeTimelock() public {
+        vm.prank(governance);
+        feedback.proposeSetPerpEngine(makeAddr("foo"));
+        vm.expectRevert(
+            abi.encodeWithSelector(
+                IFeedbackController.TimelockNotElapsed.selector, uint64(block.timestamp + TIMELOCK_DELAY)
+            )
+        );
+        feedback.activateSetPerpEngine();
+    }
+
+    function test_ActivateSetPerpEngine_RevertWhenNoPending() public {
+        vm.expectRevert(IFeedbackController.NoPendingPerpEngine.selector);
+        feedback.activateSetPerpEngine();
+    }
+
+    function test_CancelSetPerpEngine_HappyPath() public {
+        address newEngine = makeAddr("newEngine");
+        vm.prank(governance);
+        feedback.proposeSetPerpEngine(newEngine);
+        vm.expectEmit(true, false, false, true, address(feedback));
+        emit IFeedbackController.PerpEngineCancelled(newEngine);
+        vm.prank(governance);
+        feedback.cancelSetPerpEngine();
+        (address pending, uint64 readyAt) = feedback.pendingPerpEngine();
+        assertEq(pending, address(0));
+        assertEq(readyAt, 0);
+    }
+
+    function test_CancelSetPerpEngine_RevertOnNonGovernance() public {
+        vm.prank(governance);
+        feedback.proposeSetPerpEngine(makeAddr("foo"));
+        vm.prank(stranger);
+        vm.expectRevert(abi.encodeWithSelector(IFeedbackController.Unauthorized.selector, stranger));
+        feedback.cancelSetPerpEngine();
+    }
+
+    function test_CancelSetPerpEngine_RevertWhenNoPending() public {
+        vm.prank(governance);
+        vm.expectRevert(IFeedbackController.NoPendingPerpEngine.selector);
+        feedback.cancelSetPerpEngine();
+    }
+
+    // ------------------------------------------------------------------------------------------
+    // proposeSetOracleRouter / activateSetOracleRouter / cancelSetOracleRouter
+    // ------------------------------------------------------------------------------------------
+
+    function test_ProposeSetOracleRouter_HappyPath() public {
+        address newRouter = makeAddr("newRouter");
+        uint64 expectedAt = uint64(block.timestamp + TIMELOCK_DELAY);
+        vm.expectEmit(true, false, false, true, address(feedback));
+        emit IFeedbackController.OracleRouterProposed(newRouter, expectedAt);
+        vm.prank(governance);
+        feedback.proposeSetOracleRouter(newRouter);
+        (address pending, uint64 readyAt) = feedback.pendingOracleRouter();
+        assertEq(pending, newRouter);
+        assertEq(readyAt, expectedAt);
+        assertEq(feedback.oracleRouter(), address(router));
+    }
+
+    function test_ProposeSetOracleRouter_RevertOnZero() public {
+        vm.prank(governance);
+        vm.expectRevert(IFeedbackController.InvalidConfig.selector);
+        feedback.proposeSetOracleRouter(address(0));
+    }
+
+    function test_ProposeSetOracleRouter_RevertOnNonGovernance() public {
+        vm.prank(stranger);
+        vm.expectRevert(abi.encodeWithSelector(IFeedbackController.Unauthorized.selector, stranger));
+        feedback.proposeSetOracleRouter(makeAddr("foo"));
+    }
+
+    function test_ProposeSetOracleRouter_RevertOnPendingExists() public {
+        vm.prank(governance);
+        feedback.proposeSetOracleRouter(makeAddr("foo"));
+        vm.prank(governance);
+        vm.expectRevert(IFeedbackController.PendingOracleRouterExists.selector);
+        feedback.proposeSetOracleRouter(makeAddr("bar"));
+    }
+
+    function test_ActivateSetOracleRouter_HappyPath() public {
+        address newRouter = makeAddr("newRouter");
+        vm.prank(governance);
+        feedback.proposeSetOracleRouter(newRouter);
+        vm.warp(block.timestamp + TIMELOCK_DELAY);
+        address oldRouter = feedback.oracleRouter();
+        vm.expectEmit(true, true, false, true, address(feedback));
+        emit IFeedbackController.OracleRouterActivated(oldRouter, newRouter);
+        feedback.activateSetOracleRouter();
         assertEq(feedback.oracleRouter(), newRouter);
     }
 
-    function test_SetOracleRouter_RevertOnZero() public {
+    function test_ActivateSetOracleRouter_RevertBeforeTimelock() public {
         vm.prank(governance);
-        vm.expectRevert(IFeedbackController.InvalidConfig.selector);
-        feedback.setOracleRouter(address(0));
+        feedback.proposeSetOracleRouter(makeAddr("foo"));
+        vm.expectRevert(
+            abi.encodeWithSelector(
+                IFeedbackController.TimelockNotElapsed.selector, uint64(block.timestamp + TIMELOCK_DELAY)
+            )
+        );
+        feedback.activateSetOracleRouter();
     }
 
-    function test_SetOracleRouter_RevertOnNonGovernance() public {
+    function test_ActivateSetOracleRouter_RevertWhenNoPending() public {
+        vm.expectRevert(IFeedbackController.NoPendingOracleRouter.selector);
+        feedback.activateSetOracleRouter();
+    }
+
+    function test_CancelSetOracleRouter_HappyPath() public {
+        address newRouter = makeAddr("newRouter");
+        vm.prank(governance);
+        feedback.proposeSetOracleRouter(newRouter);
+        vm.expectEmit(true, false, false, true, address(feedback));
+        emit IFeedbackController.OracleRouterCancelled(newRouter);
+        vm.prank(governance);
+        feedback.cancelSetOracleRouter();
+        (address pending, uint64 readyAt) = feedback.pendingOracleRouter();
+        assertEq(pending, address(0));
+        assertEq(readyAt, 0);
+    }
+
+    function test_CancelSetOracleRouter_RevertOnNonGovernance() public {
+        vm.prank(governance);
+        feedback.proposeSetOracleRouter(makeAddr("foo"));
         vm.prank(stranger);
         vm.expectRevert(abi.encodeWithSelector(IFeedbackController.Unauthorized.selector, stranger));
-        feedback.setOracleRouter(makeAddr("foo"));
+        feedback.cancelSetOracleRouter();
+    }
+
+    function test_CancelSetOracleRouter_RevertWhenNoPending() public {
+        vm.prank(governance);
+        vm.expectRevert(IFeedbackController.NoPendingOracleRouter.selector);
+        feedback.cancelSetOracleRouter();
     }
 
     // ------------------------------------------------------------------------------------------

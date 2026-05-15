@@ -431,6 +431,21 @@ contract FundingEngineTest is Test {
         funding.registerSubject(keccak256("a"), keccak256("b"));
     }
 
+    /// @dev Wave 7 audit Fix #2: a second register of an already-bound metric MUST revert
+    ///      `MetricAlreadyBound`. Pre-fix the reverse-lookup write would silently overwrite
+    ///      `metricToSubject[metric]` from subjectA → subjectB while leaving
+    ///      `subjectIndexMetric[subjectA]` intact.
+    function test_Wave7Fix2_RegisterSubject_RevertOnMetricAlreadyBound() public {
+        bytes32 subjectB = keccak256("subject-b");
+        vm.prank(governance);
+        vm.expectRevert(abi.encodeWithSelector(IFundingEngine.MetricAlreadyBound.selector, INDEX_METRIC_ID));
+        funding.registerSubject(subjectB, INDEX_METRIC_ID);
+
+        // Sanity: the reverse-lookup invariant is preserved.
+        assertEq(funding.subjectForMetric(INDEX_METRIC_ID), SUBJECT_ID);
+        assertEq(funding.metricForSubject(subjectB), bytes32(0));
+    }
+
     function test_DeregisterSubject_HappyPath() public {
         vm.expectEmit(true, true, false, false, address(funding));
         emit IFundingEngine.SubjectDeregistered(SUBJECT_ID, INDEX_METRIC_ID);

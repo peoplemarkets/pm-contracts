@@ -360,10 +360,13 @@ contract LPVault is Initializable, UUPSUpgradeable, ERC4626Upgradeable, Reentran
     ///      is zero — both deltas match).
     function _accrueInsuranceCapped(VaultStorage.Layout storage s, uint256 insuranceShare) internal {
         if (insuranceShare == 0) return;
-        // `totalAssets()` returns `freeAssets()` per the override. We compute the cap against
-        // the current TVL — the same number LP shares are priced off, which is the correct
-        // denominator for "10% of TVL".
-        uint256 tvl = totalAssets();
+        // Wave 7 audit Fix #5: cap denominator is full vault capital, NOT `freeAssets()`. The
+        // `positionCollateral` bucket is real backing for real exposure — it should count toward
+        // the insurance cap denominator. `accruedFees` is excluded (those USDC are earmarked for
+        // treasury withdrawal, not LP yield). At high utilisation, the prior `totalAssets()`
+        // denominator (= freeAssets) collapsed and let the cap effectively block insurance
+        // accrual exactly when the insurance fund needs to grow the fastest.
+        uint256 tvl = _capDenominatorTvl(s);
         uint256 cap = (tvl * uint256(s.insuranceCapBps)) / BPS_DENOM;
         uint256 current = _insuranceBalanceFor(s);
         if (current >= cap) {
@@ -395,12 +398,22 @@ contract LPVault is Initializable, UUPSUpgradeable, ERC4626Upgradeable, Reentran
     function _emitFloorBreachIfBelow(VaultStorage.Layout storage s) internal {
         uint16 floorBps = s.insuranceFloorBps;
         if (floorBps == 0) return;
-        uint256 tvl = totalAssets();
+        // Wave 7 audit Fix #5: floor denominator mirrors the cap denominator.
+        uint256 tvl = _capDenominatorTvl(s);
         uint256 floor = (tvl * uint256(floorBps)) / BPS_DENOM;
         uint256 current = _insuranceBalanceFor(s);
         if (current < floor) {
             emit InsuranceFloorBreached(current, floor, tvl);
         }
+    }
+
+    /// @dev Wave 7 audit Fix #5 cap/floor denominator. Full vault capital minus the residual
+    ///      treasury bucket: `balance(USDC) − accruedFees`. The denominator includes
+    ///      `positionCollateral` (real backing for real exposure) and `insuranceFundBalance`
+    ///      (the bookkeeper itself, which is part of the protocol's reserve capital).
+    function _capDenominatorTvl(VaultStorage.Layout storage s) internal view returns (uint256) {
+        uint256 balance_ = IERC20(asset()).balanceOf(address(this));
+        return balance_ > s.accruedFees ? balance_ - s.accruedFees : 0;
     }
 
     /// @dev Returns the live insurance balance — pre-migration this is the in-vault bookkeeper,
@@ -454,18 +467,24 @@ contract LPVault is Initializable, UUPSUpgradeable, ERC4626Upgradeable, Reentran
             revert LiquidationPayoutMismatch(expectedTotal, actualTotal);
         }
 
-        // ---- State mutation BEFORE external calls (CEI). ----
-        s.positionCollateral -= collateralReleased;
-
         // Solvency check: if total payout exceeds released collateral, the difference must be
         // backed by `freeAssets`. This protects locked collateral / insurance / accruedFees from
         // being silently drained.
+        //
+        // Wave 7 audit Fix #1: the check MUST run BEFORE we decrement `positionCollateral`. If we
+        // decremented first, the just-freed collateral would inflate `freeAssets()` and let the
+        // deficit pass even when the vault genuinely cannot cover it — leaving
+        // `insuranceFundBalance` and `accruedFees` as phantom claims. Mirrors the v2-audit Fix #2
+        // ordering already applied to `settlePosition`.
         uint256 totalPayout = traderPayout + liquidatorBounty;
         if (totalPayout > collateralReleased) {
             uint256 deficit = totalPayout - collateralReleased;
             uint256 free = freeAssets();
-            if (deficit > free) revert InsufficientFreeAssets(deficit, free);
+            if (deficit > free) revert InsufficientFreeAssetsForLiquidation(deficit, free);
         }
+
+        // ---- State mutation BEFORE external calls (CEI). ----
+        s.positionCollateral -= collateralReleased;
 
         if (traderPayout > 0) IERC20(asset()).safeTransfer(trader, traderPayout);
         if (liquidatorBounty > 0) IERC20(asset()).safeTransfer(liquidator, liquidatorBounty);

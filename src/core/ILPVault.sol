@@ -365,4 +365,9 @@ interface ILPVault is IERC4626 {
     ///         match the slice's `collateralReleased + signedPnl`. Indicates a LiquidationEngine
     ///         accounting bug.
     error LiquidationPayoutMismatch(int256 expected, int256 actual);
+    /// @notice Thrown by `settleLiquidation` when the payout deficit (payout above released
+    ///         collateral) exceeds the vault's `freeAssets`. Distinguished from
+    ///         `InsufficientFreeAssets` so a liquidation-path solvency failure is unambiguous in
+    ///         the revert trace.
+    error InsufficientFreeAssetsForLiquidation(uint256 requested, uint256 available);
 }

@@ -54,6 +54,13 @@ contract FeedbackController is Initializable, UUPSUpgradeable, ReentrancyGuard, 
         // resolution-writer set + pending adds (timelocked)
         mapping(address writer => bool) resolutionWriters;
         mapping(address writer => uint64) pendingResolutionWriterActivatesAt_;
+        // ---- APPENDED: Wave 7 audit Fix #4 — timelocked PerpEngine / OracleRouter rotations ----
+        // Single in-flight pending pointer for each dependency. Matches the
+        // `pendingPerpEngine` / `pendingFundingEngine` shape elsewhere in the suite.
+        address pendingPerpEngine_;
+        uint64 pendingPerpEngineActivatesAt_;
+        address pendingOracleRouter_;
+        uint64 pendingOracleRouterActivatesAt_;
     }
 
     function _s() internal pure returns (Layout storage l) {
@@ -292,22 +299,89 @@ contract FeedbackController is Initializable, UUPSUpgradeable, ReentrancyGuard, 
         emit LateMoveParamsSet(denominator, slope, maxDiscount);
     }
 
+    // ------------------------------------------------------------------------------------------
+    // Governance: PerpEngine pointer rotation (timelocked) — Wave 7 audit Fix #4
+    //
+    // Cross-cutting pointer rotations follow the same propose/activate/cancel pattern as
+    // `proposeSetFundingEngine` on PerpEngine: the engine receives every `applyImpulse` call,
+    // so an instant swap could divert mark moves to a malicious engine before downstream
+    // consumers (vault LP, indexers) react.
+    // ------------------------------------------------------------------------------------------
+
     /// @inheritdoc IFeedbackController
-    function setOracleRouter(address newRouter) external onlyGovernance {
-        if (newRouter == address(0)) revert InvalidConfig();
+    function proposeSetPerpEngine(address newEngine) external onlyGovernance {
+        if (newEngine == address(0)) revert InvalidConfig();
         Layout storage s = _s();
-        address old = s.oracleRouter;
-        s.oracleRouter = newRouter;
-        emit OracleRouterSet(old, newRouter);
+        if (s.pendingPerpEngineActivatesAt_ != 0) revert PendingPerpEngineExists();
+        uint64 activatesAt = uint64(block.timestamp + s.timelockDelay);
+        s.pendingPerpEngine_ = newEngine;
+        s.pendingPerpEngineActivatesAt_ = activatesAt;
+        emit PerpEngineProposed(newEngine, activatesAt);
     }
 
     /// @inheritdoc IFeedbackController
-    function setPerpEngine(address newEngine) external onlyGovernance {
-        if (newEngine == address(0)) revert InvalidConfig();
+    /// @dev Permissionless once the timelock has elapsed — matches the
+    ///      `activateSetPerpEngine` shape on LPVault.
+    function activateSetPerpEngine() external {
         Layout storage s = _s();
-        address old = s.perpEngine;
+        uint64 readyAt = s.pendingPerpEngineActivatesAt_;
+        if (readyAt == 0) revert NoPendingPerpEngine();
+        if (block.timestamp < readyAt) revert TimelockNotElapsed(readyAt);
+        address oldEngine = s.perpEngine;
+        address newEngine = s.pendingPerpEngine_;
         s.perpEngine = newEngine;
-        emit PerpEngineSet(old, newEngine);
+        delete s.pendingPerpEngine_;
+        delete s.pendingPerpEngineActivatesAt_;
+        emit PerpEngineActivated(oldEngine, newEngine);
+    }
+
+    /// @inheritdoc IFeedbackController
+    function cancelSetPerpEngine() external onlyGovernance {
+        Layout storage s = _s();
+        if (s.pendingPerpEngineActivatesAt_ == 0) revert NoPendingPerpEngine();
+        address pending = s.pendingPerpEngine_;
+        delete s.pendingPerpEngine_;
+        delete s.pendingPerpEngineActivatesAt_;
+        emit PerpEngineCancelled(pending);
+    }
+
+    // ------------------------------------------------------------------------------------------
+    // Governance: OracleRouter pointer rotation (timelocked) — Wave 7 audit Fix #4
+    // ------------------------------------------------------------------------------------------
+
+    /// @inheritdoc IFeedbackController
+    function proposeSetOracleRouter(address newRouter) external onlyGovernance {
+        if (newRouter == address(0)) revert InvalidConfig();
+        Layout storage s = _s();
+        if (s.pendingOracleRouterActivatesAt_ != 0) revert PendingOracleRouterExists();
+        uint64 activatesAt = uint64(block.timestamp + s.timelockDelay);
+        s.pendingOracleRouter_ = newRouter;
+        s.pendingOracleRouterActivatesAt_ = activatesAt;
+        emit OracleRouterProposed(newRouter, activatesAt);
+    }
+
+    /// @inheritdoc IFeedbackController
+    function activateSetOracleRouter() external {
+        Layout storage s = _s();
+        uint64 readyAt = s.pendingOracleRouterActivatesAt_;
+        if (readyAt == 0) revert NoPendingOracleRouter();
+        if (block.timestamp < readyAt) revert TimelockNotElapsed(readyAt);
+        address oldRouter = s.oracleRouter;
+        address newRouter = s.pendingOracleRouter_;
+        s.oracleRouter = newRouter;
+        delete s.pendingOracleRouter_;
+        delete s.pendingOracleRouterActivatesAt_;
+        emit OracleRouterActivated(oldRouter, newRouter);
+    }
+
+    /// @inheritdoc IFeedbackController
+    function cancelSetOracleRouter() external onlyGovernance {
+        Layout storage s = _s();
+        if (s.pendingOracleRouterActivatesAt_ == 0) revert NoPendingOracleRouter();
+        address pending = s.pendingOracleRouter_;
+        delete s.pendingOracleRouter_;
+        delete s.pendingOracleRouterActivatesAt_;
+        emit OracleRouterCancelled(pending);
     }
 
     // ------------------------------------------------------------------------------------------
@@ -456,6 +530,18 @@ contract FeedbackController is Initializable, UUPSUpgradeable, ReentrancyGuard, 
     /// @inheritdoc IFeedbackController
     function timelockDelay() external view returns (uint32) {
         return _s().timelockDelay;
+    }
+
+    /// @inheritdoc IFeedbackController
+    function pendingPerpEngine() external view returns (address account, uint64 activatesAt) {
+        Layout storage s = _s();
+        return (s.pendingPerpEngine_, s.pendingPerpEngineActivatesAt_);
+    }
+
+    /// @inheritdoc IFeedbackController
+    function pendingOracleRouter() external view returns (address account, uint64 activatesAt) {
+        Layout storage s = _s();
+        return (s.pendingOracleRouter_, s.pendingOracleRouterActivatesAt_);
     }
 
     // ------------------------------------------------------------------------------------------

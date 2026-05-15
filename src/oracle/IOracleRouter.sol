@@ -83,6 +83,27 @@ interface IOracleRouter {
     ///         separate component and not implemented here.
     function markIfStale(bytes32 metricId) external;
 
+    // -- Governance transfer (timelocked) + operator rotation (immediate) --------------------------
+
+    /// @notice Schedule a governance transfer. Activates after `timelockDelay`.
+    function proposeGovernanceTransfer(address newGov) external;
+
+    /// @notice Permissionless: activate a previously-proposed governance transfer once the
+    ///         timelock has elapsed. Anyone can pay the gas; the handoff is fully gated by the
+    ///         original propose call and the elapsed timelock.
+    function activateGovernanceTransfer() external;
+
+    /// @notice Cancel a pending governance transfer.
+    function cancelGovernanceTransfer() external;
+
+    /// @notice Rotate the operator address. Governance only, NO timelock — the operator's
+    ///         narrow scope (only `setDegraded`) means fast cut-off is the right emergency
+    ///         response when the operator multi-sig is compromised. Matches `LPVault.setOperator`.
+    function setOperator(address newOperator) external;
+
+    /// @notice Read the current pending governance transfer (zero address + zero timestamp when none).
+    function pendingGovernance() external view returns (address account, uint64 activatesAt);
+
     // -- Events -------------------------------------------------------------------------------------
 
     event MetricProposed(bytes32 indexed metricId, MetricConfig config, uint64 activatesAt);
@@ -94,6 +115,13 @@ interface IOracleRouter {
     /// @notice Emitted when `markIfStale` flips a metric to degraded because the adapter's last
     ///         `valueTimestamp` is older than `3 × cadence` seconds.
     event AutoDegraded(bytes32 indexed metricId, uint64 valueTimestamp, uint32 cadence, address triggerer);
+    /// @notice Emitted by the governance-transfer timelock dance.
+    event GovernanceTransferProposed(address indexed newGov, uint64 activatesAt);
+    event GovernanceTransferActivated(address indexed oldGov, address indexed newGov);
+    event GovernanceTransferCancelled(address indexed pendingGov);
+    /// @notice Emitted on `setOperator`. The operator multi-sig may toggle the degraded flag
+    ///         (no timelock); rotation is governance-only with immediate effect.
+    event OperatorSet(address indexed oldOperator, address indexed newOperator);
 
     // -- Errors -------------------------------------------------------------------------------------
 
@@ -112,4 +140,14 @@ interface IOracleRouter {
     error MetricAlreadyDegraded(bytes32 metricId);
     /// @dev Thrown by `markIfStale` when the metric has refreshed inside its 3×cadence window.
     error MetricNotStale(bytes32 metricId, uint64 valueTimestamp, uint64 staleAfter);
+
+    // -- Wave 7 audit Fix #3 — governance transfer + operator rotation -----------------------------
+
+    /// @dev Thrown by `proposeGovernanceTransfer` when a transfer is already in flight.
+    error PendingGovernanceTransferExists();
+    /// @dev Thrown by `activateGovernanceTransfer` / `cancelGovernanceTransfer` when there is
+    ///      no pending transfer.
+    error NoPendingGovernanceTransfer();
+    /// @dev Thrown by `activateGovernanceTransfer` before the timelock has elapsed.
+    error GovernanceTimelockNotElapsed(uint64 readyAt);
 }

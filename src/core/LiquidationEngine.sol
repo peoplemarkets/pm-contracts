@@ -373,6 +373,35 @@ contract LiquidationEngine is Initializable, UUPSUpgradeable, ReentrancyGuard, I
         return result;
     }
 
+    // ------------------------------------------------------------------------------------------
+    // Wave 7 audit Fix #6 — permissionless reset of partialAttempts for healed positions
+    // ------------------------------------------------------------------------------------------
+
+    /// @inheritdoc ILiquidationEngine
+    function resetPartialAttempts(bytes32 positionId) external {
+        Layout storage s = _s();
+        IPerpEngine pe = IPerpEngine(s.perpEngine);
+
+        IPerpEngine.Position memory pos = pe.positionOf(positionId);
+        if (pos.size == 0) revert PositionNotFound(positionId);
+
+        (uint256 mark,) = pe.markOf(pos.subjectId);
+        // markOf == 0 implies the subject has no live mark; treat as "not under buffer" — a
+        // position without a usable mark is not actively distressed and should be eligible for
+        // reset so the next mark push can put the partial budget back in play.
+        if (mark != 0) {
+            (, uint16 mmBps, uint16 bufBps,,) = IMarginEngine(s.marginEngine).marginParams();
+            bool underBuffer = LiquidationMath.isUnderLiquidationBuffer(
+                pos.size, pos.collateral, mark, pos.entryPrice, mmBps, bufBps
+            );
+            if (underBuffer) revert StillUnderBuffer(positionId);
+        }
+
+        // Healed: clear the counter so the next distress cycle starts fresh at the partial phase.
+        s.partialAttempts[positionId] = 0;
+        emit PartialAttemptsReset(positionId);
+    }
+
     /// @dev Helper: recompute the bounty target (notional × fullBountyBps / 10_000) for the
     ///      full-close path. Mirrors the math inside `LiquidationMath.computeFullLiquidation`.
     function _bountyTargetForFull(int256 size, uint256 mark, uint16 bps) internal pure returns (uint256) {

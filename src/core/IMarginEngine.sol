@@ -73,6 +73,10 @@ interface IMarginEngine {
     // Hook errors (called by PerpEngine on the open/close hot path).
     error OnlyPerpEngine(address caller);
 
+    /// @dev Thrown by `seedNetCategoryOi` on the second invocation. The one-shot flag prevents
+    ///      the accumulator from being rebased after live use.
+    error AlreadySeeded();
+
     // ------------------------------------------------------------------------------------------
     // Events
     // ------------------------------------------------------------------------------------------
@@ -86,6 +90,11 @@ interface IMarginEngine {
     event GovernanceTransferProposed(address indexed newGovernance, uint64 activatesAt);
     event GovernanceTransferActivated(address indexed oldGovernance, address indexed newGovernance);
     event GovernanceTransferCancelled(address indexed pendingGovernance);
+    /// @notice Emitted per category by the one-shot `seedNetCategoryOi` rotation helper.
+    event NetCategoryOiSeeded(bytes32 indexed categoryId, int256 value);
+    /// @notice Emitted at the end of a successful `seedNetCategoryOi` call. The `seeded` flag is
+    ///         set; further calls to the helper revert `AlreadySeeded`.
+    event SeedingFinalized();
 
     // ------------------------------------------------------------------------------------------
     // Check functions (called by PerpEngine open/close paths)
@@ -199,6 +208,21 @@ interface IMarginEngine {
     // ------------------------------------------------------------------------------------------
 
     function setPerpEngine(address newPerpEngine) external;
+
+    // ------------------------------------------------------------------------------------------
+    // Wave 7 audit Fix #7 — one-shot rotation-seed helper
+    // ------------------------------------------------------------------------------------------
+
+    /// @notice Seed the per-category net OI accumulator. ONE-SHOT — reverts `AlreadySeeded` on
+    ///         the second call.
+    /// @dev    Used during the rotation flow when a fresh MarginEngine proxy is deployed and the
+    ///         live position set already held in PerpEngine needs to be mirrored into the new
+    ///         accumulator before the engine starts gating opens/closes. The `seeded` flag is
+    ///         intentionally one-shot to prevent rebasing the accumulator after live use.
+    function seedNetCategoryOi(bytes32[] calldata categoryIds, int256[] calldata values) external;
+
+    /// @notice True after `seedNetCategoryOi` has run.
+    function seeded() external view returns (bool);
 
     // ------------------------------------------------------------------------------------------
     // Views

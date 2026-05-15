@@ -374,6 +374,12 @@ library OracleStorage {
         address operator;
         // timelock delay for governance changes, in seconds (spec: 48h baseline)
         uint32 timelockDelay;
+        // ---- APPENDED: Wave 7 audit Fix #3 governance transfer (timelocked) ----
+        // Single in-flight pending governance handoff. Matches the LPVault / SubjectRegistry
+        // shape: propose stages the new gov + activation timestamp; activate is permissionless
+        // after the timelock elapses; cancel clears the pending slot.
+        address pendingGovernance;
+        uint64 pendingGovernanceActivatesAt;
     }
 
     function load() internal pure returns (Layout storage l) {

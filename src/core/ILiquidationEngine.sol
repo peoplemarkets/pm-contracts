@@ -82,6 +82,10 @@ interface ILiquidationEngine {
     error NoPendingLiquidator(address liquidator);
     error LiquidatorNotSet(address liquidator);
     error LiquidatorAlreadyAdded(address liquidator);
+    /// @dev Thrown by `resetPartialAttempts` when the position is still under the liquidation
+    ///      buffer. Reset is reserved for positions that have been healed (collateral added,
+    ///      mark moved, etc.) so the next distress cycle re-enters at the partial phase.
+    error StillUnderBuffer(bytes32 positionId);
 
     // ------------------------------------------------------------------------------------------
     // Events
@@ -109,6 +113,9 @@ interface ILiquidationEngine {
     event GovernanceTransferProposed(address indexed newGov, uint64 activatesAt);
     event GovernanceTransferActivated(address indexed oldGov, address indexed newGov);
     event GovernanceTransferCancelled(address indexed pendingGov);
+    /// @notice Emitted when a permissionless caller resets the partial-attempts counter for a
+    ///         healed position (Wave 7 audit Fix #6).
+    event PartialAttemptsReset(bytes32 indexed positionId);
 
     // ------------------------------------------------------------------------------------------
     // External
@@ -121,6 +128,17 @@ interface ILiquidationEngine {
     ///         socialization would exceed the cap, (d) `ADLNotImplemented` if the waterfall would
     ///         need Tier 5.
     function liquidate(bytes32 positionId) external returns (LiquidationResult memory);
+
+    /// @notice Permissionless reset of the partial-attempts counter for a healed position.
+    /// @dev    Wave 7 audit Fix #6. A position that was previously partial-liquidated and then
+    ///         healed (collateral added, mark recovered, etc.) keeps its `partialAttempts`
+    ///         counter from the prior distress cycle. Without this reset, the next distress
+    ///         skips straight to full liquidation, bypassing the partial-increment phase the
+    ///         spec mandates. The reset is a separate entry point — not auto-fired inside
+    ///         `addCollateral` — so the hot path stays cheap and the trader/keeper makes the
+    ///         reset explicit. Reverts `PositionNotFound` when `size == 0` and
+    ///         `StillUnderBuffer` when the position is still distressed.
+    function resetPartialAttempts(bytes32 positionId) external;
 
     function setConfig(
         uint16 partialIncrementBps,

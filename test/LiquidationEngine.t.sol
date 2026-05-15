@@ -907,4 +907,60 @@ contract LiquidationEngineTest is Test {
         vm.expectRevert(ILPVault.AmountZero.selector);
         vault.drawFromInsuranceForLiquidation(0);
     }
+
+    // ------------------------------------------------------------------------------------------
+    // Wave 7 audit Fix #6 — resetPartialAttempts
+    //
+    // A position partially-liquidated, then healed (trader added collateral, mark recovered),
+    // keeps its `partialAttempts` counter from the prior distress cycle. Without an explicit
+    // reset, the next distress skips straight to FULL liquidation, bypassing the
+    // 25%-increment phase the spec mandates. The helper is permissionless and only succeeds
+    // when the position is currently healthy (NOT under the liquidation buffer).
+    // ------------------------------------------------------------------------------------------
+
+    function test_Wave7Fix6_ResetPartialAttempts_HappyPath() public {
+        bytes32 positionId = _openLong(trader);
+
+        // Drop the mark so the position falls under the liquidation buffer.
+        _pushMark(84 * ONE_18);
+
+        // Partial-liquidate twice (counter -> 2).
+        vm.prank(liquidator);
+        liqEngine.liquidate(positionId);
+        vm.prank(liquidator);
+        liqEngine.liquidate(positionId);
+        uint8 attemptsBefore = liqEngine.partialAttemptsOf(positionId);
+        assertGe(attemptsBefore, uint8(1));
+
+        // Heal the position: push the mark up so it is no longer under buffer.
+        _pushMark(120 * ONE_18);
+
+        // Permissionless reset succeeds — even from a stranger.
+        vm.expectEmit(true, false, false, true, address(liqEngine));
+        emit ILiquidationEngine.PartialAttemptsReset(positionId);
+        vm.prank(stranger);
+        liqEngine.resetPartialAttempts(positionId);
+
+        assertEq(liqEngine.partialAttemptsOf(positionId), 0);
+    }
+
+    function test_Wave7Fix6_ResetPartialAttempts_RevertWhenStillUnderBuffer() public {
+        bytes32 positionId = _openLong(trader);
+        _pushMark(84 * ONE_18);
+
+        // Partial-liquidate once to bump the counter.
+        vm.prank(liquidator);
+        liqEngine.liquidate(positionId);
+        assertGe(liqEngine.partialAttemptsOf(positionId), uint8(1));
+
+        // Mark is still depressed — reset must revert.
+        vm.expectRevert(abi.encodeWithSelector(ILiquidationEngine.StillUnderBuffer.selector, positionId));
+        liqEngine.resetPartialAttempts(positionId);
+    }
+
+    function test_Wave7Fix6_ResetPartialAttempts_RevertOnPositionNotFound() public {
+        bytes32 ghost = keccak256("ghost-position");
+        vm.expectRevert(abi.encodeWithSelector(ILiquidationEngine.PositionNotFound.selector, ghost));
+        liqEngine.resetPartialAttempts(ghost);
+    }
 }
