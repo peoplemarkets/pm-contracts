@@ -99,6 +99,22 @@ interface ILPVault is IERC4626 {
     function releaseCollateral(address to, uint256 amount) external;
 
     // ------------------------------------------------------------------------------------------
+    // Event Market Seeding (Wave 8)
+    // ------------------------------------------------------------------------------------------
+
+    /// @notice Pulls `amount` USDC from the vault to seed an EventMarket AMM.
+    ///         The amount is tracked in `eventFundedSeed` to preserve `freeAssets`.
+    /// @dev    Caller MUST be the configured `eventMarketFactory`.
+    function fundEventMarket(uint256 amount) external;
+
+    /// @notice Returns liquidity from a resolved EventMarket back to the vault.
+    ///         Decrements `eventFundedSeed` by `originalSeed`, and transfers `returnedAmount`
+    ///         USDC from the caller to the vault.
+    /// @dev    Caller MUST be the configured `eventMarketFactory`. The difference between
+    ///         `returnedAmount` and `originalSeed` is absorbed naturally by `freeAssets` as PnL.
+    function settleEventMarket(uint256 originalSeed, uint256 returnedAmount) external;
+
+    // ------------------------------------------------------------------------------------------
     // Insurance fund seeding (Fix #6) — governance only, no timelock, capped cumulatively
     // ------------------------------------------------------------------------------------------
 
@@ -194,6 +210,14 @@ interface ILPVault is IERC4626 {
     function cancelGovernanceTransfer() external;
 
     // ------------------------------------------------------------------------------------------
+    // Governance (timelocked) — setEventMarketFactory (Wave 8)
+    // ------------------------------------------------------------------------------------------
+
+    function proposeSetEventMarketFactory(address newFactory) external;
+    function activateSetEventMarketFactory() external;
+    function cancelSetEventMarketFactory() external;
+
+    // ------------------------------------------------------------------------------------------
     // Operator (no timelock) — emergency pause
     // ------------------------------------------------------------------------------------------
 
@@ -243,6 +267,15 @@ interface ILPVault is IERC4626 {
     /// @notice Pending LiquidationEngine rotation (zero address + zero timestamp when none).
     function pendingLiquidationEngine() external view returns (address account, uint64 activatesAt);
 
+    /// @notice Configured EventMarketFactory (Wave 8). `address(0)` until rotated in.
+    function eventMarketFactory() external view returns (address);
+
+    /// @notice Pending EventMarketFactory rotation.
+    function pendingEventMarketFactory() external view returns (address account, uint64 activatesAt);
+
+    /// @notice Total initial seed liquidity currently deployed to Event Markets.
+    function eventFundedSeed() external view returns (uint256);
+
     /// @notice Current insurance cap, basis points of `totalAssets()`. Default 1000 (10%).
     function insuranceCapBps() external view returns (uint16);
 
@@ -274,6 +307,13 @@ interface ILPVault is IERC4626 {
     event LiquidationEngineProposed(address indexed newEngine, uint64 activatesAt);
     event LiquidationEngineActivated(address indexed oldEngine, address indexed newEngine);
     event LiquidationEngineCancelled(address indexed pendingEngine);
+
+    event EventMarketFactoryProposed(address indexed newFactory, uint64 activatesAt);
+    event EventMarketFactoryActivated(address indexed oldFactory, address indexed newFactory);
+    event EventMarketFactoryCancelled(address indexed pendingFactory);
+
+    event EventMarketFunded(address indexed factory, uint256 amount);
+    event EventMarketSettled(address indexed factory, uint256 originalSeed, uint256 returnedAmount, int256 pnl);
 
     /// @notice Emitted on every `settleLiquidation`. Mirrors `PositionSettledOnVault` but
     ///         distinguishes the liquidator bounty payout.
@@ -370,4 +410,8 @@ interface ILPVault is IERC4626 {
     ///         `InsufficientFreeAssets` so a liquidation-path solvency failure is unambiguous in
     ///         the revert trace.
     error InsufficientFreeAssetsForLiquidation(uint256 requested, uint256 available);
+    
+    // --- Wave 8: EventMarketFactory wiring ---
+    error OnlyEventMarketFactory(address caller);
+    error EventMarketFactoryNotSet();
 }

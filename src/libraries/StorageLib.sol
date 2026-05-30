@@ -301,6 +301,17 @@ library VaultStorage {
         address liquidationEngine;
         address pendingLiquidationEngine;
         uint64 pendingLiquidationEngineActivatesAt;
+        // ---- APPENDED: Wave 8 EventMarketFactory wiring ----
+        // Configured EventMarketFactory address. Sole authorised caller of
+        // `fundEventMarket` and `settleEventMarket`. Rotated through a timelocked
+        // propose/activate/cancel flow on the LPVault.
+        address eventMarketFactory;
+        address pendingEventMarketFactory;
+        uint64 pendingEventMarketFactoryActivatesAt;
+        // The total amount of seed liquidity currently deployed to unresolved Event Markets.
+        // This USDC has left the vault's balance, but is accounted for in `freeAssets` as
+        // an investment that will be returned (plus/minus PnL) upon event resolution.
+        uint256 eventFundedSeed;
     }
 
     function load() internal pure returns (Layout storage l) {

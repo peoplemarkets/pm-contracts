@@ -127,12 +127,18 @@ contract LPVault is Initializable, UUPSUpgradeable, ERC4626Upgradeable, Reentran
         _;
     }
 
-    /// @dev Wave 5B. Gates `drawFromInsuranceForLiquidation` to the configured LiquidationEngine.
-    ///      Until the rotation activates, every call reverts.
     modifier onlyLiquidationEngine() {
         VaultStorage.Layout storage s = VaultStorage.load();
         if (s.liquidationEngine == address(0)) revert LiquidationEngineNotSet();
         if (msg.sender != s.liquidationEngine) revert OnlyLiquidationEngine(msg.sender);
+        _;
+    }
+
+    /// @dev Wave 8. Gates `fundEventMarket` and `settleEventMarket` to the configured EventMarketFactory.
+    modifier onlyEventMarketFactory() {
+        VaultStorage.Layout storage s = VaultStorage.load();
+        if (s.eventMarketFactory == address(0)) revert EventMarketFactoryNotSet();
+        if (msg.sender != s.eventMarketFactory) revert OnlyEventMarketFactory(msg.sender);
         _;
     }
 
@@ -408,12 +414,11 @@ contract LPVault is Initializable, UUPSUpgradeable, ERC4626Upgradeable, Reentran
     }
 
     /// @dev Wave 7 audit Fix #5 cap/floor denominator. Full vault capital minus the residual
-    ///      treasury bucket: `balance(USDC) − accruedFees`. The denominator includes
-    ///      `positionCollateral` (real backing for real exposure) and `insuranceFundBalance`
-    ///      (the bookkeeper itself, which is part of the protocol's reserve capital).
+    ///      treasury bucket. Includes `eventFundedSeed` since that capital is deployed but still
+    ///      belongs to the protocol.
     function _capDenominatorTvl(VaultStorage.Layout storage s) internal view returns (uint256) {
-        uint256 balance_ = IERC20(asset()).balanceOf(address(this));
-        return balance_ > s.accruedFees ? balance_ - s.accruedFees : 0;
+        uint256 totalBalance = IERC20(asset()).balanceOf(address(this)) + s.eventFundedSeed;
+        return totalBalance > s.accruedFees ? totalBalance - s.accruedFees : 0;
     }
 
     /// @dev Returns the live insurance balance — pre-migration this is the in-vault bookkeeper,
@@ -536,6 +541,40 @@ contract LPVault is Initializable, UUPSUpgradeable, ERC4626Upgradeable, Reentran
         s.positionCollateral -= amount;
         IERC20(asset()).safeTransfer(to, amount);
         emit CollateralReleased(to, amount);
+    }
+
+    // ------------------------------------------------------------------------------------------
+    // Event Market Seeding (Wave 8)
+    // ------------------------------------------------------------------------------------------
+
+    /// @inheritdoc ILPVault
+    function fundEventMarket(uint256 amount) external nonReentrant onlyEventMarketFactory {
+        if (amount == 0) revert AmountZero();
+        // Check solvency BEFORE state mutation
+        uint256 free = freeAssets();
+        if (amount > free) revert InsufficientFreeAssets(amount, free);
+        
+        VaultStorage.Layout storage s = VaultStorage.load();
+        s.eventFundedSeed += amount;
+        
+        IERC20(asset()).safeTransfer(msg.sender, amount);
+        emit EventMarketFunded(msg.sender, amount);
+    }
+
+    /// @inheritdoc ILPVault
+    function settleEventMarket(uint256 originalSeed, uint256 returnedAmount) external nonReentrant onlyEventMarketFactory {
+        if (originalSeed == 0) revert AmountZero();
+        VaultStorage.Layout storage s = VaultStorage.load();
+        
+        // This is safe because eventFundedSeed only grows by exact funded amounts
+        s.eventFundedSeed -= originalSeed;
+        
+        if (returnedAmount > 0) {
+            IERC20(asset()).safeTransferFrom(msg.sender, address(this), returnedAmount);
+        }
+        
+        int256 pnl = int256(returnedAmount) - int256(originalSeed);
+        emit EventMarketSettled(msg.sender, originalSeed, returnedAmount, pnl);
     }
 
     // ------------------------------------------------------------------------------------------
@@ -737,6 +776,42 @@ contract LPVault is Initializable, UUPSUpgradeable, ERC4626Upgradeable, Reentran
     }
 
     // ------------------------------------------------------------------------------------------
+    // Governance: setEventMarketFactory (timelocked) — Wave 8
+    // ------------------------------------------------------------------------------------------
+
+    function proposeSetEventMarketFactory(address newFactory) external onlyGovernance {
+        if (newFactory == address(0)) revert InvalidConfig();
+        VaultStorage.Layout storage s = VaultStorage.load();
+        if (s.pendingEventMarketFactoryActivatesAt != 0) revert PendingProposalExists();
+        uint64 activatesAt = uint64(block.timestamp + s.timelockDelay);
+        s.pendingEventMarketFactory = newFactory;
+        s.pendingEventMarketFactoryActivatesAt = activatesAt;
+        emit EventMarketFactoryProposed(newFactory, activatesAt);
+    }
+
+    function activateSetEventMarketFactory() external {
+        VaultStorage.Layout storage s = VaultStorage.load();
+        uint64 readyAt = s.pendingEventMarketFactoryActivatesAt;
+        if (readyAt == 0) revert NoPendingProposal();
+        if (block.timestamp < readyAt) revert TimelockNotElapsed(readyAt);
+        address oldFactory = s.eventMarketFactory;
+        address newFactory = s.pendingEventMarketFactory;
+        s.eventMarketFactory = newFactory;
+        delete s.pendingEventMarketFactory;
+        delete s.pendingEventMarketFactoryActivatesAt;
+        emit EventMarketFactoryActivated(oldFactory, newFactory);
+    }
+
+    function cancelSetEventMarketFactory() external onlyGovernance {
+        VaultStorage.Layout storage s = VaultStorage.load();
+        if (s.pendingEventMarketFactoryActivatesAt == 0) revert NoPendingProposal();
+        address pending = s.pendingEventMarketFactory;
+        delete s.pendingEventMarketFactory;
+        delete s.pendingEventMarketFactoryActivatesAt;
+        emit EventMarketFactoryCancelled(pending);
+    }
+
+    // ------------------------------------------------------------------------------------------
     // Governance: governance transfer (timelocked)
     // ------------------------------------------------------------------------------------------
 
@@ -834,15 +909,15 @@ contract LPVault is Initializable, UUPSUpgradeable, ERC4626Upgradeable, Reentran
     // ------------------------------------------------------------------------------------------
 
     /// @inheritdoc ILPVault
-    /// @dev Computed: `balance(USDC) − positionCollateral − insuranceFundBalance − accruedFees`.
+    /// @dev Computed: `balance(USDC) + eventFundedSeed − positionCollateral − insuranceFundBalance − accruedFees`.
     ///      Saturates at 0 if the bookkeepers somehow exceed balance (invariant break) so this
     ///      view stays callable during incident response. Production state-changing flows still
     ///      enforce solvency via the bookkeeper-decrement-before-transfer ordering.
     function freeAssets() public view returns (uint256) {
         VaultStorage.Layout storage s = VaultStorage.load();
-        uint256 balance = IERC20(asset()).balanceOf(address(this));
+        uint256 totalBalance = IERC20(asset()).balanceOf(address(this)) + s.eventFundedSeed;
         uint256 booked = s.positionCollateral + s.insuranceFundBalance + s.accruedFees;
-        return balance > booked ? balance - booked : 0;
+        return totalBalance > booked ? totalBalance - booked : 0;
     }
 
     function positionCollateral() external view returns (uint256) {
@@ -910,6 +985,22 @@ contract LPVault is Initializable, UUPSUpgradeable, ERC4626Upgradeable, Reentran
     function pendingGovernance() external view returns (address account, uint64 activatesAt) {
         VaultStorage.Layout storage s = VaultStorage.load();
         return (s.pendingGovernance, s.pendingGovernanceActivatesAt);
+    }
+
+    /// @inheritdoc ILPVault
+    function eventMarketFactory() external view returns (address) {
+        return VaultStorage.load().eventMarketFactory;
+    }
+
+    /// @inheritdoc ILPVault
+    function pendingEventMarketFactory() external view returns (address account, uint64 activatesAt) {
+        VaultStorage.Layout storage s = VaultStorage.load();
+        return (s.pendingEventMarketFactory, s.pendingEventMarketFactoryActivatesAt);
+    }
+
+    /// @inheritdoc ILPVault
+    function eventFundedSeed() external view returns (uint256) {
+        return VaultStorage.load().eventFundedSeed;
     }
 
     function insuranceSeedDeposited() external view returns (uint256) {
