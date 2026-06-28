@@ -462,74 +462,11 @@ contract PerpEngine is Initializable, UUPSUpgradeable, ReentrancyGuard, IPerpEng
     ///      Not gated by `globalHalt` — once a subject is force-settled, the trader has a vested
     ///      right to the captured-mark unwind regardless of broader system state.
     function closeAtForcedSettlement(bytes32 subjectId) external nonReentrant returns (int256 realizedPnl) {
-        PerpStorage.Layout storage perpS = PerpStorage.load();
-        if (!perpS.subjectForceSettled[subjectId]) revert SubjectNotForceSettled(subjectId);
-
-        bytes32 positionId = perpS.openPositionId[msg.sender][subjectId];
-        if (positionId == bytes32(0)) revert PositionNotOpen(subjectId);
-
-        Position memory orig = perpS.positions[positionId];
-        uint256 markCaptured = perpS.subjectSettlementMark[subjectId];
-
-        // Full close, zero fee. Reuse PositionMath for PnL.
-        int256 pnl = PositionMath.unrealizedPnl(orig.size, orig.entryPrice, markCaptured);
-
-        // Funding accrued up to the freeze. `pushFundingIndex` routes through `requireTradeable`, so
-        // the cumulative index stops advancing the moment a subject is paused/delisted — the index
-        // read here is therefore frozen at (or before) the force-settlement timestamp. We still owe
-        // the funding that accrued while the subject was live, so it is settled here too.
-        int256 fundingDebt6 =
-            FundingMath.computeFundingDebt(orig.size, FundingStorage.load().cumulativeFundingIndex[subjectId], orig.entryFundingIndex);
-
-        // v2-audit Fix #1: cap the trader's loss at posted collateral. If the captured mark + funding
-        // put the position deep underwater (loss > collateral), the trader gets nothing, the vault
-        // keeps the full collateral, and the position is cleanly cleared from `positionCollateral`.
-        // The shortfall (true loss − collateral) is an unfunded LP loss in v0; full coverage from
-        // the insurance fund lands with the InsuranceFund / LiquidationEngine work (week 14+).
-        // Without this cap, every revert here would permanently strand the trader's collateral.
-        //
-        // `effectivePnl` folds funding into the pnl leg booked to the vault (funding owed reduces
-        // the trader payout / accrues to LP; funding credit increases it).
-        int256 effectivePnl = pnl - fundingDebt6;
-        int256 cappedPnl = effectivePnl;
-        int256 returnedSigned = int256(orig.collateral) + effectivePnl;
-        uint256 returned;
-        if (returnedSigned < 0) {
-            cappedPnl = -int256(orig.collateral); // full collateral wiped, no payout
-            returned = 0;
-        } else {
-            returned = uint256(returnedSigned);
-        }
-
-        uint256 absSize = orig.size > 0 ? uint256(orig.size) : uint256(-orig.size);
-        uint256 openingNotional = (absSize * orig.entryPrice) / ONE;
-
-        // State updates BEFORE the external call (CEI).
-        delete perpS.positions[positionId];
-        delete perpS.openPositionId[msg.sender][subjectId];
-        bool isLong = orig.size > 0;
-        if (isLong) {
-            perpS.totalLongOI[subjectId] -= openingNotional;
-        } else {
-            perpS.totalShortOI[subjectId] -= openingNotional;
-        }
-        if (perpS.marginEngine != address(0)) {
-            IMarginEngine(perpS.marginEngine).recordCloseDelta(
-                msg.sender, _categoryOf(perpS, subjectId), openingNotional, isLong
-            );
-        }
-
-        // Vault settle: zero fee, zero rebate, zero insurance share. cappedPnl ensures the
-        // vault's own UnderwaterClose check (collateral + cappedPnl − fee ≥ 0) passes — at the
-        // boundary it computes returnedSigned = 0, which is fine.
-        ILPVault(perpS.lpVault).settlePosition(msg.sender, orig.collateral, cappedPnl, 0, 0, 0);
-
-        // Report the funding settled on this close. Note: when the position is capped underwater
-        // (returnedSigned < 0), the realized funding actually collected by the vault is bounded by
-        // the wiped collateral; `fundingDebt6` here is the economically-owed funding for indexers.
-        emit FundingSettled(positionId, msg.sender, fundingDebt6);
-        emit PositionClosedAtForcedSettlement(positionId, msg.sender, subjectId, cappedPnl, returned);
-        return cappedPnl;
+        // Body extracted to `PerpInternals.forceSettlementClose` (DELEGATECALL) to keep this
+        // contract under the 24,576-byte EIP-170 cap. Namespaced storage + msg.sender resolve
+        // unchanged. Settles funding accrued up to the freeze and caps the trader's loss at
+        // posted collateral.
+        return PerpInternals.forceSettlementClose(subjectId, msg.sender);
     }
 
     /// @inheritdoc IPerpEngine

@@ -6,7 +6,9 @@ import {IMarginEngine} from "../core/IMarginEngine.sol";
 import {IPerpEngine} from "../core/IPerpEngine.sol";
 import {ISubjectRegistry} from "../registry/ISubjectRegistry.sol";
 
-import {PerpStorage} from "./StorageLib.sol";
+import {FundingMath} from "./FundingMath.sol";
+import {PositionMath} from "./PositionMath.sol";
+import {FundingStorage, PerpStorage} from "./StorageLib.sol";
 
 /// @title  PerpInternals — bytecode-extraction library for PerpEngine.
 /// @notice Hosts the heavy-weight close paths (`liquidateClose`) as a `public` library function so
@@ -35,6 +37,16 @@ library PerpInternals {
         uint8 tierCode
     );
 
+    event PositionClosedAtForcedSettlement(
+        bytes32 indexed positionId,
+        address indexed trader,
+        bytes32 indexed subjectId,
+        int256 realizedPnl,
+        uint256 returnedToTrader
+    );
+
+    event FundingSettled(bytes32 indexed positionId, address indexed trader, int256 fundingDelta1e6);
+
     // ------------------------------------------------------------------------------------------
     // Errors (signatures must match IPerpEngine)
     // ------------------------------------------------------------------------------------------
@@ -43,6 +55,7 @@ library PerpInternals {
     error PositionNotOpen(bytes32 subjectId);
     error LiquidationSizeMismatch(int256 positionSize, int256 sizeToClose);
     error LiquidationSizeZero();
+    error SubjectNotForceSettled(bytes32 subjectId);
 
     /// @notice Liquidation-engine 3-way close. See PerpEngine.liquidateClose for full semantics.
     /// @dev    Public so the engine links it as an external library and DELEGATECALLs in. This
@@ -74,7 +87,12 @@ library PerpInternals {
         bool fullClose = absClose == absPos;
 
         uint256 collateralReleased = fullClose ? pos.collateral : (pos.collateral * absClose) / absPos;
-        if (collateralToReturn > collateralReleased) revert InvalidConfig();
+        // For Tiers 1-4 (liquidations) the trader is never returned more than the released
+        // collateral — they are underwater. Tier 5 (ADL, tierCode == 5) is the exception: an ADL'd
+        // counterparty is PROFITABLE, so its payout (collateral + PnL realised at the bankruptcy
+        // price) legitimately exceeds the released collateral. The vault's payout-conservation +
+        // freeAssets-solvency guards (settleLiquidation) remain the authoritative checks in all cases.
+        if (tierCode != 5 && collateralToReturn > collateralReleased) revert InvalidConfig();
 
         uint256 openingNotionalDelta = (absClose * pos.entryPrice) / ONE;
 
@@ -107,5 +125,68 @@ library PerpInternals {
         emit PositionLiquidated(
             positionId, pos.owner, liquidator, sizeToClose, collateralToReturn, bountyToPay, signedPnl, tierCode
         );
+    }
+
+    /// @notice Forced-settlement claim. See `IPerpEngine.closeAtForcedSettlement` for full
+    ///         semantics. Public so PerpEngine links it as an external library and DELEGATECALLs in
+    ///         (keeps the engine under EIP-170). Settles funding accrued up to the freeze and caps
+    ///         the trader's loss at posted collateral.
+    /// @param  subjectId   Force-settled subject.
+    /// @param  claimant    Position owner claiming the unwind (the engine's `msg.sender`).
+    /// @return cappedPnl   Signed PnL (funding-adjusted, loss-capped at collateral) booked to the vault.
+    function forceSettlementClose(bytes32 subjectId, address claimant) public returns (int256 cappedPnl) {
+        PerpStorage.Layout storage perpS = PerpStorage.load();
+        if (!perpS.subjectForceSettled[subjectId]) revert SubjectNotForceSettled(subjectId);
+
+        bytes32 positionId = perpS.openPositionId[claimant][subjectId];
+        if (positionId == bytes32(0)) revert PositionNotOpen(subjectId);
+
+        IPerpEngine.Position memory orig = perpS.positions[positionId];
+        uint256 markCaptured = perpS.subjectSettlementMark[subjectId];
+
+        // Trading PnL at the captured mark + funding accrued up to the freeze. The cumulative index
+        // stops advancing once the subject is paused/delisted (pushFundingIndex is pause-aware), so
+        // the index read here is frozen at (or before) the force-settlement timestamp.
+        int256 pnl = PositionMath.unrealizedPnl(orig.size, orig.entryPrice, markCaptured);
+        int256 fundingDebt6 = FundingMath.computeFundingDebt(
+            orig.size, FundingStorage.load().cumulativeFundingIndex[subjectId], orig.entryFundingIndex
+        );
+
+        // Fold funding into the vault pnl leg, then cap the trader's loss at posted collateral
+        // (v2-audit Fix #1): a position underwater past its collateral pays out 0 and the vault
+        // keeps the full collateral; the uncovered remainder is an unfunded LP loss in v0.
+        int256 effectivePnl = pnl - fundingDebt6;
+        cappedPnl = effectivePnl;
+        int256 returnedSigned = int256(orig.collateral) + effectivePnl;
+        uint256 returned;
+        if (returnedSigned < 0) {
+            cappedPnl = -int256(orig.collateral);
+            returned = 0;
+        } else {
+            returned = uint256(returnedSigned);
+        }
+
+        uint256 absSize = orig.size > 0 ? uint256(orig.size) : uint256(-orig.size);
+        uint256 openingNotional = (absSize * orig.entryPrice) / ONE;
+
+        // CEI: state mutations before the external settle.
+        delete perpS.positions[positionId];
+        delete perpS.openPositionId[claimant][subjectId];
+        bool isLong = orig.size > 0;
+        if (isLong) {
+            perpS.totalLongOI[subjectId] -= openingNotional;
+        } else {
+            perpS.totalShortOI[subjectId] -= openingNotional;
+        }
+        address me = perpS.marginEngine;
+        if (me != address(0)) {
+            bytes32 categoryId = ISubjectRegistry(perpS.subjectRegistry).subjectOf(subjectId).categoryId;
+            IMarginEngine(me).recordCloseDelta(claimant, categoryId, openingNotional, isLong);
+        }
+
+        ILPVault(perpS.lpVault).settlePosition(claimant, orig.collateral, cappedPnl, 0, 0, 0);
+
+        emit FundingSettled(positionId, claimant, fundingDebt6);
+        emit PositionClosedAtForcedSettlement(positionId, claimant, subjectId, cappedPnl, returned);
     }
 }
