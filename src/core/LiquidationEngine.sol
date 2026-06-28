@@ -391,7 +391,10 @@ contract LiquidationEngine is Initializable, UUPSUpgradeable, ReentrancyGuard, I
     ///      fairness (deleveraging only as much size as the bad position carried, in priority order)
     ///      is enforced by the size-match below + the trusted keeper ordering. See AUDIT_PREP.md;
     ///      this path requires mandatory human + external-audit sign-off.
-    function adl(bytes32 badPositionId, bytes32[] calldata counterpartyIds)
+    function adl(
+        bytes32 badPositionId,
+        bytes32[] calldata counterpartyIds
+    )
         external
         nonReentrant
         onlyLiquidator
@@ -499,8 +502,7 @@ contract LiquidationEngine is Initializable, UUPSUpgradeable, ReentrancyGuard, I
         // Compute the slice's payout (collateral share + PnL realised at pBank). A negative payout
         // means the counterparty is insolvent at the bankruptcy price — closing it would create
         // fresh bad debt, so it is not an eligible ADL target.
-        uint256 collateralReleased =
-            closeAbs == cpAbs ? cp.collateral : (cp.collateral * closeAbs) / cpAbs;
+        uint256 collateralReleased = closeAbs == cpAbs ? cp.collateral : (cp.collateral * closeAbs) / cpAbs;
         int256 signedPnl = LiquidationMath.signedPnlAt(closeSize, cp.entryPrice, pBank);
         int256 payoutSigned = int256(collateralReleased) + signedPnl;
         if (payoutSigned < 0) revert ADLCounterpartyNotEligible(cpId);
@@ -534,9 +536,8 @@ contract LiquidationEngine is Initializable, UUPSUpgradeable, ReentrancyGuard, I
         // reset so the next mark push can put the partial budget back in play.
         if (mark != 0) {
             (, uint16 mmBps, uint16 bufBps,,) = IMarginEngine(s.marginEngine).marginParams();
-            bool underBuffer = LiquidationMath.isUnderLiquidationBuffer(
-                pos.size, pos.collateral, mark, pos.entryPrice, mmBps, bufBps
-            );
+            bool underBuffer =
+                LiquidationMath.isUnderLiquidationBuffer(pos.size, pos.collateral, mark, pos.entryPrice, mmBps, bufBps);
             if (underBuffer) revert StillUnderBuffer(positionId);
         }
 

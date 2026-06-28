@@ -107,10 +107,26 @@ contract LiquidationADLTest is Test {
             liqEngine = LiquidationEngine(address(new ERC1967Proxy(address(impl), initData)));
         }
 
-        _activate(address(vault), abi.encodeCall(LPVault.proposeSetPerpEngine, (address(engine))), abi.encodeCall(LPVault.activateSetPerpEngine, ()));
-        _activate(address(engine), abi.encodeCall(PerpEngine.proposeSetMarginEngine, (address(marginEngine))), abi.encodeCall(PerpEngine.activateSetMarginEngine, ()));
-        _activate(address(engine), abi.encodeCall(PerpEngine.proposeSetLiquidationEngine, (address(liqEngine))), abi.encodeCall(PerpEngine.activateSetLiquidationEngine, ()));
-        _activate(address(vault), abi.encodeCall(LPVault.proposeSetLiquidationEngine, (address(liqEngine))), abi.encodeCall(LPVault.activateSetLiquidationEngine, ()));
+        _activate(
+            address(vault),
+            abi.encodeCall(LPVault.proposeSetPerpEngine, (address(engine))),
+            abi.encodeCall(LPVault.activateSetPerpEngine, ())
+        );
+        _activate(
+            address(engine),
+            abi.encodeCall(PerpEngine.proposeSetMarginEngine, (address(marginEngine))),
+            abi.encodeCall(PerpEngine.activateSetMarginEngine, ())
+        );
+        _activate(
+            address(engine),
+            abi.encodeCall(PerpEngine.proposeSetLiquidationEngine, (address(liqEngine))),
+            abi.encodeCall(PerpEngine.activateSetLiquidationEngine, ())
+        );
+        _activate(
+            address(vault),
+            abi.encodeCall(LPVault.proposeSetLiquidationEngine, (address(liqEngine))),
+            abi.encodeCall(LPVault.activateSetLiquidationEngine, ())
+        );
 
         vm.prank(governance);
         liqEngine.proposeAddLiquidator(liquidator);
@@ -275,7 +291,9 @@ contract LiquidationADLTest is Test {
         bytes32[] memory cps = new bytes32[](1);
         cps[0] = cpId;
         vm.prank(liquidator);
-        vm.expectRevert(abi.encodeWithSelector(ILiquidationEngine.ADLInsufficientCounterpartySize.selector, uint256(2000e6)));
+        vm.expectRevert(
+            abi.encodeWithSelector(ILiquidationEngine.ADLInsufficientCounterpartySize.selector, uint256(2000e6))
+        );
         liqEngine.adl(badId, cps);
     }
 

@@ -399,15 +399,7 @@ library LiquidationMath {
     /// @dev    `pnl6 = size × (closePrice − entryPrice) / 1e18`, 6-dec USDC. Shared so the ADL
     ///         path realises counterparty PnL at the bankruptcy price with the same convention
     ///         used everywhere else in this library.
-    function signedPnlAt(
-        int256 size,
-        uint256 entryPrice,
-        uint256 closePrice
-    )
-        internal
-        pure
-        returns (int256)
-    {
+    function signedPnlAt(int256 size, uint256 entryPrice, uint256 closePrice) internal pure returns (int256) {
         int256 priceDelta = int256(closePrice) - int256(entryPrice);
         return (size * priceDelta) / int256(ONE_E18);
     }
