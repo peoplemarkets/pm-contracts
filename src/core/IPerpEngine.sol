@@ -295,6 +295,12 @@ interface IPerpEngine {
         uint256 collateral,
         uint256 fee
     );
+    /// @dev BREAKING (event signature / topic0 change): `size` and `isLong` were appended in
+    ///      feat/position-closed-size. Adding fields changes the keccak event signature, so every
+    ///      off-chain decoder (engine + indexer) MUST resync to the new ABI before reading closes.
+    ///      `size` is the SIGNED slice actually closed on this call (full position on a full close,
+    ///      the pro-rata slice on a partial close); `isLong` is the position side. Together with the
+    ///      existing legs they let indexers reconstruct the close-leg directional money-flow.
     event PositionClosed(
         bytes32 indexed positionId,
         address indexed trader,
@@ -302,7 +308,9 @@ interface IPerpEngine {
         int256 realizedPnl,
         uint256 fee,
         uint256 returnedToTrader,
-        bool isFullClose
+        bool isFullClose,
+        int256 size,
+        bool isLong
     );
     event CollateralAdded(bytes32 indexed positionId, uint256 amount, uint256 newCollateral);
     event CollateralRemoved(bytes32 indexed positionId, uint256 amount, uint256 newCollateral);
@@ -322,12 +330,18 @@ interface IPerpEngine {
     event CappedTvlPoked(uint256 newTvl, address indexed by);
     event MarkDeltaCapExceeded(bytes32 indexed subjectId, uint256 oldMark, uint256 newMark, uint16 capBps);
     event SubjectForceSettled(bytes32 indexed subjectId, uint256 settlementMark, address indexed by);
+    /// @dev BREAKING (event signature / topic0 change): `size` and `isLong` were appended in
+    ///      feat/position-closed-size to keep the forced-settlement close leg reconstructable
+    ///      off-chain. Forced settlement is always a FULL close, so `size` is the full signed
+    ///      position size and `isLong` its side. Decoders MUST resync to the new ABI.
     event PositionClosedAtForcedSettlement(
         bytes32 indexed positionId,
         address indexed trader,
         bytes32 indexed subjectId,
         int256 realizedPnl,
-        uint256 returnedToTrader
+        uint256 returnedToTrader,
+        int256 size,
+        bool isLong
     );
     event GovernanceTransferProposed(address indexed newGovernance, uint64 activatesAt);
     event GovernanceTransferActivated(address indexed oldGovernance, address indexed newGovernance);

@@ -384,7 +384,12 @@ contract PerpEngine is Initializable, UUPSUpgradeable, ReentrancyGuard, IPerpEng
         // vault; `< 0` ⇒ trader received funding from the vault. Reported separately from the
         // trading PnL (`PositionClosed.realizedPnl`) so indexers can decompose the two.
         emit FundingSettled(positionId, trader, v.fundingDebt6);
-        emit PositionClosed(positionId, trader, p.subjectId, v.realizedPnl, v.fee, v.returned, v.fullClose);
+        // `v.closeSize` is the SIGNED slice actually closed (full size on a full close, the
+        // pro-rata slice on a partial close); `v.isLong` is the position side. See IPerpEngine —
+        // appending these fields is a BREAKING event-signature change for off-chain decoders.
+        emit PositionClosed(
+            positionId, trader, p.subjectId, v.realizedPnl, v.fee, v.returned, v.fullClose, v.closeSize, v.isLong
+        );
         return v.realizedPnl;
     }
 

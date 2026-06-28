@@ -4,7 +4,7 @@ pragma solidity 0.8.24;
 import {ERC1967Proxy} from "@openzeppelin/contracts/proxy/ERC1967/ERC1967Proxy.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 
-import {Test} from "forge-std/Test.sol";
+import {Test, Vm} from "forge-std/Test.sol";
 
 import {ILPVault} from "../src/core/ILPVault.sol";
 import {IMarginEngine} from "../src/core/IMarginEngine.sol";
@@ -706,6 +706,112 @@ contract PerpEngineTest is Test {
         assertEq(pos.entryPrice, INITIAL_MARK); // unchanged
         (uint256 longOI,) = engine.openInterestOf(SUBJECT_ID);
         assertEq(longOI, 25_000 * ONE_USDC); // halved
+    }
+
+    // --- PositionClosed size+side leg (feat/position-closed-size) ---
+    // The close event carries the SIGNED slice actually closed plus the side so off-chain
+    // services can reconstruct the close-leg directional money-flow. These assert the slice on a
+    // partial close, the full size on a full close, and the side for both long and short.
+
+    bytes32 internal constant _POSITION_CLOSED_TOPIC0 = keccak256(
+        "PositionClosed(bytes32,address,bytes32,int256,uint256,uint256,bool,int256,bool)"
+    );
+    bytes32 internal constant _FORCED_CLOSE_TOPIC0 = keccak256(
+        "PositionClosedAtForcedSettlement(bytes32,address,bytes32,int256,uint256,int256,bool)"
+    );
+
+    /// @dev Pulls the (size, isLong) leg out of the most recent PositionClosed log.
+    function _lastClosedSizeSide(Vm.Log[] memory logs) internal pure returns (int256 size, bool isLong, bool found) {
+        for (uint256 i = logs.length; i > 0; i--) {
+            Vm.Log memory l = logs[i - 1];
+            if (l.topics.length > 0 && l.topics[0] == _POSITION_CLOSED_TOPIC0) {
+                (,,,, size, isLong) = abi.decode(l.data, (int256, uint256, uint256, bool, int256, bool));
+                return (size, isLong, true);
+            }
+        }
+    }
+
+    /// @dev Pulls the (size, isLong) leg out of the most recent PositionClosedAtForcedSettlement log.
+    function _lastForcedSizeSide(Vm.Log[] memory logs) internal pure returns (int256 size, bool isLong, bool found) {
+        for (uint256 i = logs.length; i > 0; i--) {
+            Vm.Log memory l = logs[i - 1];
+            if (l.topics.length > 0 && l.topics[0] == _FORCED_CLOSE_TOPIC0) {
+                (,, size, isLong) = abi.decode(l.data, (int256, uint256, int256, bool));
+                return (size, isLong, true);
+            }
+        }
+    }
+
+    function test_ClosePosition_EmitsFullSizeAndLongSide() public {
+        bytes32 positionId = _open(_baseOpenParams());
+        int256 fullSize = engine.positionOf(positionId).size;
+        assertGt(fullSize, 0); // long
+
+        vm.recordLogs();
+        vm.prank(trader);
+        engine.closePosition(_baseCloseParams()); // 100% close
+        (int256 size, bool isLong, bool found) = _lastClosedSizeSide(vm.getRecordedLogs());
+
+        assertTrue(found, "PositionClosed not emitted");
+        assertEq(size, fullSize, "full close must emit the full position size");
+        assertTrue(isLong, "long side");
+    }
+
+    function test_ClosePosition_EmitsSliceSizeOnPartialClose() public {
+        bytes32 positionId = _open(_baseOpenParams());
+        int256 fullSize = engine.positionOf(positionId).size;
+
+        IPerpEngine.CloseParams memory p = _baseCloseParams();
+        p.sizeFractionBps = 5_000; // 50%
+        int256 expectedSlice = (fullSize * 5_000) / 10_000; // mirror the contract formula
+
+        vm.recordLogs();
+        vm.prank(trader);
+        engine.closePosition(p);
+        (int256 size, bool isLong, bool found) = _lastClosedSizeSide(vm.getRecordedLogs());
+
+        assertTrue(found, "PositionClosed not emitted");
+        assertEq(size, expectedSlice, "partial close must emit the slice, not the full size");
+        assertLt(size, fullSize, "slice strictly smaller than full size");
+        assertTrue(isLong, "long side");
+        // Residual still open and equal to the un-closed remainder.
+        assertEq(engine.positionOf(positionId).size, fullSize - expectedSlice);
+    }
+
+    function test_ClosePosition_EmitsShortSideWithSignedSize() public {
+        IPerpEngine.OpenParams memory op = _baseOpenParams();
+        op.side = IPerpEngine.Side.SHORT;
+        bytes32 positionId = _open(op);
+        int256 fullSize = engine.positionOf(positionId).size;
+        assertLt(fullSize, 0); // short → negative signed size
+
+        vm.recordLogs();
+        vm.prank(trader);
+        engine.closePosition(_baseCloseParams()); // 100% close
+        (int256 size, bool isLong, bool found) = _lastClosedSizeSide(vm.getRecordedLogs());
+
+        assertTrue(found, "PositionClosed not emitted");
+        assertEq(size, fullSize, "short full close emits the signed full size");
+        assertLt(size, 0, "short slice is negative");
+        assertFalse(isLong, "short side");
+    }
+
+    function test_CloseAtForcedSettlement_EmitsFullSizeAndSide() public {
+        bytes32 positionId = _open(_baseOpenParams());
+        int256 fullSize = engine.positionOf(positionId).size;
+        _delistSubject(SUBJECT_ID);
+        vm.prank(governance);
+        engine.forceSettleSubject(SUBJECT_ID, INITIAL_MARK);
+
+        vm.recordLogs();
+        vm.prank(trader);
+        engine.closeAtForcedSettlement(SUBJECT_ID);
+        (int256 size, bool isLong, bool found) = _lastForcedSizeSide(vm.getRecordedLogs());
+
+        assertTrue(found, "PositionClosedAtForcedSettlement not emitted");
+        // Forced settlement is always a full close.
+        assertEq(size, fullSize, "forced settlement emits the full signed size");
+        assertTrue(isLong, "long side");
     }
 
     function test_ClosePosition_RevertOnGlobalHalt() public {
