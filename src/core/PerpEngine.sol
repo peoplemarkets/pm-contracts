@@ -8,6 +8,7 @@ import {UUPSUpgradeable} from "@openzeppelin/contracts-upgradeable/proxy/utils/U
 
 import {ReentrancyGuard} from "solady/utils/ReentrancyGuard.sol";
 
+import {FundingMath} from "../libraries/FundingMath.sol";
 import {PerpInternals} from "../libraries/PerpInternals.sol";
 import {PositionMath} from "../libraries/PositionMath.sol";
 import {FundingStorage, PerpStorage} from "../libraries/StorageLib.sol";
@@ -273,6 +274,16 @@ contract PerpEngine is Initializable, UUPSUpgradeable, ReentrancyGuard, IPerpEng
         uint256 closeCollateral;
         uint256 openingNotionalDelta;
         int256 realizedPnl;
+        // Funding debt settled on the closed slice. Signed, 6-decimal USDC: positive = trader OWES
+        // funding (deducted from payout, credited to the LP vault); negative = trader RECEIVES
+        // funding (added to payout, debited from the LP vault). Computed from the cumulative
+        // funding index delta (currentIndex − entryFundingIndex) via `FundingMath.computeFundingDebt`.
+        int256 fundingDebt6;
+        // PnL leg actually booked to the vault on settle: `realizedPnl − fundingDebt6`. Folding
+        // funding into the vault's signed-pnl leg keeps a single settlement primitive (the vault is
+        // the universal counterparty), so funding paid by traders accrues to LP `freeAssets` and
+        // funding owed to traders is paid out of it.
+        int256 settlePnl;
         uint256 fee;
         uint256 lpRebate;
         uint256 insuranceShare;
@@ -325,7 +336,13 @@ contract PerpEngine is Initializable, UUPSUpgradeable, ReentrancyGuard, IPerpEng
         _checkSlippage(markNow, p.expectedMark, p.maxSlippageBps);
 
         Position memory orig = perpS.positions[positionId];
-        _CloseValues memory v = _computeCloseValues(orig, markNow, p.sizeFractionBps, p.isMaker);
+        // Funding settlement (Tier-1): the cumulative funding index is the single source of truth,
+        // pushed by FundingEngine via `pushFundingIndex` and frozen during pauses. We settle funding
+        // on the CLOSED SLICE only; the residual keeps its original `entryFundingIndex`, so funding
+        // that accrued over the residual's lifetime is settled in full at its own eventual close —
+        // no double counting, no missed accrual.
+        int256 currentFundingIndex = FundingStorage.load().cumulativeFundingIndex[p.subjectId];
+        _CloseValues memory v = _computeCloseValues(orig, markNow, p.sizeFractionBps, p.isMaker, currentFundingIndex);
 
         // Update position state.
         if (v.fullClose) {
@@ -356,13 +373,17 @@ contract PerpEngine is Initializable, UUPSUpgradeable, ReentrancyGuard, IPerpEng
             );
         }
 
+        // Settle the closed slice against the vault. The pnl leg is `realizedPnl − fundingDebt6`
+        // (funding folded in — see `_CloseValues.settlePnl`). Fees are unchanged; funding is NOT
+        // a fee and does not route through the lpRebate/insurance split.
         ILPVault(perpS.lpVault).settlePosition(
-            trader, v.closeCollateral, v.realizedPnl, v.fee, v.lpRebate, v.insuranceShare
+            trader, v.closeCollateral, v.settlePnl, v.fee, v.lpRebate, v.insuranceShare
         );
 
-        // Tier-1 funding event stub: FundingEngine v1 has not shipped, so the funding debt at
-        // close is 0. The event is wired today so indexers can subscribe without a redeploy.
-        emit FundingSettled(positionId, trader, int256(0));
+        // Funding settled on the closed slice. `fundingDebt6 > 0` ⇒ trader paid funding into the
+        // vault; `< 0` ⇒ trader received funding from the vault. Reported separately from the
+        // trading PnL (`PositionClosed.realizedPnl`) so indexers can decompose the two.
+        emit FundingSettled(positionId, trader, v.fundingDebt6);
         emit PositionClosed(positionId, trader, p.subjectId, v.realizedPnl, v.fee, v.returned, v.fullClose);
         return v.realizedPnl;
     }
@@ -371,7 +392,8 @@ contract PerpEngine is Initializable, UUPSUpgradeable, ReentrancyGuard, IPerpEng
         Position memory orig,
         uint256 markNow,
         uint256 sizeFractionBps,
-        bool isMaker
+        bool isMaker,
+        int256 currentFundingIndex
     )
         internal
         view
@@ -395,8 +417,17 @@ contract PerpEngine is Initializable, UUPSUpgradeable, ReentrancyGuard, IPerpEng
 
         (v.fee, v.lpRebate, v.insuranceShare) = _computeFees(closeNotionalAtMark, isMaker);
 
-        // Underwater guard. v0 has no liquidation; voluntary close into negative equity reverts.
-        int256 returnedSigned = int256(v.closeCollateral) + v.realizedPnl - int256(v.fee);
+        // Funding debt on the closed slice. `computeFundingDebt = closeSize × (currentIndex −
+        // entryIndex) / 1e18`. Sign: long + index-grew ⇒ pays; short + index-grew ⇒ receives.
+        // The `settlePnl` leg folds funding into the vault settlement.
+        v.fundingDebt6 = FundingMath.computeFundingDebt(v.closeSize, currentFundingIndex, orig.entryFundingIndex);
+        v.settlePnl = v.realizedPnl - v.fundingDebt6;
+
+        // Underwater guard. Voluntary close into negative equity (after funding) reverts — the
+        // LiquidationEngine waterfall is the only path that clears a position whose equity cannot
+        // cover its obligations. Funding is included so a position pushed underwater purely by
+        // accrued funding debt cannot be voluntarily closed at the vault's expense.
+        int256 returnedSigned = int256(v.closeCollateral) + v.settlePnl - int256(v.fee);
         if (returnedSigned < 0) revert UnderwaterClose(returnedSigned);
         v.returned = uint256(returnedSigned);
     }
@@ -443,14 +474,25 @@ contract PerpEngine is Initializable, UUPSUpgradeable, ReentrancyGuard, IPerpEng
         // Full close, zero fee. Reuse PositionMath for PnL.
         int256 pnl = PositionMath.unrealizedPnl(orig.size, orig.entryPrice, markCaptured);
 
-        // v2-audit Fix #1: cap the trader's loss at posted collateral. If the captured mark puts
-        // the position deep underwater (loss > collateral), the trader gets nothing, the vault
+        // Funding accrued up to the freeze. `pushFundingIndex` routes through `requireTradeable`, so
+        // the cumulative index stops advancing the moment a subject is paused/delisted — the index
+        // read here is therefore frozen at (or before) the force-settlement timestamp. We still owe
+        // the funding that accrued while the subject was live, so it is settled here too.
+        int256 fundingDebt6 =
+            FundingMath.computeFundingDebt(orig.size, FundingStorage.load().cumulativeFundingIndex[subjectId], orig.entryFundingIndex);
+
+        // v2-audit Fix #1: cap the trader's loss at posted collateral. If the captured mark + funding
+        // put the position deep underwater (loss > collateral), the trader gets nothing, the vault
         // keeps the full collateral, and the position is cleanly cleared from `positionCollateral`.
         // The shortfall (true loss − collateral) is an unfunded LP loss in v0; full coverage from
         // the insurance fund lands with the InsuranceFund / LiquidationEngine work (week 14+).
         // Without this cap, every revert here would permanently strand the trader's collateral.
-        int256 cappedPnl = pnl;
-        int256 returnedSigned = int256(orig.collateral) + pnl;
+        //
+        // `effectivePnl` folds funding into the pnl leg booked to the vault (funding owed reduces
+        // the trader payout / accrues to LP; funding credit increases it).
+        int256 effectivePnl = pnl - fundingDebt6;
+        int256 cappedPnl = effectivePnl;
+        int256 returnedSigned = int256(orig.collateral) + effectivePnl;
         uint256 returned;
         if (returnedSigned < 0) {
             cappedPnl = -int256(orig.collateral); // full collateral wiped, no payout
@@ -482,8 +524,10 @@ contract PerpEngine is Initializable, UUPSUpgradeable, ReentrancyGuard, IPerpEng
         // boundary it computes returnedSigned = 0, which is fine.
         ILPVault(perpS.lpVault).settlePosition(msg.sender, orig.collateral, cappedPnl, 0, 0, 0);
 
-        // Tier-1 funding event stub: same rationale as `closePosition` — 0 delta in v0.
-        emit FundingSettled(positionId, msg.sender, int256(0));
+        // Report the funding settled on this close. Note: when the position is capped underwater
+        // (returnedSigned < 0), the realized funding actually collected by the vault is bounded by
+        // the wiped collateral; `fundingDebt6` here is the economically-owed funding for indexers.
+        emit FundingSettled(positionId, msg.sender, fundingDebt6);
         emit PositionClosedAtForcedSettlement(positionId, msg.sender, subjectId, cappedPnl, returned);
         return cappedPnl;
     }
