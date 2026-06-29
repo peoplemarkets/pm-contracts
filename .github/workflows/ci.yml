@@ -67,9 +67,20 @@ jobs:
         with:
           version: nightly
 
+      - name: Show forge version
+        run: forge --version
+
+      # slither-action runs inside a Docker container that does not have forge on
+      # its PATH, so it cannot drive the Foundry build itself. Compile here on the
+      # host (where foundry-toolchain installed forge) and emit build-info JSON so
+      # Slither can consume the pre-built artifacts via `ignore-compile`.
+      - name: Build (with build-info for Slither)
+        run: forge build --build-info
+
       - name: Run Slither
         uses: crytic/slither-action@v0.4.0
         with:
           fail-on: high
           slither-config: slither.config.json
           target: "src/"
+          ignore-compile: true
