@@ -2,8 +2,18 @@
 pragma solidity 0.8.24;
 
 interface IEventMarket {
-    enum Status { OPEN, PAUSED, PENDING_RESOLUTION, RESOLVED }
-    enum Outcome { UNRESOLVED, YES, NO, VOID }
+    enum Status {
+        OPEN,
+        PAUSED,
+        PENDING_RESOLUTION,
+        RESOLVED
+    }
+    enum Outcome {
+        UNRESOLVED,
+        YES,
+        NO,
+        VOID
+    }
 
     struct MarketParams {
         bytes32 subjectId;
@@ -15,11 +25,38 @@ interface IEventMarket {
         uint256 lmsrB; // Liquidity parameter B (scaled to 1e6)
     }
 
-    /// @notice Buy outcome shares
-    function buyOutcome(bool isYes, uint256 usdcAmount) external returns (uint256 shares);
+    /// @notice Buy outcome shares for `msg.sender`. Reverts if the minted shares would be below
+    ///         `minSharesOut` (slippage protection).
+    function buyOutcome(bool isYes, uint256 usdcAmount, uint256 minSharesOut) external returns (uint256 shares);
 
-    /// @notice Sell outcome shares
-    function sellOutcome(bool isYes, uint256 shares) external returns (uint256 usdcOut);
+    /// @notice Sell outcome shares held by `msg.sender`. Reverts if the USDC returned would be
+    ///         below `minUsdcOut` (slippage protection).
+    function sellOutcome(bool isYes, uint256 shares, uint256 minUsdcOut) external returns (uint256 usdcOut);
+
+    /// @notice Operator-gated buy on behalf of `trader`. Only an allowlisted operator
+    ///         (`factory.isOperator(msg.sender)`) may call. USDC is pulled from the caller (the
+    ///         operator/router, which has already collected it from `trader`); shares are credited
+    ///         to `trader` and the `SharesBought` event reports `trader` as the buyer.
+    function buyOutcomeFor(
+        address trader,
+        bool isYes,
+        uint256 usdcAmount,
+        uint256 minSharesOut
+    )
+        external
+        returns (uint256 shares);
+
+    /// @notice Operator-gated sell on behalf of `trader`. Only an allowlisted operator may call.
+    ///         Shares are burned from `trader`'s balance and the USDC proceeds are sent directly to
+    ///         `trader`; the `SharesSold` event reports `trader` as the seller.
+    function sellOutcomeFor(
+        address trader,
+        bool isYes,
+        uint256 shares,
+        uint256 minUsdcOut
+    )
+        external
+        returns (uint256 usdcOut);
 
     /// @notice Redeem winnings after resolution
     function redeemWinnings() external returns (uint256 usdcOut);

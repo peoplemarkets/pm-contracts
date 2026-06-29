@@ -5,10 +5,10 @@ import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 import {ReentrancyGuard} from "solady/utils/ReentrancyGuard.sol";
 
+import {UMAAdapter} from "../oracle/UMAAdapter.sol";
 import {IEventMarket} from "./IEventMarket.sol";
 import {IEventMarketFactory} from "./IEventMarketFactory.sol";
 import {LMSRMath} from "./LMSRMath.sol";
-import {UMAAdapter} from "../oracle/UMAAdapter.sol";
 
 import {Initializable} from "@openzeppelin/contracts-upgradeable/proxy/utils/Initializable.sol";
 
@@ -36,11 +36,13 @@ contract EventMarket is Initializable, IEventMarket, ReentrancyGuard {
     event MarketResolved(Outcome finalOutcome);
     event WinningsRedeemed(address indexed user, uint256 usdcPayout);
 
-    function initialize(
-        IERC20 usdc_,
-        UMAAdapter umaAdapter_,
-        MarketParams memory params_
-    ) external initializer {
+    error AmountZero();
+    error NotOperator(address caller);
+    error ZeroTrader();
+    error InsufficientBalance();
+    error SlippageExceeded(uint256 got, uint256 minRequired);
+
+    function initialize(IERC20 usdc_, UMAAdapter umaAdapter_, MarketParams memory params_) external initializer {
         usdc = usdc_;
         factory = IEventMarketFactory(msg.sender);
         umaAdapter = umaAdapter_;
@@ -60,47 +62,144 @@ contract EventMarket is Initializable, IEventMarket, ReentrancyGuard {
         _;
     }
 
-    /// @inheritdoc IEventMarket
-    function buyOutcome(bool isYes, uint256 usdcAmount) external nonReentrant onlyOpen returns (uint256 shares) {
-        require(usdcAmount > 0, "EventMarket: amount zero");
-
-        // Transfer USDC from user to this market
-        usdc.safeTransferFrom(msg.sender, address(this), usdcAmount);
-
-        // Calculate shares to mint
-        if (isYes) {
-            shares = LMSRMath.sharesForUsdc(q1, q2, _params.lmsrB, usdcAmount);
-            q1 += shares;
-            yesBalance[msg.sender] += shares;
-        } else {
-            shares = LMSRMath.sharesForUsdc(q2, q1, _params.lmsrB, usdcAmount);
-            q2 += shares;
-            noBalance[msg.sender] += shares;
-        }
-
-        emit SharesBought(msg.sender, isYes, usdcAmount, shares);
+    /// @dev Restricts to operators allowlisted on the factory (the engine-relayed `*For` path).
+    ///      The EventMarketRouter is registered as such an operator; the market trusts it to supply
+    ///      a faithful `trader`. This is the first of the two trust layers (see EventMarketRouter).
+    modifier onlyOperator() {
+        if (!factory.isOperator(msg.sender)) revert NotOperator(msg.sender);
+        _;
     }
 
     /// @inheritdoc IEventMarket
-    function sellOutcome(bool isYes, uint256 sharesAmount) external nonReentrant onlyOpen returns (uint256 usdcOut) {
-        require(sharesAmount > 0, "EventMarket: amount zero");
+    function buyOutcome(
+        bool isYes,
+        uint256 usdcAmount,
+        uint256 minSharesOut
+    )
+        external
+        nonReentrant
+        onlyOpen
+        returns (uint256 shares)
+    {
+        return _buyOutcomeFor(msg.sender, isYes, usdcAmount, minSharesOut);
+    }
 
+    /// @inheritdoc IEventMarket
+    function buyOutcomeFor(
+        address trader,
+        bool isYes,
+        uint256 usdcAmount,
+        uint256 minSharesOut
+    )
+        external
+        nonReentrant
+        onlyOpen
+        onlyOperator
+        returns (uint256 shares)
+    {
+        if (trader == address(0)) revert ZeroTrader();
+        return _buyOutcomeFor(trader, isYes, usdcAmount, minSharesOut);
+    }
+
+    /// @dev Shared buy-path implementation. Mirrors `PerpEngine._openPositionFor`: USDC is always
+    ///      pulled from `msg.sender` (the trader directly on the self-custody path, or the operator
+    ///      /router on the relayed path), while shares are credited to — and the `SharesBought`
+    ///      event reports — `trader`. The relayed router has already collected the USDC from
+    ///      `trader` and approved this market before calling.
+    function _buyOutcomeFor(
+        address trader,
+        bool isYes,
+        uint256 usdcAmount,
+        uint256 minSharesOut
+    )
+        internal
+        returns (uint256 shares)
+    {
+        if (usdcAmount == 0) revert AmountZero();
+
+        // Pull USDC from the immediate caller (trader on the direct path; router on the relayed path).
+        usdc.safeTransferFrom(msg.sender, address(this), usdcAmount);
+
+        // Calculate shares to mint and credit them to the trader.
         if (isYes) {
-            require(yesBalance[msg.sender] >= sharesAmount, "EventMarket: insufficient YES balance");
-            usdcOut = LMSRMath.usdcForShares(q1, q2, _params.lmsrB, sharesAmount);
-            q1 -= sharesAmount;
-            yesBalance[msg.sender] -= sharesAmount;
+            shares = LMSRMath.sharesForUsdc(q1, q2, _params.lmsrB, usdcAmount);
+            q1 += shares;
+            yesBalance[trader] += shares;
         } else {
-            require(noBalance[msg.sender] >= sharesAmount, "EventMarket: insufficient NO balance");
-            usdcOut = LMSRMath.usdcForShares(q2, q1, _params.lmsrB, sharesAmount);
-            q2 -= sharesAmount;
-            noBalance[msg.sender] -= sharesAmount;
+            shares = LMSRMath.sharesForUsdc(q2, q1, _params.lmsrB, usdcAmount);
+            q2 += shares;
+            noBalance[trader] += shares;
         }
 
-        // Transfer USDC back to user
-        usdc.safeTransfer(msg.sender, usdcOut);
+        if (shares < minSharesOut) revert SlippageExceeded(shares, minSharesOut);
 
-        emit SharesSold(msg.sender, isYes, sharesAmount, usdcOut);
+        emit SharesBought(trader, isYes, usdcAmount, shares);
+    }
+
+    /// @inheritdoc IEventMarket
+    function sellOutcome(
+        bool isYes,
+        uint256 sharesAmount,
+        uint256 minUsdcOut
+    )
+        external
+        nonReentrant
+        onlyOpen
+        returns (uint256 usdcOut)
+    {
+        return _sellOutcomeFor(msg.sender, isYes, sharesAmount, minUsdcOut);
+    }
+
+    /// @inheritdoc IEventMarket
+    function sellOutcomeFor(
+        address trader,
+        bool isYes,
+        uint256 sharesAmount,
+        uint256 minUsdcOut
+    )
+        external
+        nonReentrant
+        onlyOpen
+        onlyOperator
+        returns (uint256 usdcOut)
+    {
+        if (trader == address(0)) revert ZeroTrader();
+        return _sellOutcomeFor(trader, isYes, sharesAmount, minUsdcOut);
+    }
+
+    /// @dev Shared sell-path implementation. Shares are burned from `trader`'s balance and the USDC
+    ///      proceeds are sent directly to `trader` (the owner of the position) on both the direct
+    ///      and relayed paths — the router never custodies sell proceeds. The `SharesSold` event
+    ///      reports `trader` as the seller.
+    function _sellOutcomeFor(
+        address trader,
+        bool isYes,
+        uint256 sharesAmount,
+        uint256 minUsdcOut
+    )
+        internal
+        returns (uint256 usdcOut)
+    {
+        if (sharesAmount == 0) revert AmountZero();
+
+        if (isYes) {
+            if (yesBalance[trader] < sharesAmount) revert InsufficientBalance();
+            usdcOut = LMSRMath.usdcForShares(q1, q2, _params.lmsrB, sharesAmount);
+            q1 -= sharesAmount;
+            yesBalance[trader] -= sharesAmount;
+        } else {
+            if (noBalance[trader] < sharesAmount) revert InsufficientBalance();
+            usdcOut = LMSRMath.usdcForShares(q2, q1, _params.lmsrB, sharesAmount);
+            q2 -= sharesAmount;
+            noBalance[trader] -= sharesAmount;
+        }
+
+        if (usdcOut < minUsdcOut) revert SlippageExceeded(usdcOut, minUsdcOut);
+
+        // Send proceeds to the position owner (trader), not the caller.
+        usdc.safeTransfer(trader, usdcOut);
+
+        emit SharesSold(trader, isYes, sharesAmount, usdcOut);
     }
 
     /// @inheritdoc IEventMarket
@@ -108,26 +207,36 @@ contract EventMarket is Initializable, IEventMarket, ReentrancyGuard {
         // This acts as a wrapper around UMAAdapter's proposeAssertion to conveniently format the claim
         // The user must still have approved UMAAdapter to spend the bond.
         // We use the eventId as the metricId for the UMA metric.
-        require(proposedOutcome == Outcome.YES || proposedOutcome == Outcome.NO || proposedOutcome == Outcome.VOID, "EventMarket: invalid outcome");
-        
-        string memory claim = string(abi.encodePacked(
-            "Assert that event ", _params.question, " resolved to ",
-            proposedOutcome == Outcome.YES ? "YES" : proposedOutcome == Outcome.NO ? "NO" : "VOID"
-        ));
+        require(
+            proposedOutcome == Outcome.YES || proposedOutcome == Outcome.NO || proposedOutcome == Outcome.VOID,
+            "EventMarket: invalid outcome"
+        );
+
+        string memory claim = string(
+            abi.encodePacked(
+                "Assert that event ",
+                _params.question,
+                " resolved to ",
+                proposedOutcome == Outcome.YES ? "YES" : proposedOutcome == Outcome.NO ? "NO" : "VOID"
+            )
+        );
 
         // The caller pays the bond directly to the adapter.
         umaAdapter.proposeAssertion(_params.eventId, uint256(proposedOutcome), bytes(claim));
-        
+
         _status = Status.PENDING_RESOLUTION;
     }
 
     /// @inheritdoc IEventMarket
     function settleResolution() external nonReentrant {
         require(_status == Status.OPEN || _status == Status.PENDING_RESOLUTION, "EventMarket: already resolved");
-        
+
         // Read the latest value from UMAAdapter
-        (uint256 value, ) = umaAdapter.latestValue(_params.eventId);
-        require(value == uint256(Outcome.YES) || value == uint256(Outcome.NO) || value == uint256(Outcome.VOID), "EventMarket: unsupported or unresolved value");
+        (uint256 value,) = umaAdapter.latestValue(_params.eventId);
+        require(
+            value == uint256(Outcome.YES) || value == uint256(Outcome.NO) || value == uint256(Outcome.VOID),
+            "EventMarket: unsupported or unresolved value"
+        );
 
         _outcome = Outcome(value);
         _status = Status.RESOLVED;
@@ -138,13 +247,14 @@ contract EventMarket is Initializable, IEventMarket, ReentrancyGuard {
             liability = q1;
         } else if (_outcome == Outcome.NO) {
             liability = q2;
-        } else { // VOID
+        } else {
+            // VOID
             liability = (q1 + q2) / 2; // 0.5 USDC per share
         }
 
         // Total USDC in the market is exactly LMSRMath.cost(q1, q2)
         uint256 currentCost = LMSRMath.cost(q1, q2, _params.lmsrB);
-        
+
         // Profit returned to LPVault is (currentCost - liability).
         // Due to rounding in exp/ln, we use actual balance minus liability.
         uint256 actualBalance = usdc.balanceOf(address(this));
@@ -161,7 +271,7 @@ contract EventMarket is Initializable, IEventMarket, ReentrancyGuard {
         else outcomeScore_e18 = 0; // VOID
 
         factory.onMarketResolved(_params.subjectId, _params.eventId, _params.eventClass, outcomeScore_e18, toReturn);
-        
+
         emit MarketResolved(_outcome);
     }
 
@@ -169,7 +279,7 @@ contract EventMarket is Initializable, IEventMarket, ReentrancyGuard {
     function redeemWinnings() external nonReentrant onlyResolved returns (uint256 payout) {
         uint256 yesShares = yesBalance[msg.sender];
         uint256 noShares = noBalance[msg.sender];
-        
+
         yesBalance[msg.sender] = 0;
         noBalance[msg.sender] = 0;
 
@@ -198,9 +308,23 @@ contract EventMarket is Initializable, IEventMarket, ReentrancyGuard {
         }
     }
 
-    function totalYesShares() external view returns (uint256) { return q1; }
-    function totalNoShares() external view returns (uint256) { return q2; }
-    function status() external view returns (Status) { return _status; }
-    function outcome() external view returns (Outcome) { return _outcome; }
-    function params() external view returns (MarketParams memory) { return _params; }
+    function totalYesShares() external view returns (uint256) {
+        return q1;
+    }
+
+    function totalNoShares() external view returns (uint256) {
+        return q2;
+    }
+
+    function status() external view returns (Status) {
+        return _status;
+    }
+
+    function outcome() external view returns (Outcome) {
+        return _outcome;
+    }
+
+    function params() external view returns (MarketParams memory) {
+        return _params;
+    }
 }
