@@ -126,8 +126,9 @@ contract LPVaultTest is Test {
 
     function test_Initialize_RevertOnTimelockTooLong() public {
         LPVault impl = new LPVault();
-        bytes memory initData =
-            abi.encodeCall(LPVault.initialize, (IERC20(address(usdc)), governance, operator, uint32(60 days), "x", "x"));
+        bytes memory initData = abi.encodeCall(
+            LPVault.initialize, (IERC20(address(usdc)), governance, operator, uint32(60 days), "x", "x")
+        );
         vm.expectRevert(ILPVault.InvalidConfig.selector);
         new ERC1967Proxy(address(impl), initData);
     }
@@ -1577,9 +1578,7 @@ contract LPVaultTest is Test {
         address liquidator = makeAddr("liquidator");
         vm.prank(perpEngine);
         vm.expectRevert(
-            abi.encodeWithSelector(
-                ILPVault.InsufficientFreeAssetsForLiquidation.selector, 100 * ONE_USDC, uint256(0)
-            )
+            abi.encodeWithSelector(ILPVault.InsufficientFreeAssetsForLiquidation.selector, 100 * ONE_USDC, uint256(0))
         );
         vault.settleLiquidation(trader, liquidator, 100 * ONE_USDC, 0, 200 * ONE_USDC, int256(100 * ONE_USDC));
 

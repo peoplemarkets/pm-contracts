@@ -168,14 +168,7 @@ contract BatchRouterTest is Test {
     // Helpers
     // ------------------------------------------------------------------------------------------
 
-    function _baseOpen(
-        bytes32 subjectId,
-        IPerpEngine.Side side
-    )
-        internal
-        view
-        returns (IPerpEngine.OpenParams memory)
-    {
+    function _baseOpen(bytes32 subjectId, IPerpEngine.Side side) internal view returns (IPerpEngine.OpenParams memory) {
         return IPerpEngine.OpenParams({
             subjectId: subjectId,
             side: side,

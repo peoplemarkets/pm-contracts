@@ -215,11 +215,7 @@ contract ChainlinkAdapter is Initializable, UUPSUpgradeable, IOracleAdapter {
 
         uint64 activatesAt = uint64(block.timestamp) + uint64(l.timelockDelay);
         l.pendingRegister[metricId] = PendingFeed({
-            aggregator: aggregator,
-            decimals: dec,
-            maxStaleness: maxStaleness,
-            activatesAt: activatesAt,
-            exists: true
+            aggregator: aggregator, decimals: dec, maxStaleness: maxStaleness, activatesAt: activatesAt, exists: true
         });
         emit FeedRegisterProposed(metricId, aggregator, dec, maxStaleness, activatesAt);
     }
@@ -235,10 +231,7 @@ contract ChainlinkAdapter is Initializable, UUPSUpgradeable, IOracleAdapter {
         if (l.feeds[metricId].registered) revert FeedAlreadyRegistered(metricId);
 
         l.feeds[metricId] = ChainlinkFeed({
-            aggregator: p.aggregator,
-            decimals: p.decimals,
-            maxStaleness: p.maxStaleness,
-            registered: true
+            aggregator: p.aggregator, decimals: p.decimals, maxStaleness: p.maxStaleness, registered: true
         });
         delete l.pendingRegister[metricId];
         emit FeedRegisterActivated(metricId, p.aggregator, p.decimals, p.maxStaleness);
@@ -280,11 +273,7 @@ contract ChainlinkAdapter is Initializable, UUPSUpgradeable, IOracleAdapter {
 
         uint64 activatesAt = uint64(block.timestamp) + uint64(l.timelockDelay);
         l.pendingUpdate[metricId] = PendingFeed({
-            aggregator: aggregator,
-            decimals: dec,
-            maxStaleness: maxStaleness,
-            activatesAt: activatesAt,
-            exists: true
+            aggregator: aggregator, decimals: dec, maxStaleness: maxStaleness, activatesAt: activatesAt, exists: true
         });
         emit FeedUpdateProposed(metricId, aggregator, dec, maxStaleness, activatesAt);
     }
@@ -299,10 +288,7 @@ contract ChainlinkAdapter is Initializable, UUPSUpgradeable, IOracleAdapter {
         if (!l.feeds[metricId].registered) revert FeedNotRegistered(metricId);
 
         l.feeds[metricId] = ChainlinkFeed({
-            aggregator: p.aggregator,
-            decimals: p.decimals,
-            maxStaleness: p.maxStaleness,
-            registered: true
+            aggregator: p.aggregator, decimals: p.decimals, maxStaleness: p.maxStaleness, registered: true
         });
         delete l.pendingUpdate[metricId];
         emit FeedUpdateActivated(metricId, p.aggregator, p.decimals, p.maxStaleness);
@@ -444,7 +430,7 @@ contract ChainlinkAdapter is Initializable, UUPSUpgradeable, IOracleAdapter {
         ChainlinkFeed memory f = l.feeds[metricId];
         if (!f.registered) revert FeedNotRegistered(metricId);
 
-        (uint80 roundId, int256 answer, /*startedAt*/, uint256 updatedAt, uint80 answeredInRound) =
+        (uint80 roundId, int256 answer,/*startedAt*/, uint256 updatedAt, uint80 answeredInRound) =
             IAggregatorV3(f.aggregator).latestRoundData();
 
         // Round completeness: `updatedAt == 0` is the canonical "round not yet answered" sentinel.

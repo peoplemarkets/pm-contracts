@@ -368,11 +368,7 @@ library LiquidationMath {
     /// @param  collateral  Posted collateral, 6-dec USDC.
     /// @param  entryPrice  Entry mark, 1e18 fixed-point. MUST be positive.
     /// @return pBank       Bankruptcy price, 1e18 fixed-point, strictly positive.
-    function bankruptcyPrice(
-        int256 size,
-        uint256 collateral,
-        uint256 entryPrice
-    )
+    function bankruptcyPrice(int256 size, uint256 collateral, uint256 entryPrice)
         internal
         pure
         returns (uint256 pBank)

@@ -244,8 +244,9 @@ contract FundingEngineTest is Test {
         // 12. Deploy FundingEngine behind UUPS.
         {
             FundingEngine impl = new FundingEngine();
-            bytes memory initData =
-                abi.encodeCall(FundingEngine.initialize, (governance, address(engine), address(router), TIMELOCK_DELAY));
+            bytes memory initData = abi.encodeCall(
+                FundingEngine.initialize, (governance, address(engine), address(router), TIMELOCK_DELAY)
+            );
             funding = FundingEngine(address(new ERC1967Proxy(address(impl), initData)));
         }
 

@@ -386,8 +386,9 @@ contract PerpVaultHandler is Test {
 
         vm.prank(markWriter);
         try engine.pushMark(subject, newMark) {
-            // diagnostic only
-        } catch {
+        // diagnostic only
+        }
+            catch {
             // skip
         }
     }

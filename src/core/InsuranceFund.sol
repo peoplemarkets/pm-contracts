@@ -139,6 +139,7 @@ contract InsuranceFund is Initializable, UUPSUpgradeable, ReentrancyGuard, IInsu
         // Pull USDC from the configured LPVault. LPVault pre-approves `type(uint256).max` via
         // `approveInsuranceFund()`. The transferFrom + bookkeeper bump happen atomically; if the
         // pull fails (e.g. approval revoked) the whole settle reverts on the LPVault side.
+        // slither-disable-next-line arbitrary-send-erc20 -- onlyLPVault; `from` is the configured, pre-approved vault.
         s.usdc.safeTransferFrom(s.lpVault, address(this), amount);
         uint256 newBalance = s.trackedBalance + amount;
         s.trackedBalance = newBalance;

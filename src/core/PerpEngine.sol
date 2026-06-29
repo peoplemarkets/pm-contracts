@@ -106,9 +106,9 @@ contract PerpEngine is Initializable, UUPSUpgradeable, ReentrancyGuard, IPerpEng
         perpS.markStaleAfter = 30 seconds; // spec §1 default
         perpS.lpRebatePct = 40; // spec §3 starting value
         perpS.markMaxDeltaBps = DEFAULT_MARK_MAX_DELTA_BPS; // v2-audit Fix #5
-            // Margin params + KYC caps + per-subject + per-category OI caps are now owned by the
-            // MarginEngine namespace and seeded in `MarginEngine.initialize`. This contract no longer
-            // touches MarginStorage on init.
+        // Margin params + KYC caps + per-subject + per-category OI caps are now owned by the
+        // MarginEngine namespace and seeded in `MarginEngine.initialize`. This contract no longer
+        // touches MarginStorage on init.
     }
 
     // ------------------------------------------------------------------------------------------
@@ -368,17 +368,15 @@ contract PerpEngine is Initializable, UUPSUpgradeable, ReentrancyGuard, IPerpEng
         // close paths stay alive on a partially-wired engine — opens are blocked by the unset
         // pointer, but unwinds must always succeed.
         if (perpS.marginEngine != address(0)) {
-            IMarginEngine(perpS.marginEngine).recordCloseDelta(
-                trader, _categoryOf(perpS, p.subjectId), v.openingNotionalDelta, v.isLong
-            );
+            IMarginEngine(perpS.marginEngine)
+                .recordCloseDelta(trader, _categoryOf(perpS, p.subjectId), v.openingNotionalDelta, v.isLong);
         }
 
         // Settle the closed slice against the vault. The pnl leg is `realizedPnl − fundingDebt6`
         // (funding folded in — see `_CloseValues.settlePnl`). Fees are unchanged; funding is NOT
         // a fee and does not route through the lpRebate/insurance split.
-        ILPVault(perpS.lpVault).settlePosition(
-            trader, v.closeCollateral, v.settlePnl, v.fee, v.lpRebate, v.insuranceShare
-        );
+        ILPVault(perpS.lpVault)
+            .settlePosition(trader, v.closeCollateral, v.settlePnl, v.fee, v.lpRebate, v.insuranceShare);
 
         // Funding settled on the closed slice. `fundingDebt6 > 0` ⇒ trader paid funding into the
         // vault; `< 0` ⇒ trader received funding from the vault. Reported separately from the

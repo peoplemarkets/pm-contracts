@@ -180,13 +180,7 @@ contract LPVault is Initializable, UUPSUpgradeable, ERC4626Upgradeable, Reentran
         return Math.min(super.maxWithdraw(ownerAddr), freeAssets());
     }
 
-    function maxRedeem(address ownerAddr)
-        public
-        view
-        virtual
-        override(ERC4626Upgradeable, IERC4626)
-        returns (uint256)
-    {
+    function maxRedeem(address ownerAddr) public view virtual override(ERC4626Upgradeable, IERC4626) returns (uint256) {
         if (VaultStorage.load().withdrawalsPaused) return 0;
         uint256 byOwner = super.maxRedeem(ownerAddr);
         // Convert the freeAssets cap into shares using floor rounding so we don't grant more
@@ -282,6 +276,7 @@ contract LPVault is Initializable, UUPSUpgradeable, ERC4626Upgradeable, Reentran
         VaultStorage.Layout storage s = VaultStorage.load();
 
         // Single transferFrom for collateral + fee; cheaper than two pulls.
+        // slither-disable-next-line arbitrary-send-erc20 -- onlyPerpEngine; `trader` is the position owner who approved the vault.
         IERC20(asset()).safeTransferFrom(trader, address(this), collateralToLock + fee);
 
         s.positionCollateral += collateralToLock;
@@ -528,6 +523,7 @@ contract LPVault is Initializable, UUPSUpgradeable, ERC4626Upgradeable, Reentran
     /// @inheritdoc ILPVault
     function lockCollateral(address from, uint256 amount) external nonReentrant onlyPerpEngine {
         if (amount == 0) revert AmountZero();
+        // slither-disable-next-line arbitrary-send-erc20 -- onlyPerpEngine; `from` is the position owner who approved the vault.
         IERC20(asset()).safeTransferFrom(from, address(this), amount);
         VaultStorage.load().positionCollateral += amount;
         emit CollateralLocked(from, amount);
@@ -553,26 +549,33 @@ contract LPVault is Initializable, UUPSUpgradeable, ERC4626Upgradeable, Reentran
         // Check solvency BEFORE state mutation
         uint256 free = freeAssets();
         if (amount > free) revert InsufficientFreeAssets(amount, free);
-        
+
         VaultStorage.Layout storage s = VaultStorage.load();
         s.eventFundedSeed += amount;
-        
+
         IERC20(asset()).safeTransfer(msg.sender, amount);
         emit EventMarketFunded(msg.sender, amount);
     }
 
     /// @inheritdoc ILPVault
-    function settleEventMarket(uint256 originalSeed, uint256 returnedAmount) external nonReentrant onlyEventMarketFactory {
+    function settleEventMarket(
+        uint256 originalSeed,
+        uint256 returnedAmount
+    )
+        external
+        nonReentrant
+        onlyEventMarketFactory
+    {
         if (originalSeed == 0) revert AmountZero();
         VaultStorage.Layout storage s = VaultStorage.load();
-        
+
         // This is safe because eventFundedSeed only grows by exact funded amounts
         s.eventFundedSeed -= originalSeed;
-        
+
         if (returnedAmount > 0) {
             IERC20(asset()).safeTransferFrom(msg.sender, address(this), returnedAmount);
         }
-        
+
         int256 pnl = int256(returnedAmount) - int256(originalSeed);
         emit EventMarketSettled(msg.sender, originalSeed, returnedAmount, pnl);
     }
@@ -671,10 +674,7 @@ contract LPVault is Initializable, UUPSUpgradeable, ERC4626Upgradeable, Reentran
         if (s.pendingFeeWithdrawal.exists) revert PendingProposalExists();
         uint64 activatesAt = uint64(block.timestamp + s.timelockDelay);
         s.pendingFeeWithdrawal = VaultStorage.PendingFeeWithdrawal({
-            recipient: recipient,
-            amount: amount,
-            activatesAt: activatesAt,
-            exists: true
+            recipient: recipient, amount: amount, activatesAt: activatesAt, exists: true
         });
         emit FeeWithdrawalProposed(recipient, amount, activatesAt);
     }

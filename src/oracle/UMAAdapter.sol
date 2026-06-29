@@ -278,11 +278,7 @@ contract UMAAdapter is Initializable, UUPSUpgradeable, IOracleAdapter {
         if (currency == address(0)) revert InvalidConfig();
 
         UMAMetric memory cfg = UMAMetric({
-            bond: bond,
-            livenessSeconds: liveness,
-            identifier: identifier,
-            currency: currency,
-            registered: true
+            bond: bond, livenessSeconds: liveness, identifier: identifier, currency: currency, registered: true
         });
         uint64 activatesAt = uint64(block.timestamp) + uint64(l.timelockDelay);
         l.pendingMetric[metricId] =
@@ -338,11 +334,7 @@ contract UMAAdapter is Initializable, UUPSUpgradeable, IOracleAdapter {
         if (currency == address(0)) revert InvalidConfig();
 
         UMAMetric memory cfg = UMAMetric({
-            bond: bond,
-            livenessSeconds: liveness,
-            identifier: identifier,
-            currency: currency,
-            registered: true
+            bond: bond, livenessSeconds: liveness, identifier: identifier, currency: currency, registered: true
         });
         uint64 activatesAt = uint64(block.timestamp) + uint64(l.timelockDelay);
         l.pendingMetric[metricId] = PendingMetric({config: cfg, activatesAt: activatesAt, isUpdate: true, exists: true});
@@ -444,17 +436,18 @@ contract UMAAdapter is Initializable, UUPSUpgradeable, IOracleAdapter {
         token.safeTransferFrom(msg.sender, address(this), cfg.bond);
         token.forceApprove(address(l.oo), cfg.bond);
 
-        assertionId = l.oo.assertTruth(
-            claim,
-            msg.sender, // asserter
-            address(0), // callbackRecipient — not used
-            address(0), // escalationManager — not used
-            cfg.livenessSeconds,
-            cfg.currency,
-            cfg.bond,
-            cfg.identifier,
-            bytes32(0) // domainId — default
-        );
+        assertionId = l.oo
+            .assertTruth(
+                claim,
+                msg.sender, // asserter
+                address(0), // callbackRecipient — not used
+                address(0), // escalationManager — not used
+                cfg.livenessSeconds,
+                cfg.currency,
+                cfg.bond,
+                cfg.identifier,
+                bytes32(0) // domainId — default
+            );
 
         // Defense-in-depth: OOv3 returning a zero assertionId would be a contract bug, but if it
         // ever happens (or a malicious mock does) we would silently overwrite a real record.
