@@ -170,13 +170,7 @@ interface ILPVault is IERC4626 {
     // Slippage-protected ERC-4626 wrappers
     // ------------------------------------------------------------------------------------------
 
-    function depositWithMinShares(
-        uint256 assets,
-        address receiver,
-        uint256 minShares
-    )
-        external
-        returns (uint256 shares);
+    function depositWithMinShares(uint256 assets, address receiver, uint256 minShares) external returns (uint256 shares);
 
     /// @notice Slippage-protected redeem: burns `shares`, reverts if assets received are LESS
     ///         than `minAssets`. The previous wrapper was named `withdrawWithMaxAssets` and

@@ -175,12 +175,7 @@ interface ILiquidationEngine {
     ///
     /// @param  badPositionId    The bankrupt position to clear.
     /// @param  counterpartyIds  Profitable opposite-side positions, in ADL-priority order.
-    function adl(
-        bytes32 badPositionId,
-        bytes32[] calldata counterpartyIds
-    )
-        external
-        returns (LiquidationResult memory);
+    function adl(bytes32 badPositionId, bytes32[] calldata counterpartyIds) external returns (LiquidationResult memory);
 
     /// @notice Permissionless reset of the partial-attempts counter for a healed position.
     /// @dev    Wave 7 audit Fix #6. A position that was previously partial-liquidated and then

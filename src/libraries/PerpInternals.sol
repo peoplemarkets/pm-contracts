@@ -123,9 +123,8 @@ library PerpInternals {
             IMarginEngine(me).recordCloseDelta(pos.owner, categoryId, openingNotionalDelta, isLong);
         }
 
-        ILPVault(perpS.lpVault).settleLiquidation(
-            pos.owner, liquidator, collateralReleased, collateralToReturn, bountyToPay, signedPnl
-        );
+        ILPVault(perpS.lpVault)
+            .settleLiquidation(pos.owner, liquidator, collateralReleased, collateralToReturn, bountyToPay, signedPnl);
 
         emit PositionLiquidated(
             positionId, pos.owner, liquidator, sizeToClose, collateralToReturn, bountyToPay, signedPnl, tierCode

@@ -173,10 +173,7 @@ contract DeployBaseSepolia is Script {
         console2.log("ChainlinkAdapter", proxy);
     }
 
-    function _deploySignedFeedAdapter(
-        DeployConfig memory cfg,
-        address oracleRouter
-    )
+    function _deploySignedFeedAdapter(DeployConfig memory cfg, address oracleRouter)
         internal
         returns (address adapter)
     {
@@ -286,8 +283,9 @@ contract DeployBaseSepolia is Script {
         returns (address proxy)
     {
         FeedbackController impl = new FeedbackController();
-        bytes memory init =
-            abi.encodeCall(FeedbackController.initialize, (cfg.governance, perpEngine, oracleRouter, cfg.timelockDelay));
+        bytes memory init = abi.encodeCall(
+            FeedbackController.initialize, (cfg.governance, perpEngine, oracleRouter, cfg.timelockDelay)
+        );
         proxy = _deployUUPS(address(impl), init);
         console2.log("FeedbackController", proxy);
     }

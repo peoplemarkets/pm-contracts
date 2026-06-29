@@ -180,13 +180,7 @@ contract LPVault is Initializable, UUPSUpgradeable, ERC4626Upgradeable, Reentran
         return Math.min(super.maxWithdraw(ownerAddr), freeAssets());
     }
 
-    function maxRedeem(address ownerAddr)
-        public
-        view
-        virtual
-        override(ERC4626Upgradeable, IERC4626)
-        returns (uint256)
-    {
+    function maxRedeem(address ownerAddr) public view virtual override(ERC4626Upgradeable, IERC4626) returns (uint256) {
         if (VaultStorage.load().withdrawalsPaused) return 0;
         uint256 byOwner = super.maxRedeem(ownerAddr);
         // Convert the freeAssets cap into shares using floor rounding so we don't grant more
@@ -678,10 +672,7 @@ contract LPVault is Initializable, UUPSUpgradeable, ERC4626Upgradeable, Reentran
         if (s.pendingFeeWithdrawal.exists) revert PendingProposalExists();
         uint64 activatesAt = uint64(block.timestamp + s.timelockDelay);
         s.pendingFeeWithdrawal = VaultStorage.PendingFeeWithdrawal({
-            recipient: recipient,
-            amount: amount,
-            activatesAt: activatesAt,
-            exists: true
+            recipient: recipient, amount: amount, activatesAt: activatesAt, exists: true
         });
         emit FeeWithdrawalProposed(recipient, amount, activatesAt);
     }

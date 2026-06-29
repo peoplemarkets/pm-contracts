@@ -126,8 +126,9 @@ contract LPVaultTest is Test {
 
     function test_Initialize_RevertOnTimelockTooLong() public {
         LPVault impl = new LPVault();
-        bytes memory initData =
-            abi.encodeCall(LPVault.initialize, (IERC20(address(usdc)), governance, operator, uint32(60 days), "x", "x"));
+        bytes memory initData = abi.encodeCall(
+            LPVault.initialize, (IERC20(address(usdc)), governance, operator, uint32(60 days), "x", "x")
+        );
         vm.expectRevert(ILPVault.InvalidConfig.selector);
         new ERC1967Proxy(address(impl), initData);
     }
