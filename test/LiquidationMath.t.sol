@@ -79,6 +79,14 @@ contract Harness {
         return LiquidationMath.isUnderMaintenance(size, collateral, markPrice, entryPrice, mmBps);
     }
 
+    function bankruptcy(int256 size, uint256 collateral, uint256 entryPrice) external pure returns (uint256) {
+        return LiquidationMath.bankruptcyPrice(size, collateral, entryPrice);
+    }
+
+    function signedPnlAt(int256 size, uint256 entryPrice, uint256 closePrice) external pure returns (int256) {
+        return LiquidationMath.signedPnlAt(size, entryPrice, closePrice);
+    }
+
     function underBuf(
         int256 size,
         uint256 collateral,
@@ -635,5 +643,52 @@ contract LiquidationMathTest is Test {
         // entry $100 fixed → never above mark
         LiquidationMath.FullResult memory r = h.full(size, MAX_COLLATERAL, mark, 100e18, 100);
         assertEq(r.shortfall, 0);
+    }
+
+    // ------------------------------------------------------------------------------------------
+    // bankruptcyPrice (Tier-5 ADL)
+    // ------------------------------------------------------------------------------------------
+
+    /// @dev Long: $100K collateral on 4000e6 contracts at $100 entry ⇒ P_b = 100 − 25 = $75.
+    function test_Bankruptcy_Long() public view {
+        assertEq(h.bankruptcy(int256(4000e6), 100_000e6, 100e18), 75e18);
+    }
+
+    /// @dev Short: same numbers ⇒ P_b = 100 + 25 = $125 (above entry).
+    function test_Bankruptcy_Short() public view {
+        assertEq(h.bankruptcy(-int256(4000e6), 100_000e6, 100e18), 125e18);
+    }
+
+    /// @dev At P_b the position has exactly zero equity: collateral + size×(P_b−entry)/1e18 == 0.
+    function test_Bankruptcy_ZeroEquityInvariant() public view {
+        int256 size = int256(4000e6);
+        uint256 pb = h.bankruptcy(size, 100_000e6, 100e18);
+        int256 pnlAtPb = h.signedPnlAt(size, 100e18, pb);
+        assertEq(int256(100_000e6) + pnlAtPb, 0);
+    }
+
+    /// @dev A long whose collateral covers its full entry notional can never reach zero equity by
+    ///      price alone ⇒ revert. (collateral $400K on 4000e6 @ $100 ⇒ delta $100 == entry.)
+    function test_Bankruptcy_RevertLongCollateralExceedsEntry() public {
+        vm.expectRevert(LiquidationMath.BankruptcyPriceNonPositive.selector);
+        h.bankruptcy(int256(4000e6), 400_000e6, 100e18);
+    }
+
+    function test_Bankruptcy_RevertOnZeroSize() public {
+        vm.expectRevert(LiquidationMath.ZeroSize.selector);
+        h.bankruptcy(0, 100_000e6, 100e18);
+    }
+
+    function test_Bankruptcy_RevertOnZeroEntry() public {
+        vm.expectRevert(LiquidationMath.EntryPriceNotPositive.selector);
+        h.bankruptcy(int256(4000e6), 100_000e6, 0);
+    }
+
+    /// @dev signedPnlAt sign quadrants: long profits when close > entry, short profits when below.
+    function test_SignedPnlAt_Quadrants() public view {
+        assertEq(h.signedPnlAt(int256(1000e6), 100e18, 120e18), int256(20_000e6)); // long up
+        assertEq(h.signedPnlAt(int256(1000e6), 100e18, 80e18), -int256(20_000e6)); // long down
+        assertEq(h.signedPnlAt(-int256(1000e6), 100e18, 80e18), int256(20_000e6)); // short down
+        assertEq(h.signedPnlAt(-int256(1000e6), 100e18, 120e18), -int256(20_000e6)); // short up
     }
 }

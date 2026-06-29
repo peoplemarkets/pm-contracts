@@ -106,6 +106,9 @@ library LiquidationMath {
     /// @dev Reverts if `currentSize == 0` — there is nothing to liquidate.
     error ZeroSize();
 
+    /// @dev Reverts if a solved bankruptcy price is ≤ 0 (long with collateral ≥ entry notional).
+    error BankruptcyPriceNonPositive();
+
     // ------------------------------------------------------------------------------------------
     // Partial liquidation
     // ------------------------------------------------------------------------------------------
@@ -334,6 +337,71 @@ library LiquidationMath {
         uint256 leverageX1e6 = (notional6 * LEVERAGE_SCALE) / currentCollateral;
 
         return Math.mulDiv(upnl6Abs, leverageX1e6, LEVERAGE_SCALE);
+    }
+
+    // ------------------------------------------------------------------------------------------
+    // Bankruptcy price (Tier-5 ADL)
+    // ------------------------------------------------------------------------------------------
+
+    /// @notice Price at which a position's equity is exactly zero — the "bankruptcy price".
+    ///
+    /// @dev    Solve `collateral + size × (P_b − entry) / 1e18 = 0` for `P_b`:
+    ///
+    ///             P_b = entry − collateral × 1e18 / size            (size signed)
+    ///
+    ///         For a LONG (`size > 0`) this lands BELOW entry; for a SHORT (`size < 0`) ABOVE entry.
+    ///         This is the price the spec (§3 line 153) closes ADL'd counterparties at: the
+    ///         bankruptcy price of the liquidated position. Closing a profitable opposite-side
+    ///         position here (rather than at the current, more-favourable mark) is the mechanism
+    ///         by which the surviving counterparties absorb the liquidated position's loss instead
+    ///         of the LP vault.
+    ///
+    ///         UNITS: `collateral` 6-dec USDC, `size` 1e6-fixed contracts, `entryPrice` 1e18.
+    ///         `collateral × 1e18 / |size|` lands in 1e18 price units. Uses `Math.mulDiv` so the
+    ///         intermediate `collateral × 1e18` cannot overflow.
+    ///
+    ///         Reverts `BankruptcyPriceNonPositive` if the solved price is ≤ 0 — only possible for
+    ///         a long whose collateral exceeds its entry notional, i.e. a position that can never
+    ///         reach zero equity by price alone and therefore is never an ADL candidate.
+    ///
+    /// @param  size        Signed position size, 1e6-fixed contracts. MUST be non-zero.
+    /// @param  collateral  Posted collateral, 6-dec USDC.
+    /// @param  entryPrice  Entry mark, 1e18 fixed-point. MUST be positive.
+    /// @return pBank       Bankruptcy price, 1e18 fixed-point, strictly positive.
+    function bankruptcyPrice(
+        int256 size,
+        uint256 collateral,
+        uint256 entryPrice
+    )
+        internal
+        pure
+        returns (uint256 pBank)
+    {
+        if (entryPrice == 0) revert EntryPriceNotPositive();
+        if (size == 0) revert ZeroSize();
+
+        uint256 absSize = size > 0 ? uint256(size) : uint256(-size);
+        // collateral-per-contract, expressed as a 1e18 price delta.
+        uint256 collateralPriceDelta = Math.mulDiv(collateral, ONE_E18, absSize);
+
+        if (size > 0) {
+            // Long: P_b = entry − delta. A non-positive result means the position cannot reach
+            // zero equity by price alone — it is not an ADL candidate.
+            if (collateralPriceDelta >= entryPrice) revert BankruptcyPriceNonPositive();
+            pBank = entryPrice - collateralPriceDelta;
+        } else {
+            // Short: P_b = entry + delta. Always strictly positive.
+            pBank = entryPrice + collateralPriceDelta;
+        }
+    }
+
+    /// @notice Signed PnL of a (possibly partial) close of `size` contracts at `closePrice`.
+    /// @dev    `pnl6 = size × (closePrice − entryPrice) / 1e18`, 6-dec USDC. Shared so the ADL
+    ///         path realises counterparty PnL at the bankruptcy price with the same convention
+    ///         used everywhere else in this library.
+    function signedPnlAt(int256 size, uint256 entryPrice, uint256 closePrice) internal pure returns (int256) {
+        int256 priceDelta = int256(closePrice) - int256(entryPrice);
+        return (size * priceDelta) / int256(ONE_E18);
     }
 
     // ------------------------------------------------------------------------------------------

@@ -374,6 +374,151 @@ contract LiquidationEngine is Initializable, UUPSUpgradeable, ReentrancyGuard, I
     }
 
     // ------------------------------------------------------------------------------------------
+    // Tier 5 — Auto-Deleveraging (ADL)
+    // ------------------------------------------------------------------------------------------
+
+    /// @inheritdoc ILiquidationEngine
+    /// @dev Mechanism (spec §3 line 153): when the normal waterfall cannot absorb a bankrupt
+    ///      position's shortfall without breaching the socialization cap, the position is closed at
+    ///      ZERO equity (its collateral fully absorbs the loss — no LP shortfall) and its
+    ///      directional size is offloaded onto profitable opposite-side positions, each force-closed
+    ///      at the bankrupt position's BANKRUPTCY PRICE instead of the current, more-favourable
+    ///      mark. The counterparties give up the profit between mark and bankruptcy price; that
+    ///      foregone profit is exactly what funds the bad position's would-be shortfall.
+    ///
+    ///      SAFETY: every leg settles through the vault's payout-conservation + freeAssets guards,
+    ///      so ADL can never drive the vault negative — at worst a leg reverts. The economic
+    ///      fairness (deleveraging only as much size as the bad position carried, in priority order)
+    ///      is enforced by the size-match below + the trusted keeper ordering. See AUDIT_PREP.md;
+    ///      this path requires mandatory human + external-audit sign-off.
+    function adl(
+        bytes32 badPositionId,
+        bytes32[] calldata counterpartyIds
+    )
+        external
+        nonReentrant
+        onlyLiquidator
+        returns (LiquidationResult memory result)
+    {
+        Layout storage s = _s();
+        IPerpEngine pe = IPerpEngine(s.perpEngine);
+
+        IPerpEngine.Position memory bad = pe.positionOf(badPositionId);
+        if (bad.size == 0) revert PositionNotFound(badPositionId);
+        if (bad.owner == msg.sender) revert ADLSelfLiquidation(msg.sender);
+
+        (uint256 mark,) = pe.markOf(bad.subjectId);
+        if (mark == 0) revert NotUnderBuffer(badPositionId);
+
+        // Gate 1 — the bad position must be under the liquidation buffer.
+        (, uint16 mmBps, uint16 bufBps,,) = IMarginEngine(s.marginEngine).marginParams();
+        if (!LiquidationMath.isUnderLiquidationBuffer(bad.size, bad.collateral, mark, bad.entryPrice, mmBps, bufBps)) {
+            revert NotUnderBuffer(badPositionId);
+        }
+
+        // Gate 2 — ADL is only justified when the normal waterfall (insurance + socialization to
+        // the cap) cannot absorb the shortfall.
+        _requireAdlJustified(s, bad, mark, badPositionId);
+
+        // The price every ADL leg executes at.
+        uint256 pBank = LiquidationMath.bankruptcyPrice(bad.size, bad.collateral, bad.entryPrice);
+
+        // 1. Wipe the bad position at zero equity. collateralReleased = collateral, payout = 0,
+        //    bounty = 0, signedPnl = -collateral ⇒ the vault keeps the full collateral and books no
+        //    shortfall. (The ADL'd counterparties bear the loss via the price gap below.)
+        pe.liquidateClose(badPositionId, bad.size, 0, 0, -int256(bad.collateral), msg.sender, uint8(Tier.ADL));
+
+        // 2. Offload the bad position's |size| onto the supplied counterparties, in order, at pBank.
+        uint256 remaining = bad.size > 0 ? uint256(bad.size) : uint256(-bad.size);
+        bool badIsLong = bad.size > 0;
+        for (uint256 i = 0; i < counterpartyIds.length && remaining > 0; ++i) {
+            remaining =
+                _deleverageOne(pe, badPositionId, counterpartyIds[i], bad.subjectId, badIsLong, mark, pBank, remaining);
+        }
+        if (remaining > 0) revert ADLInsufficientCounterpartySize(remaining);
+
+        result.tier = Tier.ADL;
+        result.positionId = badPositionId;
+        result.trader = bad.owner;
+        result.markPrice = mark;
+        result.sizeClosed = bad.size;
+        // No collateral returned, no bounty, and the LP absorbs no shortfall under ADL.
+        emit Liquidated(result, msg.sender);
+        return result;
+    }
+
+    /// @dev Reverts `ADLNotRequired` unless the bad position's full-liquidation shortfall, after the
+    ///      maximum insurance draw, leaves a socialization residual that EXCEEDS the cap.
+    function _requireAdlJustified(
+        Layout storage s,
+        IPerpEngine.Position memory bad,
+        uint256 mark,
+        bytes32 badPositionId
+    )
+        internal
+        view
+    {
+        LiquidationMath.FullResult memory fr =
+            LiquidationMath.computeFullLiquidation(bad.size, bad.collateral, mark, bad.entryPrice, s.fullBountyBps);
+        if (fr.shortfall <= 0) revert ADLNotRequired(badPositionId);
+
+        uint256 shortfall = uint256(fr.shortfall);
+        uint256 insBalance = IInsuranceFund(s.insuranceFund).balance();
+        uint256 drawn = shortfall <= insBalance ? shortfall : insBalance;
+        uint256 socialized = shortfall - drawn;
+        uint256 cap = (IERC4626(s.lpVault).totalAssets() * uint256(s.socializationCapBps)) / BPS_DENOMINATOR;
+        if (socialized <= cap) revert ADLNotRequired(badPositionId);
+    }
+
+    /// @dev Validate + force-close one counterparty at the bankruptcy price. Returns the updated
+    ///      `remaining` size still to be offloaded.
+    function _deleverageOne(
+        IPerpEngine pe,
+        bytes32 badPositionId,
+        bytes32 cpId,
+        bytes32 subjectId,
+        bool badIsLong,
+        uint256 mark,
+        uint256 pBank,
+        uint256 remaining
+    )
+        internal
+        returns (uint256)
+    {
+        IPerpEngine.Position memory cp = pe.positionOf(cpId);
+        if (cp.size == 0) revert ADLCounterpartyNotEligible(cpId);
+        if (cp.owner == msg.sender) revert ADLSelfLiquidation(msg.sender);
+        if (cp.subjectId != subjectId) revert ADLCounterpartyNotEligible(cpId);
+
+        bool cpIsLong = cp.size > 0;
+        if (cpIsLong == badIsLong) revert ADLCounterpartyNotEligible(cpId); // must be opposite side
+        // Only PROFITABLE counterparties are eligible for ADL (spec §3 line 153).
+        if (LiquidationMath.signedPnlAt(cp.size, cp.entryPrice, mark) <= 0) revert ADLCounterpartyNotEligible(cpId);
+
+        uint256 cpAbs = cpIsLong ? uint256(cp.size) : uint256(-cp.size);
+        uint256 closeAbs = cpAbs <= remaining ? cpAbs : remaining;
+        int256 closeSize = cpIsLong ? int256(closeAbs) : -int256(closeAbs);
+
+        // Compute the slice's payout (collateral share + PnL realised at pBank). A negative payout
+        // means the counterparty is insolvent at the bankruptcy price — closing it would create
+        // fresh bad debt, so it is not an eligible ADL target.
+        uint256 collateralReleased = closeAbs == cpAbs ? cp.collateral : (cp.collateral * closeAbs) / cpAbs;
+        int256 signedPnl = LiquidationMath.signedPnlAt(closeSize, cp.entryPrice, pBank);
+        int256 payoutSigned = int256(collateralReleased) + signedPnl;
+        if (payoutSigned < 0) revert ADLCounterpartyNotEligible(cpId);
+        uint256 payout = uint256(payoutSigned);
+
+        // Reuse the liquidation-close primitive at Tier.ADL: zero bounty, payout = collateral +
+        // profit-at-bankruptcy-price. The ADL tier lifts the "payout <= released collateral" cap so
+        // the profitable counterparty receives its (reduced) gain; the vault still enforces
+        // payout-conservation and freeAssets solvency.
+        pe.liquidateClose(cpId, closeSize, payout, 0, signedPnl, msg.sender, uint8(Tier.ADL));
+
+        emit AutoDeleveraged(badPositionId, cpId, cp.owner, closeSize, pBank, payout);
+        return remaining - closeAbs;
+    }
+
+    // ------------------------------------------------------------------------------------------
     // Wave 7 audit Fix #6 — permissionless reset of partialAttempts for healed positions
     // ------------------------------------------------------------------------------------------
 
@@ -391,9 +536,8 @@ contract LiquidationEngine is Initializable, UUPSUpgradeable, ReentrancyGuard, I
         // reset so the next mark push can put the partial budget back in play.
         if (mark != 0) {
             (, uint16 mmBps, uint16 bufBps,,) = IMarginEngine(s.marginEngine).marginParams();
-            bool underBuffer = LiquidationMath.isUnderLiquidationBuffer(
-                pos.size, pos.collateral, mark, pos.entryPrice, mmBps, bufBps
-            );
+            bool underBuffer =
+                LiquidationMath.isUnderLiquidationBuffer(pos.size, pos.collateral, mark, pos.entryPrice, mmBps, bufBps);
             if (underBuffer) revert StillUnderBuffer(positionId);
         }
 

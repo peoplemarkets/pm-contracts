@@ -70,6 +70,19 @@ interface ILiquidationEngine {
     error NotUnderBuffer(bytes32 positionId);
     error SocializationCapExceeded(uint256 requested, uint256 cap);
     error ADLNotImplemented();
+    /// @dev Thrown by `adl` when the position is NOT bad enough to justify ADL — i.e. the normal
+    ///      Tier 1-4 waterfall (insurance draw + socialization within the cap) could absorb the
+    ///      shortfall. ADL is reserved for the residual that would otherwise breach the cap.
+    error ADLNotRequired(bytes32 positionId);
+    /// @dev Thrown when a supplied ADL counterparty is ineligible: wrong subject, same side as the
+    ///      bad position, not currently profitable at mark, or insolvent at the bankruptcy price
+    ///      (closing it there would itself create new bad debt).
+    error ADLCounterpartyNotEligible(bytes32 counterpartyId);
+    /// @dev Thrown when the supplied counterparties' combined size cannot fully offset the bad
+    ///      position's size. The keeper must supply enough opposite-side notional.
+    error ADLInsufficientCounterpartySize(uint256 remaining);
+    /// @dev Thrown when the liquidator is also the owner of the bad position or a counterparty.
+    error ADLSelfLiquidation(address account);
     error PartialIncrementOutOfRange(uint16 bps);
     error MinPartialsOutOfRange(uint8 attempts);
     error MmRestoreBufferOutOfRange(uint16 bps);
@@ -99,6 +112,21 @@ interface ILiquidationEngine {
         address insuranceFund
     );
     event Liquidated(LiquidationResult result, address indexed liquidator);
+    /// @notice Emitted once per counterparty deleveraged inside an `adl` call.
+    /// @param  badPositionId       The liquidated (bankrupt) position whose risk is being offloaded.
+    /// @param  counterpartyId      The profitable opposite-side position being force-closed.
+    /// @param  counterparty        Owner of the deleveraged position.
+    /// @param  sizeClosed          Signed contract units of the counterparty closed at `bankruptcyPrice`.
+    /// @param  bankruptcyPrice     Price (1e18) at which the counterparty was closed.
+    /// @param  traderPayout        6-dec USDC paid back to the counterparty for the closed slice.
+    event AutoDeleveraged(
+        bytes32 indexed badPositionId,
+        bytes32 indexed counterpartyId,
+        address indexed counterparty,
+        int256 sizeClosed,
+        uint256 bankruptcyPrice,
+        uint256 traderPayout
+    );
     event ConfigSet(
         uint16 partialIncrementBps,
         uint8 minPartialsBeforeFull,
@@ -128,6 +156,31 @@ interface ILiquidationEngine {
     ///         socialization would exceed the cap, (d) `ADLNotImplemented` if the waterfall would
     ///         need Tier 5.
     function liquidate(bytes32 positionId) external returns (LiquidationResult memory);
+
+    /// @notice Tier-5 auto-deleveraging. Closes a bankrupt position at zero equity (its full
+    ///         collateral absorbs the loss, no LP shortfall) and offloads its directional size onto
+    ///         keeper-supplied profitable opposite-side positions, each force-closed at the bad
+    ///         position's BANKRUPTCY PRICE rather than the (more favourable) current mark.
+    ///
+    /// @dev    Only callable when the normal Tier 1-4 waterfall cannot absorb the shortfall (the
+    ///         residual LP socialization would breach the configured cap) — otherwise reverts
+    ///         `ADLNotRequired`. Counterparties MUST be supplied in the protocol's published ADL
+    ///         priority order (highest unrealized PnL × leverage first, per `LiquidationMath.
+    ///         adlPriority`); the contract validates eligibility but NOT global ordering, so an
+    ///         off-chain keeper is trusted to honour the queue exposed in the front-end.
+    ///
+    ///         The combined |size| of the supplied counterparties MUST be ≥ the bad position's
+    ///         |size|; the final counterparty is closed partially to match exactly. Reverts
+    ///         `ADLInsufficientCounterpartySize` otherwise.
+    ///
+    /// @param  badPositionId    The bankrupt position to clear.
+    /// @param  counterpartyIds  Profitable opposite-side positions, in ADL-priority order.
+    function adl(
+        bytes32 badPositionId,
+        bytes32[] calldata counterpartyIds
+    )
+        external
+        returns (LiquidationResult memory);
 
     /// @notice Permissionless reset of the partial-attempts counter for a healed position.
     /// @dev    Wave 7 audit Fix #6. A position that was previously partial-liquidated and then
