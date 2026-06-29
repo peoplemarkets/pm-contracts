@@ -276,6 +276,7 @@ contract LPVault is Initializable, UUPSUpgradeable, ERC4626Upgradeable, Reentran
         VaultStorage.Layout storage s = VaultStorage.load();
 
         // Single transferFrom for collateral + fee; cheaper than two pulls.
+        // slither-disable-next-line arbitrary-send-erc20 -- onlyPerpEngine; `trader` is the position owner who approved the vault.
         IERC20(asset()).safeTransferFrom(trader, address(this), collateralToLock + fee);
 
         s.positionCollateral += collateralToLock;
@@ -522,6 +523,7 @@ contract LPVault is Initializable, UUPSUpgradeable, ERC4626Upgradeable, Reentran
     /// @inheritdoc ILPVault
     function lockCollateral(address from, uint256 amount) external nonReentrant onlyPerpEngine {
         if (amount == 0) revert AmountZero();
+        // slither-disable-next-line arbitrary-send-erc20 -- onlyPerpEngine; `from` is the position owner who approved the vault.
         IERC20(asset()).safeTransferFrom(from, address(this), amount);
         VaultStorage.load().positionCollateral += amount;
         emit CollateralLocked(from, amount);

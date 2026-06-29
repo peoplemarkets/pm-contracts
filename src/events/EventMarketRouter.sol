@@ -147,6 +147,7 @@ contract EventMarketRouter is Initializable, UUPSUpgradeable, IEventMarketRouter
 
         IERC20 token = IERC20(s.usdc);
         // Pull USDC from the trader (single approval to this router) into the router transiently.
+        // slither-disable-next-line arbitrary-send-erc20 -- onlyOperator; `trader` approved this router and is credited the shares.
         token.safeTransferFrom(trader, address(this), usdcAmount);
         // Approve exactly this spend to the market, which pulls it inside buyOutcomeFor.
         token.forceApprove(market, usdcAmount);
