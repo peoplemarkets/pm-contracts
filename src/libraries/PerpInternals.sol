@@ -37,12 +37,17 @@ library PerpInternals {
         uint8 tierCode
     );
 
+    // BREAKING: `size` + `isLong` appended (see IPerpEngine) — signature MUST match the interface
+    // so delegatecall-emitted logs stay selector-compatible. Forced settlement is always a full
+    // close, so `size` is the full signed position size.
     event PositionClosedAtForcedSettlement(
         bytes32 indexed positionId,
         address indexed trader,
         bytes32 indexed subjectId,
         int256 realizedPnl,
-        uint256 returnedToTrader
+        uint256 returnedToTrader,
+        int256 size,
+        bool isLong
     );
 
     event FundingSettled(bytes32 indexed positionId, address indexed trader, int256 fundingDelta1e6);
@@ -187,6 +192,8 @@ library PerpInternals {
         ILPVault(perpS.lpVault).settlePosition(claimant, orig.collateral, cappedPnl, 0, 0, 0);
 
         emit FundingSettled(positionId, claimant, fundingDebt6);
-        emit PositionClosedAtForcedSettlement(positionId, claimant, subjectId, cappedPnl, returned);
+        // Forced settlement always fully closes the position, so the closed size is the full signed
+        // `orig.size` and `isLong` its side. BREAKING event-signature change — see IPerpEngine.
+        emit PositionClosedAtForcedSettlement(positionId, claimant, subjectId, cappedPnl, returned, orig.size, isLong);
     }
 }
