@@ -7,22 +7,25 @@ import "forge-std/console2.sol";
 import {ERC1967Proxy} from "@openzeppelin/contracts/proxy/ERC1967/ERC1967Proxy.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 
-import {BatchRouter} from "../src/routers/BatchRouter.sol";
-import {FeedbackController} from "../src/feedback/FeedbackController.sol";
 import {FundingEngine} from "../src/core/FundingEngine.sol";
 import {InsuranceFund} from "../src/core/InsuranceFund.sol";
-import {LiquidationEngine} from "../src/core/LiquidationEngine.sol";
+
 import {LPVault} from "../src/core/LPVault.sol";
+import {LiquidationEngine} from "../src/core/LiquidationEngine.sol";
 import {MarginEngine} from "../src/core/MarginEngine.sol";
+
+import {PauseGuardian} from "../src/core/PauseGuardian.sol";
+import {PerpEngine} from "../src/core/PerpEngine.sol";
+import {FeedbackController} from "../src/feedback/FeedbackController.sol";
 import {ChainlinkAdapter} from "../src/oracle/ChainlinkAdapter.sol";
 import {IOracleRouter} from "../src/oracle/IOracleRouter.sol";
 import {OracleRouter} from "../src/oracle/OracleRouter.sol";
-import {PairTradeRouter} from "../src/routers/PairTradeRouter.sol";
-import {PauseGuardian} from "../src/core/PauseGuardian.sol";
-import {PerpEngine} from "../src/core/PerpEngine.sol";
 import {SignedFeedAdapter} from "../src/oracle/SignedFeedAdapter.sol";
-import {SubjectRegistry} from "../src/registry/SubjectRegistry.sol";
+
 import {IOptimisticOracleV3, UMAAdapter} from "../src/oracle/UMAAdapter.sol";
+import {SubjectRegistry} from "../src/registry/SubjectRegistry.sol";
+import {BatchRouter} from "../src/routers/BatchRouter.sol";
+import {PairTradeRouter} from "../src/routers/PairTradeRouter.sol";
 
 /// @notice Base Sepolia deployment script for the People Markets core suite.
 /// @dev    Assumes you are deploying with the governance key so post-deploy proposals can be
@@ -90,8 +93,9 @@ contract DeployBaseSepolia is Script {
         deployed.perpEngine = _deployPerpEngine(cfg, deployed.subjectRegistry, deployed.lpVault);
         deployed.marginEngine = _deployMarginEngine(cfg, deployed.perpEngine);
         deployed.fundingEngine = _deployFundingEngine(cfg, deployed.perpEngine, deployed.oracleRouter);
-        deployed.liquidationEngine =
-            _deployLiquidationEngine(cfg, deployed.perpEngine, deployed.marginEngine, deployed.lpVault, deployed.insuranceFund);
+        deployed.liquidationEngine = _deployLiquidationEngine(
+            cfg, deployed.perpEngine, deployed.marginEngine, deployed.lpVault, deployed.insuranceFund
+        );
         deployed.feedbackController = _deployFeedbackController(cfg, deployed.perpEngine, deployed.oracleRouter);
         deployed.pauseGuardian = _deployPauseGuardian(cfg, deployed.perpEngine, deployed.subjectRegistry);
         deployed.pairTradeRouter = _deployPairTradeRouter(cfg, deployed.perpEngine);
@@ -146,8 +150,7 @@ contract DeployBaseSepolia is Script {
         address[] memory kycWriters = new address[](1);
         kycWriters[0] = cfg.kycWriter;
         bytes memory init = abi.encodeCall(
-            SubjectRegistry.initialize,
-            (cfg.governance, cfg.timelockDelay, admins, guardians, kycWriters)
+            SubjectRegistry.initialize, (cfg.governance, cfg.timelockDelay, admins, guardians, kycWriters)
         );
         proxy = _deployUUPS(address(impl), init);
         console2.log("SubjectRegistry", proxy);
@@ -155,19 +158,28 @@ contract DeployBaseSepolia is Script {
 
     function _deployOracleRouter(DeployConfig memory cfg) internal returns (address proxy) {
         OracleRouter impl = new OracleRouter();
-        bytes memory init = abi.encodeCall(OracleRouter.initialize, (cfg.oracleGovernance, cfg.oracleOperator, cfg.timelockDelay));
+        bytes memory init =
+            abi.encodeCall(OracleRouter.initialize, (cfg.oracleGovernance, cfg.oracleOperator, cfg.timelockDelay));
         proxy = _deployUUPS(address(impl), init);
         console2.log("OracleRouter", proxy);
     }
 
     function _deployChainlinkAdapter(DeployConfig memory cfg, address oracleRouter) internal returns (address proxy) {
         ChainlinkAdapter impl = new ChainlinkAdapter();
-        bytes memory init = abi.encodeCall(ChainlinkAdapter.initialize, (IOracleRouter(oracleRouter), cfg.oracleGovernance, cfg.timelockDelay));
+        bytes memory init = abi.encodeCall(
+            ChainlinkAdapter.initialize, (IOracleRouter(oracleRouter), cfg.oracleGovernance, cfg.timelockDelay)
+        );
         proxy = _deployUUPS(address(impl), init);
         console2.log("ChainlinkAdapter", proxy);
     }
 
-    function _deploySignedFeedAdapter(DeployConfig memory cfg, address oracleRouter) internal returns (address adapter) {
+    function _deploySignedFeedAdapter(
+        DeployConfig memory cfg,
+        address oracleRouter
+    )
+        internal
+        returns (address adapter)
+    {
         adapter = address(
             new SignedFeedAdapter(
                 IOracleRouter(oracleRouter),
@@ -182,7 +194,10 @@ contract DeployBaseSepolia is Script {
 
     function _deployUMAAdapter(DeployConfig memory cfg) internal returns (address proxy) {
         UMAAdapter impl = new UMAAdapter();
-        bytes memory init = abi.encodeCall(UMAAdapter.initialize, (IOptimisticOracleV3(cfg.umaOptimisticOracle), cfg.oracleGovernance, cfg.timelockDelay));
+        bytes memory init = abi.encodeCall(
+            UMAAdapter.initialize,
+            (IOptimisticOracleV3(cfg.umaOptimisticOracle), cfg.oracleGovernance, cfg.timelockDelay)
+        );
         proxy = _deployUUPS(address(impl), init);
         console2.log("UMAAdapter", proxy);
     }
@@ -199,14 +214,24 @@ contract DeployBaseSepolia is Script {
 
     function _deployInsuranceFund(DeployConfig memory cfg, address lpVault) internal returns (address proxy) {
         InsuranceFund impl = new InsuranceFund();
-        bytes memory init = abi.encodeCall(InsuranceFund.initialize, (cfg.insuranceGovernance, lpVault, IERC20(cfg.usdc), cfg.timelockDelay));
+        bytes memory init = abi.encodeCall(
+            InsuranceFund.initialize, (cfg.insuranceGovernance, lpVault, IERC20(cfg.usdc), cfg.timelockDelay)
+        );
         proxy = _deployUUPS(address(impl), init);
         console2.log("InsuranceFund", proxy);
     }
 
-    function _deployPerpEngine(DeployConfig memory cfg, address subjectRegistry, address lpVault) internal returns (address proxy) {
+    function _deployPerpEngine(
+        DeployConfig memory cfg,
+        address subjectRegistry,
+        address lpVault
+    )
+        internal
+        returns (address proxy)
+    {
         PerpEngine impl = new PerpEngine();
-        bytes memory init = abi.encodeCall(PerpEngine.initialize, (cfg.governance, cfg.timelockDelay, subjectRegistry, lpVault));
+        bytes memory init =
+            abi.encodeCall(PerpEngine.initialize, (cfg.governance, cfg.timelockDelay, subjectRegistry, lpVault));
         proxy = _deployUUPS(address(impl), init);
         console2.log("PerpEngine", proxy);
     }
@@ -218,9 +243,17 @@ contract DeployBaseSepolia is Script {
         console2.log("MarginEngine", proxy);
     }
 
-    function _deployFundingEngine(DeployConfig memory cfg, address perpEngine, address oracleRouter) internal returns (address proxy) {
+    function _deployFundingEngine(
+        DeployConfig memory cfg,
+        address perpEngine,
+        address oracleRouter
+    )
+        internal
+        returns (address proxy)
+    {
         FundingEngine impl = new FundingEngine();
-        bytes memory init = abi.encodeCall(FundingEngine.initialize, (cfg.governance, perpEngine, oracleRouter, cfg.timelockDelay));
+        bytes memory init =
+            abi.encodeCall(FundingEngine.initialize, (cfg.governance, perpEngine, oracleRouter, cfg.timelockDelay));
         proxy = _deployUUPS(address(impl), init);
         console2.log("FundingEngine", proxy);
     }
@@ -244,22 +277,32 @@ contract DeployBaseSepolia is Script {
         console2.log("LiquidationEngine", proxy);
     }
 
-    function _deployFeedbackController(DeployConfig memory cfg, address perpEngine, address oracleRouter)
+    function _deployFeedbackController(
+        DeployConfig memory cfg,
+        address perpEngine,
+        address oracleRouter
+    )
         internal
         returns (address proxy)
     {
         FeedbackController impl = new FeedbackController();
-        bytes memory init = abi.encodeCall(FeedbackController.initialize, (cfg.governance, perpEngine, oracleRouter, cfg.timelockDelay));
+        bytes memory init =
+            abi.encodeCall(FeedbackController.initialize, (cfg.governance, perpEngine, oracleRouter, cfg.timelockDelay));
         proxy = _deployUUPS(address(impl), init);
         console2.log("FeedbackController", proxy);
     }
 
-    function _deployPauseGuardian(DeployConfig memory cfg, address perpEngine, address subjectRegistry)
+    function _deployPauseGuardian(
+        DeployConfig memory cfg,
+        address perpEngine,
+        address subjectRegistry
+    )
         internal
         returns (address proxy)
     {
         PauseGuardian impl = new PauseGuardian();
-        bytes memory init = abi.encodeCall(PauseGuardian.initialize, (cfg.governance, perpEngine, subjectRegistry, cfg.timelockDelay));
+        bytes memory init =
+            abi.encodeCall(PauseGuardian.initialize, (cfg.governance, perpEngine, subjectRegistry, cfg.timelockDelay));
         proxy = _deployUUPS(address(impl), init);
         console2.log("PauseGuardian", proxy);
     }

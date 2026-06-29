@@ -410,7 +410,7 @@ interface ILPVault is IERC4626 {
     ///         `InsufficientFreeAssets` so a liquidation-path solvency failure is unambiguous in
     ///         the revert trace.
     error InsufficientFreeAssetsForLiquidation(uint256 requested, uint256 available);
-    
+
     // --- Wave 8: EventMarketFactory wiring ---
     error OnlyEventMarketFactory(address caller);
     error EventMarketFactoryNotSet();

@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: BUSL-1.1
 pragma solidity 0.8.24;
 
-import {FixedPointMathLib} from "solady/utils/FixedPointMathLib.sol";
 import {Math} from "@openzeppelin/contracts/utils/math/Math.sol";
+import {FixedPointMathLib} from "solady/utils/FixedPointMathLib.sol";
 
 library LMSRMath {
     using FixedPointMathLib for uint256;
@@ -19,18 +19,18 @@ library LMSRMath {
     function cost(uint256 q1, uint256 q2, uint256 b) internal pure returns (uint256) {
         uint256 maxQ = Math.max(q1, q2);
         uint256 minQ = Math.min(q1, q2);
-        
+
         // diff = (maxQ - minQ) / b
         uint256 diffWad = ((maxQ - minQ) * 1e18) / b;
-        
+
         // We need exp(-diffWad). Since diffWad is positive, -diffWad is negative.
         // Solady expWad accepts int256.
         int256 expNegDiff = int256(diffWad) * -1;
         uint256 expTerm = uint256(expNegDiff.expWad());
-        
+
         // ln(1 + expTerm)
         uint256 lnTerm = uint256(int256(1e18 + expTerm).lnWad());
-        
+
         // cost = maxQ + b * lnTerm
         uint256 costWad = maxQ + (b.mulWad(lnTerm));
         return costWad;
@@ -46,20 +46,20 @@ library LMSRMath {
     function sharesForUsdc(uint256 q1, uint256 q2, uint256 b, uint256 usdcAmount) internal pure returns (uint256) {
         uint256 cOld = cost(q1, q2, b);
         uint256 cNew = cOld + usdcAmount;
-        
+
         // (cNew - q2) / b
         require(cNew >= q2, "LMSRMath: cNew < q2");
         uint256 powerWad = ((cNew - q2) * 1e18) / b;
-        
+
         // expTerm = e^powerWad
         uint256 expTerm = uint256(int256(powerWad).expWad());
-        
+
         require(expTerm > 1e18, "LMSRMath: expTerm <= 1");
         uint256 lnTerm = uint256(int256(expTerm - 1e18).lnWad());
-        
+
         uint256 term2 = b.mulWad(lnTerm);
         uint256 newQ1 = q2 + term2;
-        
+
         require(newQ1 > q1, "LMSRMath: no shares generated");
         return newQ1 - q1;
     }

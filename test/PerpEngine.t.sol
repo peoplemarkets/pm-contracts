@@ -713,12 +713,10 @@ contract PerpEngineTest is Test {
     // services can reconstruct the close-leg directional money-flow. These assert the slice on a
     // partial close, the full size on a full close, and the side for both long and short.
 
-    bytes32 internal constant _POSITION_CLOSED_TOPIC0 = keccak256(
-        "PositionClosed(bytes32,address,bytes32,int256,uint256,uint256,bool,int256,bool)"
-    );
-    bytes32 internal constant _FORCED_CLOSE_TOPIC0 = keccak256(
-        "PositionClosedAtForcedSettlement(bytes32,address,bytes32,int256,uint256,int256,bool)"
-    );
+    bytes32 internal constant _POSITION_CLOSED_TOPIC0 =
+        keccak256("PositionClosed(bytes32,address,bytes32,int256,uint256,uint256,bool,int256,bool)");
+    bytes32 internal constant _FORCED_CLOSE_TOPIC0 =
+        keccak256("PositionClosedAtForcedSettlement(bytes32,address,bytes32,int256,uint256,int256,bool)");
 
     /// @dev Pulls the (size, isLong) leg out of the most recent PositionClosed log.
     function _lastClosedSizeSide(Vm.Log[] memory logs) internal pure returns (int256 size, bool isLong, bool found) {

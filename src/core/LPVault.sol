@@ -553,26 +553,33 @@ contract LPVault is Initializable, UUPSUpgradeable, ERC4626Upgradeable, Reentran
         // Check solvency BEFORE state mutation
         uint256 free = freeAssets();
         if (amount > free) revert InsufficientFreeAssets(amount, free);
-        
+
         VaultStorage.Layout storage s = VaultStorage.load();
         s.eventFundedSeed += amount;
-        
+
         IERC20(asset()).safeTransfer(msg.sender, amount);
         emit EventMarketFunded(msg.sender, amount);
     }
 
     /// @inheritdoc ILPVault
-    function settleEventMarket(uint256 originalSeed, uint256 returnedAmount) external nonReentrant onlyEventMarketFactory {
+    function settleEventMarket(
+        uint256 originalSeed,
+        uint256 returnedAmount
+    )
+        external
+        nonReentrant
+        onlyEventMarketFactory
+    {
         if (originalSeed == 0) revert AmountZero();
         VaultStorage.Layout storage s = VaultStorage.load();
-        
+
         // This is safe because eventFundedSeed only grows by exact funded amounts
         s.eventFundedSeed -= originalSeed;
-        
+
         if (returnedAmount > 0) {
             IERC20(asset()).safeTransferFrom(msg.sender, address(this), returnedAmount);
         }
-        
+
         int256 pnl = int256(returnedAmount) - int256(originalSeed);
         emit EventMarketSettled(msg.sender, originalSeed, returnedAmount, pnl);
     }
