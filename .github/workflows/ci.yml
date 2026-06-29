@@ -74,8 +74,13 @@ jobs:
       # its PATH, so it cannot drive the Foundry build itself. Compile here on the
       # host (where foundry-toolchain installed forge) and emit build-info JSON so
       # Slither can consume the pre-built artifacts via `ignore-compile`.
+      #
+      # Build src/ only (skip test/ and script/): compiling scripts makes Foundry
+      # emit preprocessing helpers (foundry-pp/DeployHelper*.sol) that crytic-compile
+      # cannot resolve under `--ignore-compile`. Slither only analyzes `src/` anyway
+      # (target below + filter_paths in slither.config.json).
       - name: Build (with build-info for Slither)
-        run: forge build --build-info
+        run: forge build --build-info --skip 'test/**' --skip 'script/**'
 
       - name: Run Slither
         uses: crytic/slither-action@v0.4.0
