@@ -238,22 +238,32 @@ contract EventMarket is Initializable, IEventMarket, ReentrancyGuard {
             "EventMarket: unsupported or unresolved value"
         );
 
-        _outcome = Outcome(value);
+        _finalizeResolution(Outcome(value));
+    }
+
+    /// @dev Behavior-preserving extraction of the money-movement + bookkeeping half of the
+    ///      resolution flow. Given a validated final `outcome_`, it flips the market to RESOLVED,
+    ///      computes the AMM liability, returns surplus seed to the LPVault via the factory, and
+    ///      fires the feedback impulse. `settleResolution` (the UMA-driven path) is the only
+    ///      production caller; it wraps this in `nonReentrant` and supplies the outcome read from
+    ///      the oracle. Extracting it lets alternative resolution gates (e.g. a test-only operator
+    ///      override) reuse the exact same settlement accounting without duplicating it. This
+    ///      function performs NO access control of its own — every caller MUST gate access and hold
+    ///      the reentrancy guard before invoking it.
+    function _finalizeResolution(Outcome outcome_) internal {
+        _outcome = outcome_;
         _status = Status.RESOLVED;
 
         // Calculate AMM liability based on outcome
         uint256 liability;
-        if (_outcome == Outcome.YES) {
+        if (outcome_ == Outcome.YES) {
             liability = q1;
-        } else if (_outcome == Outcome.NO) {
+        } else if (outcome_ == Outcome.NO) {
             liability = q2;
         } else {
             // VOID
             liability = (q1 + q2) / 2; // 0.5 USDC per share
         }
-
-        // Total USDC in the market is exactly LMSRMath.cost(q1, q2)
-        uint256 currentCost = LMSRMath.cost(q1, q2, _params.lmsrB);
 
         // Profit returned to LPVault is (currentCost - liability).
         // Due to rounding in exp/ln, we use actual balance minus liability.
@@ -266,13 +276,13 @@ contract EventMarket is Initializable, IEventMarket, ReentrancyGuard {
 
         // Notify factory with signed outcome score and returned liquidity
         int256 outcomeScore_e18;
-        if (_outcome == Outcome.YES) outcomeScore_e18 = 1e18;
-        else if (_outcome == Outcome.NO) outcomeScore_e18 = -1e18;
+        if (outcome_ == Outcome.YES) outcomeScore_e18 = 1e18;
+        else if (outcome_ == Outcome.NO) outcomeScore_e18 = -1e18;
         else outcomeScore_e18 = 0; // VOID
 
         factory.onMarketResolved(_params.subjectId, _params.eventId, _params.eventClass, outcomeScore_e18, toReturn);
 
-        emit MarketResolved(_outcome);
+        emit MarketResolved(outcome_);
     }
 
     /// @inheritdoc IEventMarket
@@ -298,14 +308,24 @@ contract EventMarket is Initializable, IEventMarket, ReentrancyGuard {
     }
 
     /// @inheritdoc IEventMarket
+    /// @dev Marginal LMSR price of an outcome, returned as a 1e18-scaled probability in [0, 1e18].
+    ///      YES + NO sum to ~1e18. Implemented as a finite-difference of the cost function:
+    ///      `price ≈ (cost(q + Δ) − cost(q)) / Δ`, scaled to 1e18.
+    ///
+    ///      IMPORTANT (units): shares and `lmsrB` are 6-decimal USDC units, so the perturbation Δ
+    ///      MUST also be a small 6-decimal amount. The prior implementation perturbed by `1e18`
+    ///      (a full WAD, i.e. ~1e12 whole shares) — astronomically larger than `b` (~thousands of
+    ///      6-dec units) — which saturated the exponential and returned ~1e18 (≈"$1") for BOTH
+    ///      outcomes. Trading was never affected (it uses `LMSRMath.cost`/`sharesForUsdc`
+    ///      directly); this only ever corrupted the display price. We use Δ = 1e6 (one whole
+    ///      share), tiny relative to `b`, so the difference quotient is an accurate marginal price.
     function priceOf(bool isYes) external view returns (uint256 price1e18) {
-        // Marginal price in LMSR is e^(qi/b) / (e^(q1/b) + e^(q2/b))
-        // Using cost function diff for 1e18 shares gives a close approximation:
-        if (isYes) {
-            return LMSRMath.cost(q1 + 1e18, q2, _params.lmsrB) - LMSRMath.cost(q1, q2, _params.lmsrB);
-        } else {
-            return LMSRMath.cost(q1, q2 + 1e18, _params.lmsrB) - LMSRMath.cost(q1, q2, _params.lmsrB);
-        }
+        uint256 b = _params.lmsrB;
+        uint256 delta = 1e6; // one whole share, in 6-decimal USDC units
+        uint256 c0 = LMSRMath.cost(q1, q2, b);
+        uint256 c1 = isYes ? LMSRMath.cost(q1 + delta, q2, b) : LMSRMath.cost(q1, q2 + delta, b);
+        // (c1 - c0) / delta is the dimensionless marginal price in [0, 1]; scale to 1e18.
+        return ((c1 - c0) * 1e18) / delta;
     }
 
     function totalYesShares() external view returns (uint256) {
