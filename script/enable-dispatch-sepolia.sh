@@ -22,7 +22,16 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-RPC="${SEPOLIA_RPC:-https://sepolia.base.org}"
+# Pick up repo .env (DEPLOYER_PK, GOVERNANCE, USDC, TIMELOCK_DELAY, EVENT_OPERATOR, …).
+# .env is the source of truth here — its values override prior shell exports.
+if [ -f .env ]; then
+  set -a
+  # shellcheck disable=SC1091
+  . ./.env
+  set +a
+fi
+
+RPC="${SEPOLIA_RPC:-${BASE_SEPOLIA_RPC_URL:-https://sepolia.base.org}}"
 
 # Fixed Base Sepolia wiring (from pm-infra registry + on-chain verification).
 export GOVERNANCE="${GOVERNANCE:-0x0183A2e2F30264ebB89995854e09Bab51Ca251bE}"
