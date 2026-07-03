@@ -75,13 +75,23 @@ contract DeployEventMarkets is Script {
         console2.log("   LPVault(proxy).upgradeTo(New LPVault Impl)");
         console2.log("2. Grant EVENT_MARKET_ROLE to the Factory:");
         console2.log("   LPVault(proxy).grantRole(EVENT_MARKET_ROLE, EventMarketFactory)");
-        console2.log("3. Register the Router as a factory operator (layer i, timelocked):");
-        console2.log("   EventMarketFactory(factory).proposeAddOperator(EventMarketRouter)");
-        console2.log("   ...after TIMELOCK_DELAY: activateAddOperator(EventMarketRouter)");
-        console2.log("4. Register the engine KMS key as a router operator (layer ii, timelocked):");
-        console2.log("   EventMarketRouter(router).proposeAddOperator(ENGINE_OPERATOR_KEY)");
-        console2.log("   ...after TIMELOCK_DELAY: activateAddOperator(ENGINE_OPERATOR_KEY)");
-        console2.log("5. Users approve USDC to the EventMarketRouter (single approval).");
+        console2.log("3. Enable the custodial path (layers i + ii) via EnableEventOperator:");
+        console2.log("   export EVENT_MARKET_FACTORY=<factory proxy above>");
+        console2.log("   export EVENT_MARKET_ROUTER=<router proxy above>");
+        console2.log("   export EVENT_OPERATOR=<engine operator signer address>");
+        console2.log(
+            "   forge script script/EnableEventOperator.s.sol:EnableEventOperator --sig 'propose()' --broadcast"
+        );
+        console2.log("   ...wait TIMELOCK_DELAY (router floor = 1h)...");
+        console2.log(
+            "   forge script script/EnableEventOperator.s.sol:EnableEventOperator --sig 'activate()' --broadcast"
+        );
+        console2.log("4. Users approve USDC to the EventMarketRouter (single approval).");
+        console2.log("------------------------------------------");
+        console2.log("Engine config contract (see docs/ENABLE_EVENT_DISPATCH.md):");
+        console2.log("  chain.event_market_router :", routerProxy);
+        console2.log("  event_market_factory      :", factoryProxy);
+        console2.log("  chain.event_operator      : <EVENT_OPERATOR signer, allowlisted on router>");
         console2.log("------------------------------------------");
 
         vm.stopBroadcast();
