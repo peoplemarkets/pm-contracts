@@ -210,6 +210,49 @@ contract EventMarketTest is Test {
         assertGt(pYesAfter, pYesBefore, "yes price rose");
     }
 
+    function test_priceOf_freshMarketIsHalfAndSumsToOne() public {
+        EventMarket m = _defaultMarket();
+        uint256 pYes = m.priceOf(true);
+        uint256 pNo = m.priceOf(false);
+        // Balanced book (q1 == q2 == 0) => each outcome ~= 0.5e18.
+        assertApproxEqAbs(pYes, 0.5e18, 1e6, "yes ~= 0.5e18");
+        assertApproxEqAbs(pNo, 0.5e18, 1e6, "no ~= 0.5e18");
+        // Probabilities must partition exactly.
+        assertEq(pYes + pNo, 1e18, "sum == 1e18");
+    }
+
+    function test_priceOf_afterYesBuyRisesAndStillSumsToOne() public {
+        EventMarket m = _defaultMarket();
+        uint256 pYesBefore = m.priceOf(true);
+
+        vm.startPrank(alice);
+        usdc.approve(address(m), 5_000e6);
+        m.buyOutcome(true, 5_000e6, 0);
+        vm.stopPrank();
+
+        uint256 pYes = m.priceOf(true);
+        uint256 pNo = m.priceOf(false);
+        assertGt(pYes, pYesBefore, "yes price rose after YES buy");
+        assertGt(pYes, pNo, "yes now more likely than no");
+        assertEq(pYes + pNo, 1e18, "sum still == 1e18");
+    }
+
+    function test_priceOf_extremeImbalanceDoesNotRevert() public {
+        EventMarket m = _defaultMarket();
+        // Drive a large one-sided position; the shift-invariant softmax must not overflow expWad.
+        vm.startPrank(alice);
+        usdc.approve(address(m), type(uint256).max);
+        m.buyOutcome(true, 900_000e6, 0);
+        vm.stopPrank();
+
+        uint256 pYes = m.priceOf(true);
+        uint256 pNo = m.priceOf(false);
+        // YES saturates toward 1e18; NO toward 0. No revert, and they still partition exactly.
+        assertGt(pYes, pNo, "yes dominates");
+        assertLe(pYes, 1e18, "yes bounded by 1e18");
+        assertEq(pYes + pNo, 1e18, "sum still == 1e18 under imbalance");
+    }
+
     function test_lmsr_roundTripDoesNotProfit() public {
         // Buy then immediately sell the same shares must not return more USDC than spent.
         EventMarket m = _defaultMarket();
