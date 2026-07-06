@@ -1,8 +1,6 @@
 // SPDX-License-Identifier: BUSL-1.1
 pragma solidity 0.8.24;
 
-import {IERC4626} from "@openzeppelin/contracts/interfaces/IERC4626.sol";
-
 import {Initializable} from "@openzeppelin/contracts-upgradeable/proxy/utils/Initializable.sol";
 import {UUPSUpgradeable} from "@openzeppelin/contracts-upgradeable/proxy/utils/UUPSUpgradeable.sol";
 
@@ -647,7 +645,11 @@ contract PerpEngine is Initializable, UUPSUpgradeable, ReentrancyGuard, IPerpEng
         internal
         view
     {
-        uint256 liveTvl = IERC4626(perpS.lpVault).totalAssets();
+        // OI-cap TVL uses the O(1), event-funding-invariant `capTvl()` (= freeAssets + eventFundedSeed),
+        // NOT the share-price NAV `totalAssets()`. This keeps OI capacity/liveness unaffected by event
+        // funding (no availability regression) and avoids the per-market recoverable loop on the perp
+        // hot path. Share pricing still uses the exact bounded NAV view separately.
+        uint256 liveTvl = ILPVault(perpS.lpVault).capTvl();
         uint256 vaultTvl = perpS.cappedTvl < liveTvl ? perpS.cappedTvl : liveTvl;
         me.enforceOpenCaps(
             trader,
@@ -889,7 +891,8 @@ contract PerpEngine is Initializable, UUPSUpgradeable, ReentrancyGuard, IPerpEng
             uint64 readyAt = lastUpdate + uint64(CAPPED_TVL_MIN_INTERVAL);
             if (block.timestamp < readyAt) revert CappedTvlPokeTooSoon(readyAt);
         }
-        uint256 newTvl = IERC4626(perpS.lpVault).totalAssets();
+        // Snapshot the O(1) event-funding-invariant OI-cap denominator, not the NAV.
+        uint256 newTvl = ILPVault(perpS.lpVault).capTvl();
         perpS.cappedTvl = newTvl;
         perpS.cappedTvlUpdatedAt = uint64(block.timestamp);
         emit CappedTvlPoked(newTvl, msg.sender);
