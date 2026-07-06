@@ -103,15 +103,21 @@ interface ILPVault is IERC4626 {
     // ------------------------------------------------------------------------------------------
 
     /// @notice Pulls `amount` USDC from the vault to seed an EventMarket AMM.
-    ///         The amount is tracked in `eventFundedSeed` to preserve `freeAssets`.
+    ///         The amount is tracked in `eventFundedSeed`, but is NOT added back into
+    ///         `freeAssets`: outstanding event exposure is marked to its worst-case recoverable
+    ///         value (zero) until settlement, so seeding a market lowers the LP-share NAV by
+    ///         `amount` and no stale seed can be redeemed at a phantom-high price. See the
+    ///         `LPVault.freeAssets()` NatSpec for the full rationale.
     /// @dev    Caller MUST be the configured `eventMarketFactory`.
     function fundEventMarket(uint256 amount) external;
 
     /// @notice Returns liquidity from a resolved EventMarket back to the vault.
     ///         Decrements `eventFundedSeed` by `originalSeed`, and transfers `returnedAmount`
     ///         USDC from the caller to the vault.
-    /// @dev    Caller MUST be the configured `eventMarketFactory`. The difference between
-    ///         `returnedAmount` and `originalSeed` is absorbed naturally by `freeAssets` as PnL.
+    /// @dev    Caller MUST be the configured `eventMarketFactory`. Since funding already removed
+    ///         the seed from the NAV, the LP-share NAV moves by exactly the realized PnL
+    ///         (`returnedAmount - originalSeed`) when this settles — `returnedAmount` is the only
+    ///         event-market contribution `freeAssets` ever sees.
     function settleEventMarket(uint256 originalSeed, uint256 returnedAmount) external;
 
     // ------------------------------------------------------------------------------------------

@@ -1656,4 +1656,190 @@ contract LPVaultTest is Test {
         // positionCollateral).
         assertEq(vault.insuranceFundBalance(), 99_800 * ONE_USDC);
     }
+
+    // ------------------------------------------------------------------------------------------
+    // Event-market exposure in NAV (MUST-FIX #2) — mark outstanding seed to worst-case value.
+    //
+    // Pre-fix, `freeAssets()` added `eventFundedSeed` back at full original cost for a market's
+    // entire life, so the pmUSDC share price counted the deployed seed as if it were certain to
+    // be recovered in full. The true loss is only booked at `settleEventMarket`, which can lag the
+    // moment the real-world outcome is known — letting an LP redeem at the stale-high NAV and
+    // socialize the concentrated (b·ln2-bounded) loss onto the remaining LPs. The fix marks the
+    // exposure to its worst-case recoverable value (zero) until settlement realizes the PnL.
+    // ------------------------------------------------------------------------------------------
+
+    /// @dev Test-only event-market factory stand-in. The vault gates `fundEventMarket` /
+    ///      `settleEventMarket` to the configured factory address; here that is a plain EOA so we
+    ///      can drive the vault's event-market accounting in isolation from the AMM.
+    address internal eventFactory = makeAddr("eventFactory");
+
+    function _wireEventFactory() internal {
+        vm.prank(governance);
+        vault.proposeSetEventMarketFactory(eventFactory);
+        vm.warp(block.timestamp + TIMELOCK_DELAY);
+        vault.activateSetEventMarketFactory();
+        // The factory needs USDC + approval so `settleEventMarket` can pull `returnedAmount`.
+        usdc.mint(eventFactory, 10 * USDC_1M);
+        vm.prank(eventFactory);
+        usdc.approve(address(vault), type(uint256).max);
+    }
+
+    /// @dev The vault-side identity that must hold at ALL times, including while an event market
+    ///      is live (eventFundedSeed > 0). Note `eventFundedSeed` is NOT part of this identity:
+    ///      that USDC has physically left the vault, so it is not part of `balanceOf(vault)`.
+    function _assertVaultIdentity() internal view {
+        assertEq(
+            vault.freeAssets() + vault.positionCollateral() + vault.insuranceFundBalance() + vault.accruedFees(),
+            usdc.balanceOf(address(vault)),
+            "freeAssets + booked buckets must equal on-chain USDC balance"
+        );
+    }
+
+    function test_Event_FundReducesFreeAssetsBySeed() public {
+        vm.prank(alice);
+        vault.deposit(USDC_1M, alice);
+        _wireEventFactory();
+        _assertVaultIdentity();
+
+        uint256 seed = 200_000 * ONE_USDC;
+        vm.prank(eventFactory);
+        vault.fundEventMarket(seed);
+
+        // Seed USDC left the vault; NAV drops by the full seed (worst-case recoverable = 0).
+        // Pre-fix `freeAssets()` would still read USDC_1M here — the stale-high NAV bug.
+        assertEq(vault.freeAssets(), USDC_1M - seed, "freeAssets marked down by seed");
+        assertEq(vault.totalAssets(), USDC_1M - seed, "share NAV == freeAssets");
+        assertEq(vault.eventFundedSeed(), seed, "seed tracked for settlement/insurance sizing");
+        assertEq(usdc.balanceOf(address(vault)), USDC_1M - seed, "USDC physically left the vault");
+        _assertVaultIdentity();
+    }
+
+    /// @notice The core arbitrage-closure test: an LP who redeems while an event market is live —
+    ///         after the real-world outcome is known but before `settleEventMarket` books the
+    ///         loss — can no longer exit at a stale-high NAV and dump the loss on the LP who stays.
+    function test_Event_RedeemBeforeSettlementCannotCaptureStaleSeed() public {
+        // Two equal LPs: 500k each, 50/50 of the share supply.
+        vm.prank(alice);
+        vault.deposit(USDC_1M / 2, alice);
+        vm.prank(bob);
+        vault.deposit(USDC_1M / 2, bob);
+        _wireEventFactory();
+
+        uint256 seed = 200_000 * ONE_USDC;
+        vm.prank(eventFactory);
+        vault.fundEventMarket(seed);
+
+        // Outcome is now known: this market will return NOTHING (worst case — full seed lost).
+        // Alice front-runs settlement and redeems her entire stake.
+        assertEq(vault.freeAssets(), USDC_1M - seed, "NAV already marks the exposure down");
+        uint256 aliceShares = vault.balanceOf(alice);
+        vm.prank(alice);
+        uint256 aliceProceeds = vault.redeem(aliceShares, alice, alice);
+
+        // Alice gets 50% of the marked-down NAV (400k), NOT 50% of a stale 1M NAV (500k).
+        // Pre-fix she would have extracted 500k, leaving Bob to absorb the entire 200k loss.
+        assertEq(aliceProceeds, 400_000 * ONE_USDC, "redeemer bounded by conservative NAV");
+
+        // Settlement books the realized loss (returnedAmount = 0).
+        vm.prank(eventFactory);
+        vault.settleEventMarket(seed, 0);
+        assertEq(vault.eventFundedSeed(), 0, "seed cleared at settlement");
+
+        // Bob (the LP who stayed) is left whole-minus-fair-share: his stake is worth 400k, i.e.
+        // he ate only HALF the 200k loss, not all of it. The loss is socialized evenly.
+        uint256 bobFinal = vault.previewRedeem(vault.balanceOf(bob));
+        assertEq(bobFinal, 400_000 * ONE_USDC, "remaining LP not dumped with the full loss");
+        assertEq(aliceProceeds + bobFinal, USDC_1M - seed, "both LPs shared the loss pro rata");
+        _assertVaultIdentity();
+    }
+
+    function test_Event_SettlementRealizesLoss() public {
+        vm.prank(alice);
+        vault.deposit(USDC_1M, alice);
+        _wireEventFactory();
+
+        uint256 seed = 300_000 * ONE_USDC;
+        vm.prank(eventFactory);
+        vault.fundEventMarket(seed);
+
+        // Market resolves at a partial loss: returns 220k of the 300k seed (loss = 80k).
+        uint256 returned = 220_000 * ONE_USDC;
+        vm.prank(eventFactory);
+        vault.settleEventMarket(seed, returned);
+
+        // Net NAV change over the full fund→settle lifecycle == realized PnL == returned - seed.
+        assertEq(vault.freeAssets(), USDC_1M - (seed - returned), "NAV drops by realized loss only");
+        assertEq(vault.eventFundedSeed(), 0);
+        _assertVaultIdentity();
+    }
+
+    function test_Event_SettlementRealizesProfit() public {
+        vm.prank(alice);
+        vault.deposit(USDC_1M, alice);
+        _wireEventFactory();
+
+        uint256 seed = 300_000 * ONE_USDC;
+        vm.prank(eventFactory);
+        vault.fundEventMarket(seed);
+        assertEq(vault.freeAssets(), USDC_1M - seed, "NAV marked down while live");
+
+        // LMSR LPs profit when the minority side wins: the market can hand back MORE than the seed.
+        uint256 returned = 340_000 * ONE_USDC;
+        vm.prank(eventFactory);
+        vault.settleEventMarket(seed, returned);
+
+        assertEq(vault.freeAssets(), USDC_1M + (returned - seed), "NAV rises by realized profit");
+        _assertVaultIdentity();
+    }
+
+    /// @notice Perp accounting composes with a live event market: locked collateral and event
+    ///         exposure are independent buckets and the vault identity holds throughout.
+    function test_Event_ComposesWithPerpCollateral() public {
+        vm.prank(alice);
+        vault.deposit(USDC_1M, alice);
+        _wireEventFactory();
+
+        // Perp engine locks trader collateral (pulls USDC in, bumps positionCollateral).
+        uint256 collat = 150_000 * ONE_USDC;
+        vm.prank(perpEngine);
+        vault.lockCollateral(trader, collat);
+        uint256 freeBefore = vault.freeAssets();
+        assertEq(freeBefore, USDC_1M, "locking collateral does not change freeAssets");
+        _assertVaultIdentity();
+
+        // Seed an event market: only the free (LP) bucket funds it; collateral is untouched.
+        uint256 seed = 250_000 * ONE_USDC;
+        vm.prank(eventFactory);
+        vault.fundEventMarket(seed);
+        assertEq(vault.freeAssets(), USDC_1M - seed, "event seed drawn from free bucket only");
+        assertEq(vault.positionCollateral(), collat, "perp collateral untouched by event funding");
+        _assertVaultIdentity();
+
+        // Settle the event market flat; perp collateral still intact and identity holds.
+        vm.prank(eventFactory);
+        vault.settleEventMarket(seed, seed);
+        assertEq(vault.freeAssets(), USDC_1M, "flat event settle restores free NAV");
+        assertEq(vault.positionCollateral(), collat);
+        _assertVaultIdentity();
+    }
+
+    function test_Event_FundCannotDeployLockedCollateral() public {
+        vm.prank(alice);
+        vault.deposit(USDC_1M, alice);
+        _wireEventFactory();
+
+        // Lock 100k of trader collateral: balance = 1.1M, but free = 1M.
+        vm.prank(perpEngine);
+        vault.lockCollateral(trader, 100_000 * ONE_USDC);
+
+        // Funding is bounded by freeAssets (1M), NOT by the raw balance (1.1M): a 1M seed is the
+        // max, and one wei more must revert rather than dip into locked collateral.
+        vm.prank(eventFactory);
+        vault.fundEventMarket(USDC_1M);
+        assertEq(vault.freeAssets(), 0, "all free capital deployed");
+
+        vm.expectRevert(abi.encodeWithSelector(ILPVault.InsufficientFreeAssets.selector, uint256(1), uint256(0)));
+        vm.prank(eventFactory);
+        vault.fundEventMarket(1);
+    }
 }

@@ -544,9 +544,16 @@ contract LPVault is Initializable, UUPSUpgradeable, ERC4626Upgradeable, Reentran
     // ------------------------------------------------------------------------------------------
 
     /// @inheritdoc ILPVault
+    /// @dev The seed USDC leaves the vault here. `freeAssets()` (and thus the share price) drops
+    ///      by `amount` immediately — outstanding event exposure is marked to its worst-case
+    ///      recoverable value of zero until `settleEventMarket` books the realized PnL. See the
+    ///      `freeAssets()` NatSpec for the rationale (closes the LP redemption arbitrage).
+    ///      `eventFundedSeed` is retained only for settlement validation and insurance-fund
+    ///      (`_capDenominatorTvl`) sizing; it no longer feeds the LP-share NAV.
     function fundEventMarket(uint256 amount) external nonReentrant onlyEventMarketFactory {
         if (amount == 0) revert AmountZero();
-        // Check solvency BEFORE state mutation
+        // Check solvency BEFORE state mutation. `freeAssets()` no longer counts `eventFundedSeed`,
+        // so this now requires the vault to hold `amount` of genuinely free (undeployed) USDC.
         uint256 free = freeAssets();
         if (amount > free) revert InsufficientFreeAssets(amount, free);
 
@@ -572,6 +579,10 @@ contract LPVault is Initializable, UUPSUpgradeable, ERC4626Upgradeable, Reentran
         // This is safe because eventFundedSeed only grows by exact funded amounts
         s.eventFundedSeed -= originalSeed;
 
+        // `returnedAmount` USDC flows back into the vault balance and is the ONLY event-market
+        // contribution to `freeAssets()`. Since funding already removed the seed from the NAV,
+        // the LP-share NAV moves by exactly the realized PnL (`returnedAmount - originalSeed`)
+        // across the fund→settle lifecycle. No stale seed is ever added back.
         if (returnedAmount > 0) {
             IERC20(asset()).safeTransferFrom(msg.sender, address(this), returnedAmount);
         }
@@ -909,13 +920,35 @@ contract LPVault is Initializable, UUPSUpgradeable, ERC4626Upgradeable, Reentran
     // ------------------------------------------------------------------------------------------
 
     /// @inheritdoc ILPVault
-    /// @dev Computed: `balance(USDC) + eventFundedSeed − positionCollateral − insuranceFundBalance − accruedFees`.
+    /// @dev Computed: `balance(USDC) − positionCollateral − insuranceFundBalance − accruedFees`.
     ///      Saturates at 0 if the bookkeepers somehow exceed balance (invariant break) so this
     ///      view stays callable during incident response. Production state-changing flows still
     ///      enforce solvency via the bookkeeper-decrement-before-transfer ordering.
+    ///
+    /// @dev Event-market exposure is deliberately EXCLUDED from the LP-share NAV. When an
+    ///      EventMarket is seeded, its `eventFundedSeed` USDC physically leaves this vault (it
+    ///      sits in the market clone as LMSR liquidity) and its recoverable value is unknown
+    ///      until resolution — it can be anywhere in `[0, cost(q1,q2)]` depending on the outcome,
+    ///      with a downside bounded by the seed (`b·ln2`). The pre-fix code added
+    ///      `eventFundedSeed` back at full original cost for the market's entire life, so
+    ///      `freeAssets()` (and therefore the pmUSDC share price) reported the seed as if it were
+    ///      certain to be recovered in full. Because `settleEventMarket` (which books the true
+    ///      loss) can lag the moment the real-world outcome becomes known, an LP could redeem at
+    ///      that stale-high NAV and socialize the concentrated loss onto the remaining LPs.
+    ///
+    ///      We mark outstanding event exposure to its worst-case recoverable value — zero — until
+    ///      the loss/PnL is realized at `settleEventMarket`. This is the tightest bound the vault
+    ///      can compute without an unbounded per-market on-chain loop or a trade-time push hook
+    ///      into the (out-of-scope) EventMarket AMM. Seeding a market therefore reduces `freeAssets`
+    ///      by the seed immediately, and settlement adds back exactly the returned USDC as realized
+    ///      PnL. The NAV is thus conservative while a market is live (it never over-reports, so the
+    ///      redemption arbitrage is closed); the residual is that a mid-life redeemer forgoes their
+    ///      pro-rata share of any seed the market will hand back — a self-correcting, safe-direction
+    ///      under-report bounded by `eventFundedSeed`. Note `eventFundedSeed` is still counted as
+    ///      protocol capital in `_capDenominatorTvl` for insurance cap/floor sizing.
     function freeAssets() public view returns (uint256) {
         VaultStorage.Layout storage s = VaultStorage.load();
-        uint256 totalBalance = IERC20(asset()).balanceOf(address(this)) + s.eventFundedSeed;
+        uint256 totalBalance = IERC20(asset()).balanceOf(address(this));
         uint256 booked = s.positionCollateral + s.insuranceFundBalance + s.accruedFees;
         return totalBalance > booked ? totalBalance - booked : 0;
     }

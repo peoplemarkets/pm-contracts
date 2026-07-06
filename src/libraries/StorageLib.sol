@@ -309,8 +309,12 @@ library VaultStorage {
         address pendingEventMarketFactory;
         uint64 pendingEventMarketFactoryActivatesAt;
         // The total amount of seed liquidity currently deployed to unresolved Event Markets.
-        // This USDC has left the vault's balance, but is accounted for in `freeAssets` as
-        // an investment that will be returned (plus/minus PnL) upon event resolution.
+        // This USDC has left the vault's balance. It is deliberately NOT added back into
+        // `freeAssets` (the LP-share NAV): outstanding event exposure is marked to its worst-case
+        // recoverable value of zero until `settleEventMarket` books the realized PnL, which closes
+        // the redeem-at-stale-NAV arbitrage. The counter is retained for settlement validation and
+        // for insurance cap/floor sizing (`_capDenominatorTvl`), where it still counts as deployed
+        // protocol capital.
         uint256 eventFundedSeed;
     }
 
