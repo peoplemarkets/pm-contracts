@@ -309,9 +309,20 @@ library VaultStorage {
         address pendingEventMarketFactory;
         uint64 pendingEventMarketFactoryActivatesAt;
         // The total amount of seed liquidity currently deployed to unresolved Event Markets.
-        // This USDC has left the vault's balance, but is accounted for in `freeAssets` as
-        // an investment that will be returned (plus/minus PnL) upon event resolution.
+        // This USDC has left the vault's balance. It is NO LONGER counted in `freeAssets` (the
+        // strictly-liquid, I1-preserving denominator); instead live markets are marked to their
+        // current recoverable value inside `totalAssets` (the NAV / share-price denominator) via
+        // the `liveEventMarkets` registry below. `eventFundedSeed` is retained for two O(1) uses:
+        // the insurance cap/floor denominator (`_capDenominatorTvl`) and the perp OI-cap
+        // denominator (`capTvl` = freeAssets + eventFundedSeed, invariant to fund/settle).
         uint256 eventFundedSeed;
+        // ---- APPENDED: event-NAV v2 — live event-market registry (recoverable-value marking) ----
+        // Set of currently-live (funded, unsettled) EventMarket clones. `totalAssets()` marks each
+        // one to `IEventMarket.currentRecoverable()`. Bounded by `MAX_LIVE_EVENT_MARKETS` (enforced
+        // in `fundEventMarket`) so the mark loop is provably O(bounded). `liveEventMarketIndex` is a
+        // 1-based index into `liveEventMarkets` (0 = not live) enabling O(1) swap-pop on settle.
+        address[] liveEventMarkets;
+        mapping(address => uint256) liveEventMarketIndex;
     }
 
     function load() internal pure returns (Layout storage l) {

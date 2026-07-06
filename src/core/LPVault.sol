@@ -15,6 +15,7 @@ import {UUPSUpgradeable} from "@openzeppelin/contracts-upgradeable/proxy/utils/U
 import {ReentrancyGuard} from "solady/utils/ReentrancyGuard.sol";
 
 import {VaultStorage} from "../libraries/StorageLib.sol";
+import {IEventMarket} from "../events/IEventMarket.sol";
 import {IInsuranceFund} from "./IInsuranceFund.sol";
 import {ILPVault} from "./ILPVault.sol";
 
@@ -46,6 +47,12 @@ contract LPVault is Initializable, UUPSUpgradeable, ERC4626Upgradeable, Reentran
     uint32 public constant MIN_TIMELOCK_DELAY = 1 hours;
     uint32 public constant MAX_TIMELOCK_DELAY = 30 days;
     uint8 internal constant DECIMALS_OFFSET = 6;
+
+    /// @dev Hard cap on the number of simultaneously-live event markets the vault will mark in the
+    ///      `eventRecoverable()` loop. Bounds the O(n) NAV mark to a provably small, gas-safe n.
+    ///      Markets are governance-created (one per EventMarketFactory.createMarket), so this is a
+    ///      liberal ceiling; `fundEventMarket` reverts `TooManyLiveMarkets` past it.
+    uint256 public constant MAX_LIVE_EVENT_MARKETS = 64;
 
     /// @dev Cumulative ceiling on `seedInsurance`. 10× the spec's $1M initial seed (§3 line 159)
     ///      gives generous headroom for the floor-mechanic top-up (§3 line 162) without making
@@ -147,11 +154,16 @@ contract LPVault is Initializable, UUPSUpgradeable, ERC4626Upgradeable, Reentran
     // ------------------------------------------------------------------------------------------
 
     /// @inheritdoc ERC4626Upgradeable
-    /// @dev Returns `freeAssets()` — the bucket that LP shares are redeemable from. Locked
-    ///      collateral, insurance fund, and treasury fees sit in the same USDC contract balance
-    ///      but do not back shares. See contract NatSpec.
+    /// @dev Share-price NAV denominator = strictly-liquid `freeAssets()` PLUS the current
+    ///      recoverable value of every live event market (`eventRecoverable()`). Locked collateral,
+    ///      insurance fund, and treasury fees sit in the same USDC contract balance but do not back
+    ///      shares, so they are excluded from `freeAssets()`. Event-market seed that has left the
+    ///      vault is NOT counted at full cost (that was the redemption-arb bug); it is marked to its
+    ///      current recoverable value, which is a conservative floor pre-resolution and the exact
+    ///      settle amount once UMA has posted. Because `eventRecoverable() ≥ 0`, NAV ≥ liquid, so the
+    ///      share price is always fair while withdrawals stay liquidity-capped (see `maxWithdraw`).
     function totalAssets() public view virtual override(ERC4626Upgradeable, IERC4626) returns (uint256) {
-        return freeAssets();
+        return freeAssets() + eventRecoverable();
     }
 
     function _decimalsOffset() internal pure override returns (uint8) {
@@ -544,21 +556,36 @@ contract LPVault is Initializable, UUPSUpgradeable, ERC4626Upgradeable, Reentran
     // ------------------------------------------------------------------------------------------
 
     /// @inheritdoc ILPVault
-    function fundEventMarket(uint256 amount) external nonReentrant onlyEventMarketFactory {
+    /// @dev Solvency is checked against strictly-liquid `freeAssets()` (the seed can only leave the
+    ///      vault if there is liquid USDC to cover it). The funded `market` is registered in the live
+    ///      set so `totalAssets()` immediately begins marking it to its recoverable value — closing
+    ///      the deposit arb (a depositor after this point sees NAV already crediting the market).
+    function fundEventMarket(address market, uint256 amount) external nonReentrant onlyEventMarketFactory {
         if (amount == 0) revert AmountZero();
-        // Check solvency BEFORE state mutation
+        // Solvency vs LIQUID freeAssets (the seed can only be paid out of in-vault USDC).
         uint256 free = freeAssets();
         if (amount > free) revert InsufficientFreeAssets(amount, free);
 
         VaultStorage.Layout storage s = VaultStorage.load();
+        if (s.liveEventMarketIndex[market] != 0) revert MarketAlreadyLive(market);
+        if (s.liveEventMarkets.length >= MAX_LIVE_EVENT_MARKETS) revert TooManyLiveMarkets();
+
         s.eventFundedSeed += amount;
+        s.liveEventMarkets.push(market);
+        s.liveEventMarketIndex[market] = s.liveEventMarkets.length; // 1-based
 
         IERC20(asset()).safeTransfer(msg.sender, amount);
-        emit EventMarketFunded(msg.sender, amount);
+        emit EventMarketFunded(market, amount);
     }
 
     /// @inheritdoc ILPVault
+    /// @dev Removes `market` from the live set (O(1) swap-pop) and pulls `returnedAmount` back. NAV
+    ///      is continuous across settle: by settle time UMA is resolved so the market's
+    ///      `currentRecoverable()` already equalled `returnedAmount`; here recoverable_i drops to 0
+    ///      (market leaves the set) exactly as the vault's balance rises by `returnedAmount` — no
+    ///      jump, so no depositor/redeemer can straddle the settle instant for a windfall.
     function settleEventMarket(
+        address market,
         uint256 originalSeed,
         uint256 returnedAmount
     )
@@ -569,15 +596,28 @@ contract LPVault is Initializable, UUPSUpgradeable, ERC4626Upgradeable, Reentran
         if (originalSeed == 0) revert AmountZero();
         VaultStorage.Layout storage s = VaultStorage.load();
 
-        // This is safe because eventFundedSeed only grows by exact funded amounts
+        uint256 idx = s.liveEventMarketIndex[market];
+        if (idx == 0) revert MarketNotLive(market);
+
+        // This is safe because eventFundedSeed only grows by exact funded amounts.
         s.eventFundedSeed -= originalSeed;
+
+        // O(1) swap-pop removal from the live registry.
+        uint256 last = s.liveEventMarkets.length;
+        if (idx != last) {
+            address moved = s.liveEventMarkets[last - 1];
+            s.liveEventMarkets[idx - 1] = moved;
+            s.liveEventMarketIndex[moved] = idx;
+        }
+        s.liveEventMarkets.pop();
+        delete s.liveEventMarketIndex[market];
 
         if (returnedAmount > 0) {
             IERC20(asset()).safeTransferFrom(msg.sender, address(this), returnedAmount);
         }
 
         int256 pnl = int256(returnedAmount) - int256(originalSeed);
-        emit EventMarketSettled(msg.sender, originalSeed, returnedAmount, pnl);
+        emit EventMarketSettled(market, originalSeed, returnedAmount, pnl);
     }
 
     // ------------------------------------------------------------------------------------------
@@ -909,15 +949,56 @@ contract LPVault is Initializable, UUPSUpgradeable, ERC4626Upgradeable, Reentran
     // ------------------------------------------------------------------------------------------
 
     /// @inheritdoc ILPVault
-    /// @dev Computed: `balance(USDC) + eventFundedSeed − positionCollateral − insuranceFundBalance − accruedFees`.
-    ///      Saturates at 0 if the bookkeepers somehow exceed balance (invariant break) so this
-    ///      view stays callable during incident response. Production state-changing flows still
-    ///      enforce solvency via the bookkeeper-decrement-before-transfer ordering.
+    /// @dev STRICTLY LIQUID: `balance(USDC) − positionCollateral − insuranceFundBalance − accruedFees`.
+    ///      Event-market seed that has physically left the vault is intentionally NOT added back here
+    ///      — that was the redemption-arb bug (stale-high NAV once a losing outcome is known). This
+    ///      keeps strict invariant I1 (`balance == freeAssets + positionCollateral + insurance +
+    ///      fees`) holding whenever a market is funded, and is the honest solvency cap for perp
+    ///      settle / liquidation / withdrawal (a payout can only be sourced from in-vault USDC).
+    ///      Saturates at 0 if the bookkeepers somehow exceed balance (invariant break) so this view
+    ///      stays callable during incident response.
     function freeAssets() public view returns (uint256) {
         VaultStorage.Layout storage s = VaultStorage.load();
-        uint256 totalBalance = IERC20(asset()).balanceOf(address(this)) + s.eventFundedSeed;
+        uint256 bal = IERC20(asset()).balanceOf(address(this));
         uint256 booked = s.positionCollateral + s.insuranceFundBalance + s.accruedFees;
-        return totalBalance > booked ? totalBalance - booked : 0;
+        return bal > booked ? bal - booked : 0;
+    }
+
+    /// @inheritdoc ILPVault
+    /// @dev Sum of the current recoverable value of every live event market. Added to `freeAssets()`
+    ///      to form the share-price NAV (`totalAssets`). Each market self-reports a conservative
+    ///      floor pre-resolution and the exact settle amount once UMA has posted, so this never
+    ///      over-marks system cash (`Σ recoverable_i ≤ Σ market.balanceOf(USDC)`). The loop is bounded
+    ///      by `MAX_LIVE_EVENT_MARKETS`. A market that reverts (e.g. a malicious/gas-bombing clone)
+    ///      is skipped and left unmarked — conservative (understates NAV, never over-marks) and keeps
+    ///      this view callable so perp settle / liquidation / withdrawal never brick on it.
+    function eventRecoverable() public view returns (uint256 total) {
+        VaultStorage.Layout storage s = VaultStorage.load();
+        address[] storage m = s.liveEventMarkets;
+        uint256 len = m.length;
+        for (uint256 i; i < len; ++i) {
+            try IEventMarket(m[i]).currentRecoverable() returns (uint256 r) {
+                total += r;
+            } catch {
+                // Leave that market unmarked (conservative — understates NAV, never over-marks).
+            }
+        }
+    }
+
+    /// @inheritdoc ILPVault
+    /// @dev O(1) perp OI-cap denominator, decoupled from the per-market NAV mark. Equals
+    ///      `freeAssets() + eventFundedSeed`: funding a market subtracts `S` from the balance (hence
+    ///      from `freeAssets`) while adding `S` to `eventFundedSeed`, so this total is invariant to
+    ///      fund/settle. That preserves OI capacity/liveness (the S1 concern) with no loop on the
+    ///      perp hot path, while LP share pricing uses the exact bounded NAV view above.
+    function capTvl() external view returns (uint256) {
+        VaultStorage.Layout storage s = VaultStorage.load();
+        return freeAssets() + s.eventFundedSeed;
+    }
+
+    /// @inheritdoc ILPVault
+    function liveEventMarketCount() external view returns (uint256) {
+        return VaultStorage.load().liveEventMarkets.length;
     }
 
     function positionCollateral() external view returns (uint256) {

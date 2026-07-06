@@ -102,17 +102,22 @@ interface ILPVault is IERC4626 {
     // Event Market Seeding (Wave 8)
     // ------------------------------------------------------------------------------------------
 
-    /// @notice Pulls `amount` USDC from the vault to seed an EventMarket AMM.
-    ///         The amount is tracked in `eventFundedSeed` to preserve `freeAssets`.
-    /// @dev    Caller MUST be the configured `eventMarketFactory`.
-    function fundEventMarket(uint256 amount) external;
+    /// @notice Pulls `amount` USDC from the vault to seed the EventMarket clone `market`, and
+    ///         registers `market` in the live set so `totalAssets()` immediately marks it to its
+    ///         current recoverable value.
+    /// @dev    Caller MUST be the configured `eventMarketFactory`. Solvency is checked against
+    ///         strictly-liquid `freeAssets()`. Reverts `MarketAlreadyLive` on a duplicate register
+    ///         and `TooManyLiveMarkets` past `MAX_LIVE_EVENT_MARKETS`.
+    function fundEventMarket(address market, uint256 amount) external;
 
-    /// @notice Returns liquidity from a resolved EventMarket back to the vault.
-    ///         Decrements `eventFundedSeed` by `originalSeed`, and transfers `returnedAmount`
-    ///         USDC from the caller to the vault.
-    /// @dev    Caller MUST be the configured `eventMarketFactory`. The difference between
-    ///         `returnedAmount` and `originalSeed` is absorbed naturally by `freeAssets` as PnL.
-    function settleEventMarket(uint256 originalSeed, uint256 returnedAmount) external;
+    /// @notice Returns liquidity from a resolved EventMarket back to the vault and de-registers it.
+    ///         Decrements `eventFundedSeed` by `originalSeed`, removes `market` from the live set,
+    ///         and transfers `returnedAmount` USDC from the caller to the vault.
+    /// @dev    Caller MUST be the configured `eventMarketFactory`. Reverts `MarketNotLive` if
+    ///         `market` is not currently registered. NAV is continuous across this call: by settle
+    ///         time UMA is resolved, so the market's `currentRecoverable()` already equalled
+    ///         `returnedAmount` — the recoverable mark drops to 0 exactly as the balance rises.
+    function settleEventMarket(address market, uint256 originalSeed, uint256 returnedAmount) external;
 
     // ------------------------------------------------------------------------------------------
     // Insurance fund seeding (Fix #6) — governance only, no timelock, capped cumulatively
@@ -242,7 +247,27 @@ interface ILPVault is IERC4626 {
     // Views
     // ------------------------------------------------------------------------------------------
 
+    /// @notice Strictly-liquid assets that LP shares are redeemable from:
+    ///         `balance(USDC) − positionCollateral − insuranceFundBalance − accruedFees`. Does NOT
+    ///         include event-market seed that has left the vault (that was the redemption arb). This
+    ///         is the I1-preserving denominator and the honest solvency cap for perp settle /
+    ///         liquidation / withdrawal.
     function freeAssets() external view returns (uint256);
+
+    /// @notice Sum of the current recoverable value of every live event market. Added to
+    ///         `freeAssets()` to form the share-price NAV (`totalAssets()`). Conservative floor
+    ///         pre-resolution, exact settle amount post-UMA; never over-marks system cash.
+    function eventRecoverable() external view returns (uint256);
+
+    /// @notice O(1) perp OI-cap denominator = `freeAssets() + eventFundedSeed`. Invariant to
+    ///         event-market fund/settle, so OI capacity is unaffected by event funding. Decoupled
+    ///         from the per-market NAV mark to keep the perp hot path loop-free.
+    function capTvl() external view returns (uint256);
+
+    /// @notice Number of currently-live (funded, unsettled) event markets. Bounded by
+    ///         `MAX_LIVE_EVENT_MARKETS`.
+    function liveEventMarketCount() external view returns (uint256);
+
     function positionCollateral() external view returns (uint256);
     function insuranceFundBalance() external view returns (uint256);
     function accruedFees() external view returns (uint256);
@@ -408,4 +433,11 @@ interface ILPVault is IERC4626 {
     // --- Wave 8: EventMarketFactory wiring ---
     error OnlyEventMarketFactory(address caller);
     error EventMarketFactoryNotSet();
+    // --- event-NAV v2: live event-market registry ---
+    /// @notice Thrown by `fundEventMarket` when `market` is already registered in the live set.
+    error MarketAlreadyLive(address market);
+    /// @notice Thrown by `settleEventMarket` when `market` is not currently in the live set.
+    error MarketNotLive(address market);
+    /// @notice Thrown by `fundEventMarket` when the live set already holds `MAX_LIVE_EVENT_MARKETS`.
+    error TooManyLiveMarkets();
 }
