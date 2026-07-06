@@ -69,6 +69,12 @@ interface IEventMarket {
     function settleResolution() external;
 
     // Views
+    /// @notice Current USDC (1e6) the LPVault can recover from this live market. Equals the exact
+    ///         `actualBalance − liability` that `settleResolution` will book once UMA has posted a
+    ///         supported value; a conservative worst-case-liability floor (`balance − max(q1,q2)`)
+    ///         while still unresolved. Always ≥ 0; returns 0 once RESOLVED. Never over-marks: the
+    ///         result never exceeds this market's own USDC balance.
+    function currentRecoverable() external view returns (uint256);
     function priceOf(bool isYes) external view returns (uint256 price1e18);
     function totalYesShares() external view returns (uint256);
     function totalNoShares() external view returns (uint256);

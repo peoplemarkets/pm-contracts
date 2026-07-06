@@ -342,6 +342,33 @@ contract EventMarket is Initializable, IEventMarket, ReentrancyGuard {
         return _outcome;
     }
 
+    /// @inheritdoc IEventMarket
+    /// @dev Current value the LPVault can recover from this live market, in USDC (1e6). This is the
+    ///      exact figure `settleResolution` will book back to the vault (`actualBalance − liability`),
+    ///      computed against the *real* in-market USDC balance so the resolved-branch mark equals the
+    ///      settle amount to the wei (zero settle jump). Two regimes:
+    ///        - UMA already resolved (ts != 0 and a supported value): use the EXACT per-outcome
+    ///          liability (YES→q1, NO→q2, VOID→(q1+q2)/2) — identical to `settleResolution`.
+    ///        - Not yet resolved: use the worst-case-liability FLOOR max(q1, q2). Because
+    ///          max(q1,q2) ≥ any realised liability, the recoverable is a strict lower bound in every
+    ///          pre-resolution window (VOID included, since max(q1,q2) ≥ (q1+q2)/2).
+    ///      Returns 0 once RESOLVED (the vault has already been settled / the market is being removed
+    ///      the same tx). Uses saturating subtraction so the result is always ≥ 0.
+    function currentRecoverable() external view returns (uint256) {
+        if (_status == Status.RESOLVED) return 0; // already settled/removed same-tx
+        uint256 bal = usdc.balanceOf(address(this));
+        (uint256 v, uint64 ts) = umaAdapter.latestValue(_params.eventId);
+        uint256 liab;
+        if (ts != 0 && (v == uint256(Outcome.YES) || v == uint256(Outcome.NO) || v == uint256(Outcome.VOID))) {
+            // EXACT toReturn — mirrors settleResolution's per-outcome liability.
+            liab = v == uint256(Outcome.YES) ? q1 : v == uint256(Outcome.NO) ? q2 : (q1 + q2) / 2;
+        } else {
+            // Unresolved: worst-case-liability FLOOR (a strict lower bound on the recoverable).
+            liab = q1 > q2 ? q1 : q2;
+        }
+        return bal > liab ? bal - liab : 0;
+    }
+
     function params() external view returns (MarketParams memory) {
         return _params;
     }
