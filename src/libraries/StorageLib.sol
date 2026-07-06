@@ -323,6 +323,17 @@ library VaultStorage {
         // 1-based index into `liveEventMarkets` (0 = not live) enabling O(1) swap-pop on settle.
         address[] liveEventMarkets;
         mapping(address => uint256) liveEventMarketIndex;
+        // ---- APPENDED: event-NAV v2 Design 2 — receive-only event-surplus vesting bucket ----
+        // At settle, the floor→exact surplus (`max(q1,q2) − liability`) is escrowed here instead of
+        // being snapped pro-rata into NAV. It vests LINEARLY into `freeAssets` over `T` seconds
+        // (Synthetix-style crank): the unvested remainder is P − r·(now − t0), excluded from
+        // `freeAssets` (the 5th I1 bucket) so a late depositor cannot skim the settle-time recovery.
+        // Receive-only: `eventSurplusPrincipal` only ever grows at settle and drips down over time;
+        // there is no clawback path, so the bucket can never go negative / create a deficit.
+        uint256 eventSurplusPrincipal; // P — unvested principal at the last crank (t0)
+        uint256 eventSurplusRatePerSec; // r — P / T at the last crank
+        uint64 eventSurplusLastAccrual; // t0 — timestamp of the last crank
+        uint32 eventSurplusVestWindow; // T — vesting window in seconds (0 => contract DEFAULT)
     }
 
     function load() internal pure returns (Layout storage l) {

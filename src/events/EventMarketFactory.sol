@@ -193,7 +193,8 @@ contract EventMarketFactory is Initializable, UUPSUpgradeable, IEventMarketFacto
         bytes32 eventId,
         uint8 eventClass,
         int256 outcomeScore_e18,
-        uint256 returnedAmount
+        uint256 returnedAmount,
+        uint256 lockedSurplus
     )
         external
     {
@@ -203,8 +204,10 @@ contract EventMarketFactory is Initializable, UUPSUpgradeable, IEventMarketFacto
         uint256 originalSeed = marketSeeds[eventId];
 
         // Send the returned amount back to LPVault and de-register the market from the live NAV set.
+        // `lockedSurplus` (the floor→exact surplus) is routed into the vault's receive-only vesting
+        // bucket rather than snapped pro-rata to current shareholders.
         usdc.forceApprove(address(lpVault), returnedAmount);
-        lpVault.settleEventMarket(market, originalSeed, returnedAmount);
+        lpVault.settleEventMarket(market, originalSeed, returnedAmount, lockedSurplus);
 
         // Send resolution feedback
         IFeedbackController.ResolutionInput memory input = IFeedbackController.ResolutionInput({

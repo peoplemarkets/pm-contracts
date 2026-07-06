@@ -1656,4 +1656,31 @@ contract LPVaultTest is Test {
         // positionCollateral).
         assertEq(vault.insuranceFundBalance(), 99_800 * ONE_USDC);
     }
+
+    // ------------------------------------------------------------------------------------------
+    // Event-surplus vesting window (event-NAV v2 Design 2) governance setter.
+    // ------------------------------------------------------------------------------------------
+
+    function test_EventSurplusVestWindow_defaultBoundsAndAuth() public {
+        // Default when unset: 7 days. Bucket empty at genesis.
+        assertEq(vault.eventSurplusVestWindow(), 7 days, "default window is 7 days");
+        assertEq(vault.unvestedEventSurplus(), 0, "no surplus at genesis");
+
+        // Non-governance cannot set.
+        vm.expectRevert(abi.encodeWithSelector(ILPVault.Unauthorized.selector, address(this)));
+        vault.setEventSurplusVestWindow(uint32(3 days));
+
+        // Below MIN (1 day) and above MAX (30 days) revert InvalidConfig.
+        vm.prank(governance);
+        vm.expectRevert(ILPVault.InvalidConfig.selector);
+        vault.setEventSurplusVestWindow(uint32(12 hours));
+        vm.prank(governance);
+        vm.expectRevert(ILPVault.InvalidConfig.selector);
+        vault.setEventSurplusVestWindow(uint32(31 days));
+
+        // In-bounds set takes effect.
+        vm.prank(governance);
+        vault.setEventSurplusVestWindow(uint32(3 days));
+        assertEq(vault.eventSurplusVestWindow(), 3 days, "window updated");
+    }
 }

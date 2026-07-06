@@ -227,50 +227,70 @@ contract EventNavArbTest is Test {
     }
 
     // ------------------------------------------------------------------------------------------
-    // ARB #2 — DEPOSIT ARB is closed.
-    // A depositor who enters WHILE a market is live (before settle) cannot skim the seed recovery
-    // that materialises at settlement.
+    // ARB #2 — DEPOSIT ARB is closed on a TRADED, SKEWED market (replaces the old untraded q1=q2=0
+    // proving test, which was tautological: floor==exact so the settle snap was 0 by construction).
+    // A depositor who sandwiches the UMA-resolution instant on the MINORITY (vault-favourable)
+    // outcome cannot instantly skim the large floor→exact surplus — it lands in the receive-only
+    // vesting bucket (excluded from NAV) and drips in over the vest window.
     // ------------------------------------------------------------------------------------------
 
-    function test_depositArb_closed_lateDepositorCannotSkimRecovery() public {
+    function test_depositArb_closed_tradedSkewed_minorityOutcome() public {
         // Alice is the incumbent LP.
         uint256 aliceIn = 1_000_000 * ONE_USDC;
         vm.prank(alice);
         vault.deposit(aliceIn, alice);
 
-        // Seed a market (near-full recovery is the common, most-profitable case for the mirror arb).
-        EventMarket m = _createMarket(keccak256("e.deposit"));
-        uint256 seed = _seed();
-
-        // NAV is unchanged at funding, so the late depositor enters at a FAIR price.
+        EventMarket m = _createMarket(keccak256("e.deposit.skew"));
         assertEq(vault.totalAssets(), aliceIn, "NAV neutral at funding");
 
-        // Bob deposits DURING the live market (before settle).
+        // Heavy, one-sided YES book via REAL buys (q1 >> q2). If the MINORITY-share outcome (NO)
+        // resolves, the vault pays only the smaller side but keeps the collected premium → a large
+        // surplus σ = max(q1,q2) − min(q1,q2). This is the ~$370k floor→exact snap the old two-regime
+        // mark leaked to a sandwiching depositor.
+        _buy(m, trader, true, 300_000 * ONE_USDC);
+        uint256 q1 = m.totalYesShares();
+        uint256 q2 = m.totalNoShares();
+        IEventMarket.Outcome minority = q1 >= q2 ? IEventMarket.Outcome.NO : IEventMarket.Outcome.YES;
+        uint256 sigma = q1 >= q2 ? q1 - q2 : q2 - q1;
+        assertGt(sigma, 300_000 * ONE_USDC, "market is heavily skewed (large would-be snap)");
+
+        // Bob DEPOSITS during the live market (sandwich: in just before the UMA-resolution instant).
         uint256 bobIn = 1_000_000 * ONE_USDC;
         vm.prank(bob);
         uint256 bobShares = vault.deposit(bobIn, bob);
+        uint256 bobValueAtEntry = vault.previewRedeem(bobShares);
 
-        // Settle the (un-traded) market: it returns the full seed to the vault.
-        _postOutcome(m.params().eventId, IEventMarket.Outcome.VOID);
+        // Propose + finalize the MINORITY outcome. NAV must NOT move across this whole window: the
+        // mark ignores UMA (no floor→exact snap), and the settle Δ is 0 to the wei.
+        uint256 navBeforePropose = vault.totalAssets();
+        vm.prank(trader);
+        m.proposeResolution(minority);
         m.settleResolution();
+        uint256 navAfterFinalize = vault.totalAssets();
+        assertEq(navBeforePropose, navAfterFinalize, "NAV identical across UMA propose->finalize (no snap)");
+
+        // The surplus σ = max(q1,q2) − min(q1,q2) sits in the vesting bucket, EXCLUDED from
+        // totalAssets. This is the ~$370k-style would-be snap that is NOT skimmable.
+        assertEq(vault.unvestedEventSurplus(), sigma, "sigma escrowed in the vesting bucket");
         assertEq(vault.liveEventMarketCount(), 0, "market de-registered");
-        assertEq(vault.eventFundedSeed(), 0, "seed accounting cleared");
 
-        // Bob redeems everything. He nets <= 0 — the recovery of `seed` was NOT skimmable.
-        vm.prank(bob);
-        uint256 bobOut = vault.redeem(bobShares, bob, bob);
-        assertLe(bobOut, bobIn, "late depositor must NOT profit from seed recovery");
-        assertApproxEqAbs(bobOut, bobIn, 10, "late depositor nets ~0");
-        console2.log("DEPOSIT ARB: seed that round-trips =", seed);
-        console2.log("DEPOSIT ARB: late depositor in      =", bobIn);
-        console2.log("DEPOSIT ARB: late depositor out     =", bobOut);
-        console2.log("DEPOSIT ARB: skim (out - in, 0 = closed) =", bobOut > bobIn ? bobOut - bobIn : 0);
+        // Bob redeems IMMEDIATELY (same instant, pre-vesting): he nets <= dust. The σ was NOT skimmable.
+        uint256 bobValueNow = vault.previewRedeem(bobShares);
+        assertLe(bobValueNow, bobIn + 10, "late depositor cannot instantly skim the settle surplus");
+        assertApproxEqAbs(bobValueNow, bobValueAtEntry, 10, "no instant NAV jump captured by the sandwich");
+        console2.log("DEPOSIT ARB (skewed): sigma escrowed (q1-q2) =", sigma);
+        console2.log("DEPOSIT ARB (skewed): bob in                 =", bobIn);
+        console2.log("DEPOSIT ARB (skewed): bob value instantly    =", bobValueNow);
+        console2.log("DEPOSIT ARB (skewed): instant skim (0=closed) =", bobValueNow > bobIn ? bobValueNow - bobIn : 0);
 
-        // Incumbent alice is not diluted: her stake is still worth her original deposit.
-        uint256 aliceOut = vault.previewRedeem(vault.balanceOf(alice));
-        assertGe(aliceOut + 10, aliceIn, "incumbent LP must not be diluted by the late depositor");
-        // Sanity: the seed really did round-trip through the vault.
-        assertGt(seed, 0);
+        // Past the FULL vest window, σ has dripped into NAV; bob earns only his fair pro-rata share
+        // for HOLDING across the window (legitimate yield, not a timeable snap). (Vesting continues at
+        // the fixed rate slightly past T until the floor-division dust is exhausted, so warp T + ε.)
+        vm.warp(block.timestamp + 7 days + 1 hours);
+        assertEq(vault.unvestedEventSurplus(), 0, "fully vested past the window");
+        uint256 bobValueVested = vault.previewRedeem(bobShares);
+        assertGt(bobValueVested, bobIn, "held-through-vesting LP earns pro-rata surplus (not an arb)");
+        console2.log("DEPOSIT ARB (skewed): bob value after full vest =", bobValueVested);
     }
 
     // ------------------------------------------------------------------------------------------
@@ -460,6 +480,6 @@ contract EventNavArbTest is Test {
     function test_settle_revertsOnUnknownMarket() public {
         vm.prank(address(factory));
         vm.expectRevert(abi.encodeWithSelector(ILPVault.MarketNotLive.selector, address(0xdead)));
-        vault.settleEventMarket(address(0xdead), 1, 0);
+        vault.settleEventMarket(address(0xdead), 1, 0, 0);
     }
 }
