@@ -5,6 +5,8 @@ import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 import {ReentrancyGuard} from "solady/utils/ReentrancyGuard.sol";
 
+import {FixedPointMathLib} from "solady/utils/FixedPointMathLib.sol";
+
 import {UMAAdapter} from "../oracle/UMAAdapter.sol";
 import {IEventMarket} from "./IEventMarket.sol";
 import {IEventMarketFactory} from "./IEventMarketFactory.sol";
@@ -298,14 +300,30 @@ contract EventMarket is Initializable, IEventMarket, ReentrancyGuard {
     }
 
     /// @inheritdoc IEventMarket
+    /// @dev Returns the closed-form LMSR marginal (softmax) probability scaled to 1e18. The two
+    ///      outcomes always sum to exactly 1e18: priceOf(false) is returned as 1e18 - p_yes.
     function priceOf(bool isYes) external view returns (uint256 price1e18) {
-        // Marginal price in LMSR is e^(qi/b) / (e^(q1/b) + e^(q2/b))
-        // Using cost function diff for 1e18 shares gives a close approximation:
-        if (isYes) {
-            return LMSRMath.cost(q1 + 1e18, q2, _params.lmsrB) - LMSRMath.cost(q1, q2, _params.lmsrB);
-        } else {
-            return LMSRMath.cost(q1, q2 + 1e18, _params.lmsrB) - LMSRMath.cost(q1, q2, _params.lmsrB);
-        }
+        uint256 pYes = _yesPrice();
+        return isYes ? pYes : 1e18 - pYes;
+    }
+
+    /// @dev Closed-form LMSR YES probability, scaled to 1e18:
+    ///        p_yes = e^(q1/b) / (e^(q1/b) + e^(q2/b))
+    ///      q1 (YES shares), q2 (NO shares) and b (lmsrB) are all 1e6-scaled, so q/b is a pure ratio
+    ///      that we lift to WAD (1e18) for `expWad`. To stay within `expWad`'s ~135e18 input bound for
+    ///      large share counts, we subtract max(q1, q2)/b (in WAD) from both exponents; the softmax is
+    ///      shift-invariant, so the probability is unchanged while the dominant exponent becomes 0.
+    function _yesPrice() private view returns (uint256) {
+        int256 b = int256(_params.lmsrB);
+        uint256 maxQ = q1 > q2 ? q1 : q2;
+        int256 shift = (int256(maxQ) * 1e18) / b;
+
+        // Both exponents are <= 0 after the shift, so expWad cannot overflow; each e term is in (0, 1e18].
+        uint256 eYes = uint256(FixedPointMathLib.expWad((int256(q1) * 1e18) / b - shift));
+        uint256 eNo = uint256(FixedPointMathLib.expWad((int256(q2) * 1e18) / b - shift));
+
+        // The dominant side contributes expWad(0) = 1e18, so the denominator is always >= 1e18 (no div-by-zero).
+        return (eYes * 1e18) / (eYes + eNo);
     }
 
     function totalYesShares() external view returns (uint256) {
