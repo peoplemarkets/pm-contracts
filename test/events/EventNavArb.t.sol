@@ -286,7 +286,7 @@ contract EventNavArbTest is Test {
         // Past the FULL vest window, σ has dripped into NAV; bob earns only his fair pro-rata share
         // for HOLDING across the window (legitimate yield, not a timeable snap). (Vesting continues at
         // the fixed rate slightly past T until the floor-division dust is exhausted, so warp T + ε.)
-        vm.warp(block.timestamp + 7 days + 1 hours);
+        vm.warp(block.timestamp + 14 days + 1 hours);
         assertEq(vault.unvestedEventSurplus(), 0, "fully vested past the window");
         uint256 bobValueVested = vault.previewRedeem(bobShares);
         assertGt(bobValueVested, bobIn, "held-through-vesting LP earns pro-rata surplus (not an arb)");

@@ -44,7 +44,7 @@ contract EventNavVestingTest is Test {
     uint256 internal constant ONE_USDC = 1e6;
     uint256 internal constant LMSR_B = 10_000e6;
     uint64 internal constant DEADLINE = 2_000_000_000;
-    uint256 internal constant VEST = 7 days; // DEFAULT_EVENT_SURPLUS_VEST_WINDOW
+    uint256 internal constant VEST = 14 days; // DEFAULT_EVENT_SURPLUS_VEST_WINDOW
     uint256 internal constant DUST = 10; // 1e-5 USDC tolerance for round-trip residuals
 
     bytes32 internal constant SUBJECT_ID = keccak256("subject.drake");

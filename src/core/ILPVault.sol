@@ -291,7 +291,7 @@ interface ILPVault is IERC4626 {
     function unvestedEventSurplus() external view returns (uint256);
 
     /// @notice Linear vesting window `T` (seconds) for the event-surplus bucket. 0 in storage means
-    ///         the contract default (7 days) is used.
+    ///         the contract default (14 days) is used.
     function eventSurplusVestWindow() external view returns (uint32);
 
     /// @notice O(1) perp OI-cap denominator = `freeAssets() + eventFundedSeed`. Invariant to

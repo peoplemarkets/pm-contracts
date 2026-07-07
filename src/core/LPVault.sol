@@ -73,10 +73,12 @@ contract LPVault is Initializable, UUPSUpgradeable, ERC4626Upgradeable, Reentran
 
     /// @dev Linear vesting window `T` for the receive-only event-surplus bucket (event-NAV v2
     ///      Design 2). Settle-time floor→exact surplus drips into `freeAssets` over this window so a
-    ///      late depositor cannot skim the settle-time recovery. Default 7 days; governance may set
-    ///      `T` anywhere in [1 day, 30 days] via `setEventSurplusVestWindow`. A stored 0 means the
-    ///      default is in force (fresh proxies never had a window set).
-    uint32 internal constant DEFAULT_EVENT_SURPLUS_VEST_WINDOW = 7 days;
+    ///      late depositor cannot skim the settle-time recovery. Default 14 days (chosen over 7 to
+    ///      further blunt the residual risk-bearing carry a late whale can earn by holding the
+    ///      window — 7d was short vs typical LP reward rates); governance may set `T` anywhere in
+    ///      [1 day, 30 days] via `setEventSurplusVestWindow`. A stored 0 means the default is in
+    ///      force (fresh proxies never had a window set).
+    uint32 internal constant DEFAULT_EVENT_SURPLUS_VEST_WINDOW = 14 days;
     uint32 internal constant MIN_EVENT_SURPLUS_VEST_WINDOW = 1 days;
     uint32 internal constant MAX_EVENT_SURPLUS_VEST_WINDOW = 30 days;
 

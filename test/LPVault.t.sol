@@ -1662,8 +1662,8 @@ contract LPVaultTest is Test {
     // ------------------------------------------------------------------------------------------
 
     function test_EventSurplusVestWindow_defaultBoundsAndAuth() public {
-        // Default when unset: 7 days. Bucket empty at genesis.
-        assertEq(vault.eventSurplusVestWindow(), 7 days, "default window is 7 days");
+        // Default when unset: 14 days. Bucket empty at genesis.
+        assertEq(vault.eventSurplusVestWindow(), 14 days, "default window is 14 days");
         assertEq(vault.unvestedEventSurplus(), 0, "no surplus at genesis");
 
         // Non-governance cannot set.
