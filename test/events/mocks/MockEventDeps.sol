@@ -12,20 +12,34 @@ contract MockLPVault {
     IERC20 public immutable usdc;
     uint256 public lastSeed;
     uint256 public lastReturned;
+    uint256 public lastLockedSurplus;
+    address public lastMarket;
 
     constructor(IERC20 usdc_) {
         usdc = usdc_;
     }
 
-    /// @dev Send `amount` USDC to the caller (the factory), modelling seed funding.
-    function fundEventMarket(uint256 amount) external {
+    /// @dev Send `amount` USDC to the caller (the factory), modelling seed funding. Records the
+    ///      registered `market` (event-NAV v2 signature).
+    function fundEventMarket(address market, uint256 amount) external {
+        lastMarket = market;
         usdc.transfer(msg.sender, amount);
     }
 
-    /// @dev Pull `returnedAmount` back from the caller (the factory approved us first).
-    function settleEventMarket(uint256 originalSeed, uint256 returnedAmount) external {
+    /// @dev Pull `returnedAmount` back from the caller (the factory approved us first). Records the
+    ///      de-registered `market` (event-NAV v2 signature).
+    function settleEventMarket(
+        address market,
+        uint256 originalSeed,
+        uint256 returnedAmount,
+        uint256 lockedSurplus
+    )
+        external
+    {
+        lastMarket = market;
         lastSeed = originalSeed;
         lastReturned = returnedAmount;
+        lastLockedSurplus = lockedSurplus;
         if (returnedAmount > 0) {
             usdc.transferFrom(msg.sender, address(this), returnedAmount);
         }

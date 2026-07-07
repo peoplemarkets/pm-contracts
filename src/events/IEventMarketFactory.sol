@@ -20,7 +20,8 @@ interface IEventMarketFactory {
         bytes32 eventId,
         uint8 eventClass,
         int256 outcomeScore_e18,
-        uint256 returnedAmount
+        uint256 returnedAmount,
+        uint256 lockedSurplus
     )
         external;
 

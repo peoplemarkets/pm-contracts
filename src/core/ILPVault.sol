@@ -102,17 +102,32 @@ interface ILPVault is IERC4626 {
     // Event Market Seeding (Wave 8)
     // ------------------------------------------------------------------------------------------
 
-    /// @notice Pulls `amount` USDC from the vault to seed an EventMarket AMM.
-    ///         The amount is tracked in `eventFundedSeed` to preserve `freeAssets`.
-    /// @dev    Caller MUST be the configured `eventMarketFactory`.
-    function fundEventMarket(uint256 amount) external;
+    /// @notice Pulls `amount` USDC from the vault to seed the EventMarket clone `market`, and
+    ///         registers `market` in the live set so `totalAssets()` immediately marks it to its
+    ///         current recoverable value.
+    /// @dev    Caller MUST be the configured `eventMarketFactory`. Solvency is checked against
+    ///         strictly-liquid `freeAssets()`. Reverts `MarketAlreadyLive` on a duplicate register
+    ///         and `TooManyLiveMarkets` past `MAX_LIVE_EVENT_MARKETS`.
+    function fundEventMarket(address market, uint256 amount) external;
 
-    /// @notice Returns liquidity from a resolved EventMarket back to the vault.
-    ///         Decrements `eventFundedSeed` by `originalSeed`, and transfers `returnedAmount`
-    ///         USDC from the caller to the vault.
-    /// @dev    Caller MUST be the configured `eventMarketFactory`. The difference between
-    ///         `returnedAmount` and `originalSeed` is absorbed naturally by `freeAssets` as PnL.
-    function settleEventMarket(uint256 originalSeed, uint256 returnedAmount) external;
+    /// @notice Returns liquidity from a resolved EventMarket back to the vault and de-registers it.
+    ///         Decrements `eventFundedSeed` by `originalSeed`, removes `market` from the live set,
+    ///         and transfers `returnedAmount` USDC from the caller to the vault.
+    /// @dev    Caller MUST be the configured `eventMarketFactory`. Reverts `MarketNotLive` if
+    ///         `market` is not currently registered. NAV is continuous across this call: the market
+    ///         carried the FLOOR mark (`returnedAmount − lockedSurplus`) in NAV through resolution;
+    ///         `returnedAmount` lands on the balance while the recoverable mark drops to 0, and the
+    ///         `lockedSurplus` above the floor is added to the receive-only vesting bucket (excluded
+    ///         from `freeAssets` until it vests). |Δ totalAssets| across this call is 0 to the wei.
+    /// @param  lockedSurplus  The floor→exact surplus (`max(q1,q2) − liability`) to escrow into the
+    ///                        vesting bucket. Receive-only: never clawed back, never snapped.
+    function settleEventMarket(
+        address market,
+        uint256 originalSeed,
+        uint256 returnedAmount,
+        uint256 lockedSurplus
+    )
+        external;
 
     // ------------------------------------------------------------------------------------------
     // Insurance fund seeding (Fix #6) — governance only, no timelock, capped cumulatively
@@ -239,10 +254,55 @@ interface ILPVault is IERC4626 {
     function checkInsuranceFloor() external;
 
     // ------------------------------------------------------------------------------------------
+    // Event-surplus vesting bucket (event-NAV v2 — Design 2)
+    // ------------------------------------------------------------------------------------------
+
+    /// @notice Governance setter for the linear vesting window `T` (seconds) of the event-surplus
+    ///         bucket. Bounds [1 day, 30 days]. Re-cranks the bucket to the new rate on change.
+    function setEventSurplusVestWindow(uint32 w) external;
+
+    // ------------------------------------------------------------------------------------------
     // Views
     // ------------------------------------------------------------------------------------------
 
+    /// @notice Strictly-liquid, immediately-redeemable assets:
+    ///         `balance(USDC) − positionCollateral − insuranceFundBalance − accruedFees −
+    ///         unvestedEventSurplus`. Does NOT include event-market seed that has left the vault
+    ///         (that was the redemption arb) nor the not-yet-vested LP-owned event surplus (which
+    ///         drips in over the vest window, denying a late depositor the settle-time snap). This
+    ///         is the I1-preserving denominator and the honest solvency cap for perp settle /
+    ///         liquidation / withdrawal.
     function freeAssets() external view returns (uint256);
+
+    /// @notice Sum of the current recoverable value of every live event market. Added to
+    ///         `freeAssets()` to form the share-price NAV (`totalAssets()`). Conservative floor
+    ///         pre-resolution, exact settle amount post-UMA; never over-marks system cash.
+    function eventRecoverable() external view returns (uint256);
+
+    /// @notice DISPLAY-ONLY (never used in NAV/mark): Σ over live markets of `bal_i − E[liability_i]`
+    ///         under the LMSR-implied softmax probabilities. The unbiased mid-life fair recoverable
+    ///         for indexer / admin UI, shown alongside the conservative on-chain floor.
+    function fairRecoverable() external view returns (uint256);
+
+    /// @notice USDC (1e6) of settle-time event surplus that is LP-owned but not yet vested. It is
+    ///         a distinct storage bucket (the 5th I1 term), EXCLUDED from `freeAssets()` until it
+    ///         drips in linearly over `eventSurplusVestWindow()`. Receive-only: never negative,
+    ///         never clawed back. Monotonically non-increasing between settles.
+    function unvestedEventSurplus() external view returns (uint256);
+
+    /// @notice Linear vesting window `T` (seconds) for the event-surplus bucket. 0 in storage means
+    ///         the contract default (14 days) is used.
+    function eventSurplusVestWindow() external view returns (uint32);
+
+    /// @notice O(1) perp OI-cap denominator = `freeAssets() + eventFundedSeed`. Invariant to
+    ///         event-market fund/settle, so OI capacity is unaffected by event funding. Decoupled
+    ///         from the per-market NAV mark to keep the perp hot path loop-free.
+    function capTvl() external view returns (uint256);
+
+    /// @notice Number of currently-live (funded, unsettled) event markets. Bounded by
+    ///         `MAX_LIVE_EVENT_MARKETS`.
+    function liveEventMarketCount() external view returns (uint256);
+
     function positionCollateral() external view returns (uint256);
     function insuranceFundBalance() external view returns (uint256);
     function accruedFees() external view returns (uint256);
@@ -308,6 +368,13 @@ interface ILPVault is IERC4626 {
 
     event EventMarketFunded(address indexed factory, uint256 amount);
     event EventMarketSettled(address indexed factory, uint256 originalSeed, uint256 returnedAmount, int256 pnl);
+
+    /// @notice The receive-only event-surplus bucket was cranked: `added` USDC was escrowed on top of
+    ///         the still-unvested remainder, leaving principal `principal` dripping at `ratePerSec`
+    ///         over window `window`.
+    event EventSurplusAccrued(uint256 added, uint256 principal, uint256 ratePerSec, uint32 window);
+    /// @notice Governance updated the event-surplus linear vesting window.
+    event EventSurplusVestWindowSet(uint32 oldWindow, uint32 newWindow);
 
     /// @notice Emitted on every `settleLiquidation`. Mirrors `PositionSettledOnVault` but
     ///         distinguishes the liquidator bounty payout.
@@ -408,4 +475,11 @@ interface ILPVault is IERC4626 {
     // --- Wave 8: EventMarketFactory wiring ---
     error OnlyEventMarketFactory(address caller);
     error EventMarketFactoryNotSet();
+    // --- event-NAV v2: live event-market registry ---
+    /// @notice Thrown by `fundEventMarket` when `market` is already registered in the live set.
+    error MarketAlreadyLive(address market);
+    /// @notice Thrown by `settleEventMarket` when `market` is not currently in the live set.
+    error MarketNotLive(address market);
+    /// @notice Thrown by `fundEventMarket` when the live set already holds `MAX_LIVE_EVENT_MARKETS`.
+    error TooManyLiveMarkets();
 }

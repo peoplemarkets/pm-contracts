@@ -69,6 +69,13 @@ interface IEventMarket {
     function settleResolution() external;
 
     // Views
+    /// @notice Current USDC (1e6) the LPVault marks for this live market: the pure LMSR
+    ///         worst-case-liability floor `balance − max(q1,q2)`, held UNCHANGED from funding through
+    ///         resolution (it does NOT read UMA, so there is no floor→exact snap at the resolution
+    ///         instant). The surplus above the floor is escrowed into the vault's receive-only
+    ///         vesting bucket at settle, never snapped into NAV. Always ≥ 0; returns 0 once RESOLVED.
+    ///         Never over-marks: the result never exceeds this market's own USDC balance.
+    function currentRecoverable() external view returns (uint256);
     function priceOf(bool isYes) external view returns (uint256 price1e18);
     function totalYesShares() external view returns (uint256);
     function totalNoShares() external view returns (uint256);

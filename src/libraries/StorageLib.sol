@@ -309,9 +309,31 @@ library VaultStorage {
         address pendingEventMarketFactory;
         uint64 pendingEventMarketFactoryActivatesAt;
         // The total amount of seed liquidity currently deployed to unresolved Event Markets.
-        // This USDC has left the vault's balance, but is accounted for in `freeAssets` as
-        // an investment that will be returned (plus/minus PnL) upon event resolution.
+        // This USDC has left the vault's balance. It is NO LONGER counted in `freeAssets` (the
+        // strictly-liquid, I1-preserving denominator); instead live markets are marked to their
+        // current recoverable value inside `totalAssets` (the NAV / share-price denominator) via
+        // the `liveEventMarkets` registry below. `eventFundedSeed` is retained for two O(1) uses:
+        // the insurance cap/floor denominator (`_capDenominatorTvl`) and the perp OI-cap
+        // denominator (`capTvl` = freeAssets + eventFundedSeed, invariant to fund/settle).
         uint256 eventFundedSeed;
+        // ---- APPENDED: event-NAV v2 — live event-market registry (recoverable-value marking) ----
+        // Set of currently-live (funded, unsettled) EventMarket clones. `totalAssets()` marks each
+        // one to `IEventMarket.currentRecoverable()`. Bounded by `MAX_LIVE_EVENT_MARKETS` (enforced
+        // in `fundEventMarket`) so the mark loop is provably O(bounded). `liveEventMarketIndex` is a
+        // 1-based index into `liveEventMarkets` (0 = not live) enabling O(1) swap-pop on settle.
+        address[] liveEventMarkets;
+        mapping(address => uint256) liveEventMarketIndex;
+        // ---- APPENDED: event-NAV v2 Design 2 — receive-only event-surplus vesting bucket ----
+        // At settle, the floor→exact surplus (`max(q1,q2) − liability`) is escrowed here instead of
+        // being snapped pro-rata into NAV. It vests LINEARLY into `freeAssets` over `T` seconds
+        // (Synthetix-style crank): the unvested remainder is P − r·(now − t0), excluded from
+        // `freeAssets` (the 5th I1 bucket) so a late depositor cannot skim the settle-time recovery.
+        // Receive-only: `eventSurplusPrincipal` only ever grows at settle and drips down over time;
+        // there is no clawback path, so the bucket can never go negative / create a deficit.
+        uint256 eventSurplusPrincipal; // P — unvested principal at the last crank (t0)
+        uint256 eventSurplusRatePerSec; // r — P / T at the last crank
+        uint64 eventSurplusLastAccrual; // t0 — timestamp of the last crank
+        uint32 eventSurplusVestWindow; // T — vesting window in seconds (0 => contract DEFAULT)
     }
 
     function load() internal pure returns (Layout storage l) {

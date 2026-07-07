@@ -254,14 +254,24 @@ contract EventMarket is Initializable, IEventMarket, ReentrancyGuard {
             liability = (q1 + q2) / 2; // 0.5 USDC per share
         }
 
-        // Total USDC in the market is exactly LMSRMath.cost(q1, q2)
-        uint256 currentCost = LMSRMath.cost(q1, q2, _params.lmsrB);
-
-        // Profit returned to LPVault is (currentCost - liability).
-        // Due to rounding in exp/ln, we use actual balance minus liability.
+        // Total USDC in the market is (up to exp/ln rounding) LMSRMath.cost(q1, q2). Profit returned
+        // to the LPVault is (cost − liability); to be robust to that rounding we use the actual
+        // in-market balance minus liability rather than the closed-form cost.
         uint256 actualBalance = usdc.balanceOf(address(this));
         require(actualBalance >= liability, "EventMarket: insolvency");
         uint256 toReturn = actualBalance - liability;
+
+        // Escrow surplus = the amount `toReturn` exceeds the floor mark the vault carried in NAV
+        // through resolution. Computed ROBUST-TO-ROUNDING off the floor mark itself:
+        //   floorMark    = actualBalance − max(q1,q2)   (the exact figure NAV marked pre-settle)
+        //   lockedSurplus = toReturn − floorMark        (== max(q1,q2) − liability when bal ≥ maxQ)
+        // This is ALWAYS ≥ 0 because floorMark ≤ toReturn (liability ≤ max(q1,q2) for YES/NO/VOID),
+        // so the saturating subtraction never underflows. The vault routes `lockedSurplus` into a
+        // receive-only vesting bucket (no clawback, no pro-rata snap to current shareholders); only
+        // the floor `toReturn − lockedSurplus == floorMark` lands in NAV at settle, matching the mark.
+        uint256 maxQ = q1 > q2 ? q1 : q2;
+        uint256 floorMark = actualBalance > maxQ ? actualBalance - maxQ : 0;
+        uint256 lockedSurplus = toReturn > floorMark ? toReturn - floorMark : 0;
 
         // Send AMM remaining funds back to LPVault via factory
         usdc.safeTransfer(address(factory), toReturn);
@@ -272,7 +282,9 @@ contract EventMarket is Initializable, IEventMarket, ReentrancyGuard {
         else if (_outcome == Outcome.NO) outcomeScore_e18 = -1e18;
         else outcomeScore_e18 = 0; // VOID
 
-        factory.onMarketResolved(_params.subjectId, _params.eventId, _params.eventClass, outcomeScore_e18, toReturn);
+        factory.onMarketResolved(
+            _params.subjectId, _params.eventId, _params.eventClass, outcomeScore_e18, toReturn, lockedSurplus
+        );
 
         emit MarketResolved(_outcome);
     }
@@ -340,6 +352,26 @@ contract EventMarket is Initializable, IEventMarket, ReentrancyGuard {
 
     function outcome() external view returns (Outcome) {
         return _outcome;
+    }
+
+    /// @inheritdoc IEventMarket
+    /// @dev Current value the LPVault marks for this live market, in USDC (1e6). This is the pure
+    ///      LMSR worst-case-liability FLOOR `balance − max(q1, q2)`, held UNCHANGED from funding
+    ///      straight through resolution — it deliberately does NOT read UMA. Because `max(q1, q2)`
+    ///      dominates every realisable per-outcome liability (YES→q1, NO→q2, VOID→(q1+q2)/2 ≤
+    ///      max(q1,q2)), the mark is a strict lower bound on `settleResolution`'s `actualBalance −
+    ///      liability` in every state. Not reading UMA is the whole point of the fix: there is no
+    ///      floor→exact snap at the (permissionless, front-runnable) resolution instant, so a
+    ///      depositor cannot sandwich that instant for a windfall. The surplus above the floor
+    ///      (`max(q1,q2) − liability`) is escrowed into the vault's receive-only vesting bucket at
+    ///      settle time (see `LPVault.settleEventMarket`), never snapped into NAV. Returns 0 once
+    ///      RESOLVED (the vault has already been settled / the market is being removed the same tx).
+    ///      Uses saturating subtraction so the result is always ≥ 0.
+    function currentRecoverable() external view returns (uint256) {
+        if (_status == Status.RESOLVED) return 0; // already settled/removed same-tx
+        uint256 bal = usdc.balanceOf(address(this));
+        uint256 maxQ = q1 > q2 ? q1 : q2;
+        return bal > maxQ ? bal - maxQ : 0; // pure LMSR floor, held through resolution
     }
 
     function params() external view returns (MarketParams memory) {

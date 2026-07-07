@@ -115,10 +115,6 @@ contract EventMarketFactory is Initializable, UUPSUpgradeable, IEventMarketFacto
         uint256 originalSeed = LMSRMath.cost(0, 0, lmsrB);
         marketSeeds[eventId] = originalSeed;
 
-        // Pull seed liquidity from LPVault to this factory, then send to the newly cloned market
-        lpVault.fundEventMarket(originalSeed);
-        usdc.safeTransfer(clone, originalSeed);
-
         IEventMarket.MarketParams memory params = IEventMarket.MarketParams({
             subjectId: subjectId,
             eventId: eventId,
@@ -129,7 +125,15 @@ contract EventMarketFactory is Initializable, UUPSUpgradeable, IEventMarketFacto
             lmsrB: lmsrB
         });
 
+        // Initialize the clone BEFORE it is registered/funded, so that the moment the vault marks it
+        // live (`fundEventMarket`) the clone can already answer `currentRecoverable()` (needs usdc /
+        // umaAdapter / eventId set). The brief intra-tx window where a registered clone holds 0 USDC
+        // is harmless: it is atomic and no external `freeAssets`/NAV read happens between the calls.
         EventMarket(clone).initialize(usdc, umaAdapter, params);
+
+        // Pull seed liquidity from LPVault (registers `clone` in the live NAV set), then forward it.
+        lpVault.fundEventMarket(clone, originalSeed);
+        usdc.safeTransfer(clone, originalSeed);
 
         markets[eventId] = clone;
         isMarket[clone] = true;
@@ -189,7 +193,8 @@ contract EventMarketFactory is Initializable, UUPSUpgradeable, IEventMarketFacto
         bytes32 eventId,
         uint8 eventClass,
         int256 outcomeScore_e18,
-        uint256 returnedAmount
+        uint256 returnedAmount,
+        uint256 lockedSurplus
     )
         external
     {
@@ -198,9 +203,11 @@ contract EventMarketFactory is Initializable, UUPSUpgradeable, IEventMarketFacto
 
         uint256 originalSeed = marketSeeds[eventId];
 
-        // Send the returned amount back to LPVault
+        // Send the returned amount back to LPVault and de-register the market from the live NAV set.
+        // `lockedSurplus` (the floor→exact surplus) is routed into the vault's receive-only vesting
+        // bucket rather than snapped pro-rata to current shareholders.
         usdc.forceApprove(address(lpVault), returnedAmount);
-        lpVault.settleEventMarket(originalSeed, returnedAmount);
+        lpVault.settleEventMarket(market, originalSeed, returnedAmount, lockedSurplus);
 
         // Send resolution feedback
         IFeedbackController.ResolutionInput memory input = IFeedbackController.ResolutionInput({

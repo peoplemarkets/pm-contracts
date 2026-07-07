@@ -15,6 +15,7 @@ import {UUPSUpgradeable} from "@openzeppelin/contracts-upgradeable/proxy/utils/U
 import {ReentrancyGuard} from "solady/utils/ReentrancyGuard.sol";
 
 import {VaultStorage} from "../libraries/StorageLib.sol";
+import {IEventMarket} from "../events/IEventMarket.sol";
 import {IInsuranceFund} from "./IInsuranceFund.sol";
 import {ILPVault} from "./ILPVault.sol";
 
@@ -47,6 +48,12 @@ contract LPVault is Initializable, UUPSUpgradeable, ERC4626Upgradeable, Reentran
     uint32 public constant MAX_TIMELOCK_DELAY = 30 days;
     uint8 internal constant DECIMALS_OFFSET = 6;
 
+    /// @dev Hard cap on the number of simultaneously-live event markets the vault will mark in the
+    ///      `eventRecoverable()` loop. Bounds the O(n) NAV mark to a provably small, gas-safe n.
+    ///      Markets are governance-created (one per EventMarketFactory.createMarket), so this is a
+    ///      liberal ceiling; `fundEventMarket` reverts `TooManyLiveMarkets` past it.
+    uint256 public constant MAX_LIVE_EVENT_MARKETS = 64;
+
     /// @dev Cumulative ceiling on `seedInsurance`. 10× the spec's $1M initial seed (§3 line 159)
     ///      gives generous headroom for the floor-mechanic top-up (§3 line 162) without making
     ///      this a daily lever. Lifting the cap requires a UUPS upgrade — high friction by design.
@@ -63,6 +70,17 @@ contract LPVault is Initializable, UUPSUpgradeable, ERC4626Upgradeable, Reentran
     uint16 internal constant MAX_INSURANCE_CAP_BPS = 5_000;
     uint16 internal constant DEFAULT_INSURANCE_FLOOR_BPS = 500;
     uint16 internal constant MAX_INSURANCE_FLOOR_BPS = 1_000;
+
+    /// @dev Linear vesting window `T` for the receive-only event-surplus bucket (event-NAV v2
+    ///      Design 2). Settle-time floor→exact surplus drips into `freeAssets` over this window so a
+    ///      late depositor cannot skim the settle-time recovery. Default 14 days (chosen over 7 to
+    ///      further blunt the residual risk-bearing carry a late whale can earn by holding the
+    ///      window — 7d was short vs typical LP reward rates); governance may set `T` anywhere in
+    ///      [1 day, 30 days] via `setEventSurplusVestWindow`. A stored 0 means the default is in
+    ///      force (fresh proxies never had a window set).
+    uint32 internal constant DEFAULT_EVENT_SURPLUS_VEST_WINDOW = 14 days;
+    uint32 internal constant MIN_EVENT_SURPLUS_VEST_WINDOW = 1 days;
+    uint32 internal constant MAX_EVENT_SURPLUS_VEST_WINDOW = 30 days;
 
     /// @custom:oz-upgrades-unsafe-allow constructor
     constructor() {
@@ -147,11 +165,20 @@ contract LPVault is Initializable, UUPSUpgradeable, ERC4626Upgradeable, Reentran
     // ------------------------------------------------------------------------------------------
 
     /// @inheritdoc ERC4626Upgradeable
-    /// @dev Returns `freeAssets()` — the bucket that LP shares are redeemable from. Locked
-    ///      collateral, insurance fund, and treasury fees sit in the same USDC contract balance
-    ///      but do not back shares. See contract NatSpec.
+    /// @dev Share-price NAV denominator = strictly-liquid `freeAssets()` PLUS the current
+    ///      recoverable value of every live event market (`eventRecoverable()`). Locked collateral,
+    ///      insurance fund, treasury fees, and the not-yet-vested event surplus sit in the same USDC
+    ///      contract balance but do not back immediately-redeemable shares, so they are excluded from
+    ///      `freeAssets()`. Event-market seed that has left the vault is marked at the pure LMSR
+    ///      FLOOR (`market.balance − max(q1,q2)`), held UNCHANGED from funding through resolution —
+    ///      the mark does NOT read UMA, so there is no floor→exact snap at the (front-runnable)
+    ///      resolution instant for a depositor to sandwich. The floor→exact surplus is realised only
+    ///      at settle, into the receive-only vesting bucket, and drips into NAV linearly over the
+    ///      vest window. Because `eventRecoverable() ≥ 0` and the vesting exclusion only lowers
+    ///      `freeAssets`, both the redemption and deposit residuals are small and un-timeable; the
+    ///      share price stays fair while withdrawals remain liquidity-capped (see `maxWithdraw`).
     function totalAssets() public view virtual override(ERC4626Upgradeable, IERC4626) returns (uint256) {
-        return freeAssets();
+        return freeAssets() + eventRecoverable();
     }
 
     function _decimalsOffset() internal pure override returns (uint8) {
@@ -544,23 +571,45 @@ contract LPVault is Initializable, UUPSUpgradeable, ERC4626Upgradeable, Reentran
     // ------------------------------------------------------------------------------------------
 
     /// @inheritdoc ILPVault
-    function fundEventMarket(uint256 amount) external nonReentrant onlyEventMarketFactory {
+    /// @dev Solvency is checked against strictly-liquid `freeAssets()` (the seed can only leave the
+    ///      vault if there is liquid USDC to cover it). The funded `market` is registered in the live
+    ///      set so `totalAssets()` immediately begins marking it to its recoverable value — closing
+    ///      the deposit arb (a depositor after this point sees NAV already crediting the market).
+    function fundEventMarket(address market, uint256 amount) external nonReentrant onlyEventMarketFactory {
         if (amount == 0) revert AmountZero();
-        // Check solvency BEFORE state mutation
+        // Solvency vs LIQUID freeAssets (the seed can only be paid out of in-vault USDC).
         uint256 free = freeAssets();
         if (amount > free) revert InsufficientFreeAssets(amount, free);
 
         VaultStorage.Layout storage s = VaultStorage.load();
+        if (s.liveEventMarketIndex[market] != 0) revert MarketAlreadyLive(market);
+        if (s.liveEventMarkets.length >= MAX_LIVE_EVENT_MARKETS) revert TooManyLiveMarkets();
+
         s.eventFundedSeed += amount;
+        s.liveEventMarkets.push(market);
+        s.liveEventMarketIndex[market] = s.liveEventMarkets.length; // 1-based
 
         IERC20(asset()).safeTransfer(msg.sender, amount);
-        emit EventMarketFunded(msg.sender, amount);
+        emit EventMarketFunded(market, amount);
     }
 
     /// @inheritdoc ILPVault
+    /// @dev Removes `market` from the live set (O(1) swap-pop) and pulls `returnedAmount` back. NAV
+    ///      is continuous across settle to the wei: the market carried the FLOOR mark
+    ///      (`returnedAmount − lockedSurplus`) in `eventRecoverable()` through resolution. Here the
+    ///      recoverable mark drops to 0 (market leaves the set) while the balance rises by
+    ///      `returnedAmount`; the `lockedSurplus` above the floor is added to the receive-only
+    ///      vesting bucket (and thus removed from `freeAssets` until it vests). Net Δ(totalAssets):
+    ///        + returnedAmount (into _liquidRaw)
+    ///        − lockedSurplus  (into unvested, excluded from freeAssets)
+    ///        − floorMark      (recoverable mark leaves)
+    ///      = returnedAmount − lockedSurplus − (returnedAmount − lockedSurplus) = 0. No jump, so no
+    ///      depositor/redeemer can straddle the settle instant for a windfall; the surplus drips in.
     function settleEventMarket(
+        address market,
         uint256 originalSeed,
-        uint256 returnedAmount
+        uint256 returnedAmount,
+        uint256 lockedSurplus
     )
         external
         nonReentrant
@@ -569,15 +618,56 @@ contract LPVault is Initializable, UUPSUpgradeable, ERC4626Upgradeable, Reentran
         if (originalSeed == 0) revert AmountZero();
         VaultStorage.Layout storage s = VaultStorage.load();
 
-        // This is safe because eventFundedSeed only grows by exact funded amounts
+        uint256 idx = s.liveEventMarketIndex[market];
+        if (idx == 0) revert MarketNotLive(market);
+
+        // This is safe because eventFundedSeed only grows by exact funded amounts.
         s.eventFundedSeed -= originalSeed;
+
+        // O(1) swap-pop removal from the live registry.
+        uint256 last = s.liveEventMarkets.length;
+        if (idx != last) {
+            address moved = s.liveEventMarkets[last - 1];
+            s.liveEventMarkets[idx - 1] = moved;
+            s.liveEventMarketIndex[moved] = idx;
+        }
+        s.liveEventMarkets.pop();
+        delete s.liveEventMarketIndex[market];
 
         if (returnedAmount > 0) {
             IERC20(asset()).safeTransferFrom(msg.sender, address(this), returnedAmount);
         }
 
+        // Crank the receive-only vesting bucket with the floor→exact surplus.
+        _accrueEventSurplus(s, lockedSurplus);
+
         int256 pnl = int256(returnedAmount) - int256(originalSeed);
-        emit EventMarketSettled(msg.sender, originalSeed, returnedAmount, pnl);
+        emit EventMarketSettled(market, originalSeed, returnedAmount, pnl);
+    }
+
+    /// @dev Synthetix-style crank of the receive-only event-surplus vesting bucket. FIRST realises
+    ///      the amount vested since the last crank (moving it into `_liquidRaw`/`freeAssets`
+    ///      implicitly — the USDC is already on-balance), THEN adds the new `lockedSurplus` to the
+    ///      principal and resets the linear drip rate `r = P / T` and clock `t0 = now`. The bucket is
+    ///      receive-only: `P` only grows here and drips down via `_unvestedEventSurplus`; there is no
+    ///      clawback, so it can never go negative and an empty bucket is safe (`add == 0` no-ops the
+    ///      accounting but still re-anchors the clock, which is harmless).
+    function _accrueEventSurplus(VaultStorage.Layout storage s, uint256 add) internal {
+        uint32 t = s.eventSurplusVestWindow == 0 ? DEFAULT_EVENT_SURPLUS_VEST_WINDOW : s.eventSurplusVestWindow;
+
+        // Realise vested-so-far: collapse P to the still-unvested remainder at `now`.
+        uint256 p = s.eventSurplusPrincipal;
+        uint256 t0 = s.eventSurplusLastAccrual;
+        if (p != 0 && block.timestamp > t0) {
+            uint256 vested = s.eventSurplusRatePerSec * (block.timestamp - t0);
+            p = p > vested ? p - vested : 0;
+        }
+
+        p += add;
+        s.eventSurplusPrincipal = p;
+        s.eventSurplusRatePerSec = p / t; // floor division; the sub-`T`-wei dust rolls forward harmlessly
+        s.eventSurplusLastAccrual = uint64(block.timestamp);
+        emit EventSurplusAccrued(add, p, s.eventSurplusRatePerSec, t);
     }
 
     // ------------------------------------------------------------------------------------------
@@ -904,20 +994,140 @@ contract LPVault is Initializable, UUPSUpgradeable, ERC4626Upgradeable, Reentran
         _emitFloorBreachIfBelow(VaultStorage.load());
     }
 
+    /// @inheritdoc ILPVault
+    /// @dev Re-cranks the bucket with a zero add so the new window `T` takes effect on the currently
+    ///      unvested remainder immediately (`r = P_remaining / T_new`), keeping the drip continuous
+    ///      and NAV unchanged at the call instant (the crank realises vested-so-far but adds nothing).
+    function setEventSurplusVestWindow(uint32 w) external onlyGovernance {
+        if (w < MIN_EVENT_SURPLUS_VEST_WINDOW || w > MAX_EVENT_SURPLUS_VEST_WINDOW) revert InvalidConfig();
+        VaultStorage.Layout storage s = VaultStorage.load();
+        uint32 old = s.eventSurplusVestWindow;
+        s.eventSurplusVestWindow = w;
+        _accrueEventSurplus(s, 0); // re-anchor the drip to the new window on the unvested remainder
+        emit EventSurplusVestWindowSet(old, w);
+    }
+
     // ------------------------------------------------------------------------------------------
     // Views
     // ------------------------------------------------------------------------------------------
 
+    /// @dev Raw liquid balance BEFORE excluding the unvested event surplus:
+    ///      `balance(USDC) − positionCollateral − insuranceFundBalance − accruedFees`. This is the
+    ///      pre-Design-2 `freeAssets` body verbatim. Used by `capTvl` (so the perp OI cap is
+    ///      byte-identical to before this refactor) and as the base for `freeAssets`. Saturates at 0.
+    function _liquidRaw(VaultStorage.Layout storage s) internal view returns (uint256) {
+        uint256 bal = IERC20(asset()).balanceOf(address(this));
+        uint256 booked = s.positionCollateral + s.insuranceFundBalance + s.accruedFees;
+        return bal > booked ? bal - booked : 0;
+    }
+
+    /// @dev Unvested portion of the receive-only event-surplus bucket = `P − r·(now − t0)`,
+    ///      saturating at 0 once fully vested. `T` (the window) only affects the rate `r` set at the
+    ///      last crank, so a live view needs no `T` here. Monotonically non-increasing between
+    ///      settles (r, t0, P are all fixed between cranks and `now` only advances).
+    function _unvestedEventSurplus(VaultStorage.Layout storage s) internal view returns (uint256) {
+        uint256 p = s.eventSurplusPrincipal;
+        if (p == 0) return 0;
+        uint256 t0 = s.eventSurplusLastAccrual;
+        if (block.timestamp <= t0) return p;
+        uint256 vested = s.eventSurplusRatePerSec * (block.timestamp - t0);
+        return p > vested ? p - vested : 0;
+    }
+
     /// @inheritdoc ILPVault
-    /// @dev Computed: `balance(USDC) + eventFundedSeed − positionCollateral − insuranceFundBalance − accruedFees`.
-    ///      Saturates at 0 if the bookkeepers somehow exceed balance (invariant break) so this
-    ///      view stays callable during incident response. Production state-changing flows still
-    ///      enforce solvency via the bookkeeper-decrement-before-transfer ordering.
+    function unvestedEventSurplus() public view returns (uint256) {
+        return _unvestedEventSurplus(VaultStorage.load());
+    }
+
+    /// @inheritdoc ILPVault
+    function eventSurplusVestWindow() external view returns (uint32) {
+        uint32 w = VaultStorage.load().eventSurplusVestWindow;
+        return w == 0 ? DEFAULT_EVENT_SURPLUS_VEST_WINDOW : w;
+    }
+
+    /// @inheritdoc ILPVault
+    /// @dev STRICTLY LIQUID and immediately redeemable: `_liquidRaw − unvestedEventSurplus`, i.e.
+    ///      `balance(USDC) − positionCollateral − insuranceFundBalance − accruedFees −
+    ///      unvestedEventSurplus`. Event-market seed that has physically left the vault is NOT added
+    ///      back (that was the redemption-arb bug). The not-yet-vested LP-owned event surplus is
+    ///      ALSO excluded here — strictly MORE conservative than the raw liquid figure — so a
+    ///      depositor entering just before/at settle cannot skim the settle-time floor→exact snap;
+    ///      it drips in over the vest window instead. This keeps strict invariant I1 with a 5th
+    ///      bucket (`balance == freeAssets + positionCollateral + insurance + fees +
+    ///      unvestedEventSurplus`) and is the honest solvency cap for perp settle / liquidation /
+    ///      withdrawal. Saturates at 0 so this view stays callable during incident response.
     function freeAssets() public view returns (uint256) {
         VaultStorage.Layout storage s = VaultStorage.load();
-        uint256 totalBalance = IERC20(asset()).balanceOf(address(this)) + s.eventFundedSeed;
-        uint256 booked = s.positionCollateral + s.insuranceFundBalance + s.accruedFees;
-        return totalBalance > booked ? totalBalance - booked : 0;
+        uint256 liquid = _liquidRaw(s);
+        uint256 unvested = _unvestedEventSurplus(s);
+        return liquid > unvested ? liquid - unvested : 0;
+    }
+
+    /// @inheritdoc ILPVault
+    /// @dev Sum of the current recoverable value of every live event market. Added to `freeAssets()`
+    ///      to form the share-price NAV (`totalAssets`). Each market self-reports the pure LMSR
+    ///      worst-case-liability FLOOR (`market.balance − max(q1,q2)`), held UNCHANGED through
+    ///      resolution (no UMA read, no floor→exact snap), so this never over-marks system cash
+    ///      (`Σ recoverable_i ≤ Σ market.balanceOf(USDC)`). The loop is bounded by
+    ///      `MAX_LIVE_EVENT_MARKETS`; it is also cheaper now (no UMA staticcall per market). A market
+    ///      that reverts (e.g. a malicious/gas-bombing clone) is skipped and left unmarked —
+    ///      conservative (understates NAV, never over-marks) and keeps this view callable so perp
+    ///      settle / liquidation / withdrawal never brick on it.
+    function eventRecoverable() public view returns (uint256 total) {
+        VaultStorage.Layout storage s = VaultStorage.load();
+        address[] storage m = s.liveEventMarkets;
+        uint256 len = m.length;
+        for (uint256 i; i < len; ++i) {
+            try IEventMarket(m[i]).currentRecoverable() returns (uint256 r) {
+                total += r;
+            } catch {
+                // Leave that market unmarked (conservative — understates NAV, never over-marks).
+            }
+        }
+    }
+
+    /// @notice DISPLAY-ONLY, NON-LOAD-BEARING. Σ over live markets of `bal_i − E[liability_i]`, where
+    ///         `E[liability] = (pYes·q1 + (1e18−pYes)·q2)/1e18` uses the market's own LMSR-implied
+    ///         softmax price (`priceOf`). This is the unbiased mid-life "fair" recoverable an indexer
+    ///         / admin UI can surface alongside the conservative `eventRecoverable()` floor. It is
+    ///         NEVER used in `totalAssets`/`freeAssets`/the mark — the on-chain NAV uses only the
+    ///         floor + the receive-only vesting bucket. try/catch per market like `eventRecoverable`.
+    function fairRecoverable() external view returns (uint256 total) {
+        VaultStorage.Layout storage s = VaultStorage.load();
+        address[] storage m = s.liveEventMarkets;
+        address usdc_ = asset();
+        uint256 len = m.length;
+        for (uint256 i; i < len; ++i) {
+            IEventMarket mkt = IEventMarket(m[i]);
+            try mkt.priceOf(true) returns (uint256 pYes) {
+                uint256 q1 = mkt.totalYesShares();
+                uint256 q2 = mkt.totalNoShares();
+                uint256 eLiab = (pYes * q1 + (1e18 - pYes) * q2) / 1e18;
+                uint256 bal = IERC20(usdc_).balanceOf(address(mkt));
+                if (bal > eLiab) total += bal - eLiab;
+            } catch {
+                // Skip markets that revert (conservative — display value understates).
+            }
+        }
+    }
+
+    /// @inheritdoc ILPVault
+    /// @dev O(1) perp OI-cap denominator, decoupled from the per-market NAV mark. Equals
+    ///      `_liquidRaw + eventFundedSeed`: funding a market subtracts `S` from the balance (hence
+    ///      from `_liquidRaw`) while adding `S` to `eventFundedSeed`, so this total is invariant to
+    ///      fund/settle. NOTE: this uses `_liquidRaw`, NOT `freeAssets` — it deliberately does NOT
+    ///      subtract the unvested event surplus, so it stays BYTE-IDENTICAL to the pre-Design-2
+    ///      value (`old-freeAssets + eventFundedSeed`). That keeps perp OI capacity/liveness (the S1
+    ///      concern) exactly as before, with no loop on the perp hot path; only LP share pricing
+    ///      (via `freeAssets`) reflects the vesting exclusion.
+    function capTvl() external view returns (uint256) {
+        VaultStorage.Layout storage s = VaultStorage.load();
+        return _liquidRaw(s) + s.eventFundedSeed;
+    }
+
+    /// @inheritdoc ILPVault
+    function liveEventMarketCount() external view returns (uint256) {
+        return VaultStorage.load().liveEventMarkets.length;
     }
 
     function positionCollateral() external view returns (uint256) {
