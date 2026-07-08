@@ -51,4 +51,31 @@ interface IEventMarketFactory {
 
     /// @notice Timestamp at which a pending operator proposal becomes activatable (0 if none).
     function pendingOperatorActivatesAt(address operator) external view returns (uint64);
+
+    // ------------------------------------------------------------------------------------------
+    // Market implementation setter (governance-timelocked). `marketImplementation` is the template
+    // every future market clone runs, so it is installed via the same two-step propose/activate
+    // timelock as operator adds. Existing clones are frozen and unaffected.
+    // ------------------------------------------------------------------------------------------
+
+    /// @notice The EventMarket template cloned by `createMarket`.
+    function marketImplementation() external view returns (address);
+
+    /// @notice Market implementation pending activation (0 if none).
+    function pendingMarketImplementation() external view returns (address);
+
+    /// @notice Timestamp at which the pending market implementation becomes activatable (0 if none).
+    function pendingMarketImplementationActivatesAt() external view returns (uint64);
+
+    /// @notice Propose a new market implementation. Takes effect after the timelock via
+    ///         `activateSetMarketImplementation`. Reverts if `newImpl` is zero, has no code, or a
+    ///         proposal is already pending.
+    function proposeSetMarketImplementation(address newImpl) external;
+
+    /// @notice Activate a previously proposed market implementation once its timelock has elapsed.
+    ///         Permissionless.
+    function activateSetMarketImplementation() external;
+
+    /// @notice Cancel a pending market implementation proposal before activation.
+    function cancelSetMarketImplementation() external;
 }
