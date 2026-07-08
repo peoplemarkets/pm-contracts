@@ -347,6 +347,10 @@ contract EventFactorySetMarketImpl is Test {
 
         // Cross-check the storage reads agree with the public getters (layout matches ABI).
         assertEq(factory.pendingMarketImplementation(), address(newImpl), "getter matches slot 12");
-        assertEq(factory.pendingMarketImplementationActivatesAt(), activatesAt, "getter matches slot 13");
+        assertEq(
+            factory.pendingMarketImplementationActivatesAt(),
+            activatesAt,
+            "getter matches slot 12 offset 20"
+        );
     }
 }

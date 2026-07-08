@@ -49,7 +49,8 @@ contract EventMarketFactory is Initializable, UUPSUpgradeable, IEventMarketFacto
     mapping(address => bool) public isMarket;
 
     // --- Market implementation setter (governance-timelocked) ---
-    // APPEND-ONLY. `isMarket` occupies slot 11; the two fields below take slots 12 and 13. They
+    // APPEND-ONLY. `isMarket` occupies slot 11; the two fields below PACK into a single new word,
+    // slot 12 (address at offset 0 + uint64 at offset 20 = 28 bytes). Slot 13 stays free. They
     // MUST stay at the end of storage so this contract stays layout-compatible when upgraded onto
     // the live proxy (0xb73f) — do NOT reorder or insert anything above them.
 
@@ -59,7 +60,7 @@ contract EventMarketFactory is Initializable, UUPSUpgradeable, IEventMarketFacto
     address public pendingMarketImplementation;
 
     /// @notice Timestamp at which `pendingMarketImplementation` becomes activatable (0 if none).
-    ///         Slot 13.
+    ///         Packed into slot 12 at byte offset 20 (alongside `pendingMarketImplementation`).
     uint64 public pendingMarketImplementationActivatesAt;
 
     event MarketCreated(bytes32 indexed eventId, address market, bytes32 subjectId);
