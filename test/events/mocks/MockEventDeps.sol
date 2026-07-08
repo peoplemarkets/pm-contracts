@@ -2,6 +2,8 @@
 pragma solidity 0.8.24;
 
 import {IFeedbackController} from "../../../src/feedback/IFeedbackController.sol";
+import {IEventMarket} from "../../../src/events/IEventMarket.sol";
+import {UMAAdapter} from "../../../src/oracle/UMAAdapter.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 
 /// @notice Minimal LPVault stand-in for EventMarketFactory tests. The factory calls
@@ -79,6 +81,29 @@ contract MockUMAAdapter {
 
     function latestValue(bytes32) external view returns (uint256 value, uint64 valueTimestamp) {
         return (_value, _ts);
+    }
+}
+
+/// @notice Minimal EventMarket-shaped implementation used to prove `createMarket` clones whichever
+///         template is currently installed. It exposes the exact `initialize(IERC20,UMAAdapter,
+///         MarketParams)` selector the factory calls on a fresh clone (so creation succeeds) plus a
+///         constant `implTag()` marker that differs from the real EventMarket, letting a test assert
+///         the clone's behaviour switches to the newly activated template. It is deliberately inert
+///         beyond recording the eventId so the clone can be identified.
+contract MockEventMarketImpl {
+    bytes32 public eventId;
+    bool private _initialized;
+
+    /// @notice Marker distinguishing this template from the real EventMarket clones in tests.
+    function implTag() external pure returns (bytes32) {
+        return keccak256("MockEventMarketImpl.v1");
+    }
+
+    /// @dev Selector-compatible with EventMarket.initialize so `createMarket` can clone + init this.
+    function initialize(IERC20, UMAAdapter, IEventMarket.MarketParams memory params_) external {
+        require(!_initialized, "already init");
+        _initialized = true;
+        eventId = params_.eventId;
     }
 }
 

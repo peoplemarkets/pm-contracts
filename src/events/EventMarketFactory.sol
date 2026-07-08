@@ -48,11 +48,28 @@ contract EventMarketFactory is Initializable, UUPSUpgradeable, IEventMarketFacto
     ///         before pulling trader USDC so it can only ever route into a genuine market.
     mapping(address => bool) public isMarket;
 
+    // --- Market implementation setter (governance-timelocked) ---
+    // APPEND-ONLY. `isMarket` occupies slot 11; the two fields below take slots 12 and 13. They
+    // MUST stay at the end of storage so this contract stays layout-compatible when upgraded onto
+    // the live proxy (0xb73f) — do NOT reorder or insert anything above them.
+
+    /// @notice Market implementation pending activation (0 if none). `createMarket` keeps cloning
+    ///         `marketImplementation` until `activateSetMarketImplementation` promotes this pending
+    ///         value once its timelock has elapsed. Slot 12.
+    address public pendingMarketImplementation;
+
+    /// @notice Timestamp at which `pendingMarketImplementation` becomes activatable (0 if none).
+    ///         Slot 13.
+    uint64 public pendingMarketImplementationActivatesAt;
+
     event MarketCreated(bytes32 indexed eventId, address market, bytes32 subjectId);
     event OperatorProposed(address indexed operator, uint64 activatesAt);
     event OperatorActivated(address indexed operator);
     event OperatorCancelled(address indexed operator);
     event OperatorRemoved(address indexed operator);
+    event MarketImplementationProposed(address indexed newImplementation, uint64 activatesAt);
+    event MarketImplementationActivated(address indexed oldImplementation, address indexed newImplementation);
+    event MarketImplementationCancelled(address indexed newImplementation);
 
     error Unauthorized();
     error InvalidConfig();
@@ -61,6 +78,8 @@ contract EventMarketFactory is Initializable, UUPSUpgradeable, IEventMarketFacto
     error NoPendingOperator(address operator);
     error TimelockNotElapsed(uint64 readyAt);
     error OperatorNotSet(address operator);
+    error PendingImplementationExists(address implementation);
+    error NoPendingImplementation();
 
     /// @custom:oz-upgrades-unsafe-allow constructor
     constructor() {
@@ -182,6 +201,48 @@ contract EventMarketFactory is Initializable, UUPSUpgradeable, IEventMarketFacto
         if (!isOperator[operator]) revert OperatorNotSet(operator);
         delete isOperator[operator];
         emit OperatorRemoved(operator);
+    }
+
+    // ------------------------------------------------------------------------------------------
+    // Governance: market implementation setter (timelocked)
+    //
+    // Mirrors the operator allowlist timelock (`proposeAddOperator` / `activateAddOperator` /
+    // `cancelAddOperator`). `marketImplementation` is the template every future market clone runs,
+    // so installing a new one is the most security-sensitive action on this contract and is gated
+    // behind the same two-step `timelockDelay` as operator adds. Existing market clones are frozen
+    // at creation time and are unaffected; only markets created AFTER activation use the new impl.
+    // ------------------------------------------------------------------------------------------
+
+    /// @inheritdoc IEventMarketFactory
+    function proposeSetMarketImplementation(address newImpl) external onlyGovernance {
+        if (newImpl == address(0) || newImpl.code.length == 0) revert InvalidConfig();
+        if (pendingMarketImplementationActivatesAt != 0) revert PendingImplementationExists(pendingMarketImplementation);
+        uint64 activatesAt = uint64(block.timestamp + timelockDelay);
+        pendingMarketImplementation = newImpl;
+        pendingMarketImplementationActivatesAt = activatesAt;
+        emit MarketImplementationProposed(newImpl, activatesAt);
+    }
+
+    /// @inheritdoc IEventMarketFactory
+    function activateSetMarketImplementation() external {
+        uint64 readyAt = pendingMarketImplementationActivatesAt;
+        if (readyAt == 0) revert NoPendingImplementation();
+        if (block.timestamp < readyAt) revert TimelockNotElapsed(readyAt);
+        address oldImpl = marketImplementation;
+        address newImpl = pendingMarketImplementation;
+        marketImplementation = newImpl;
+        delete pendingMarketImplementation;
+        delete pendingMarketImplementationActivatesAt;
+        emit MarketImplementationActivated(oldImpl, newImpl);
+    }
+
+    /// @inheritdoc IEventMarketFactory
+    function cancelSetMarketImplementation() external onlyGovernance {
+        if (pendingMarketImplementationActivatesAt == 0) revert NoPendingImplementation();
+        address newImpl = pendingMarketImplementation;
+        delete pendingMarketImplementation;
+        delete pendingMarketImplementationActivatesAt;
+        emit MarketImplementationCancelled(newImpl);
     }
 
     function getMarket(bytes32 eventId) external view returns (address) {
