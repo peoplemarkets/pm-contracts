@@ -7,6 +7,7 @@ import {ReentrancyGuard} from "solady/utils/ReentrancyGuard.sol";
 
 import {FixedPointMathLib} from "solady/utils/FixedPointMathLib.sol";
 
+import {IOracleRouter} from "../oracle/IOracleRouter.sol";
 import {UMAAdapter} from "../oracle/UMAAdapter.sol";
 import {IEventMarket} from "./IEventMarket.sol";
 import {IEventMarketFactory} from "./IEventMarketFactory.sol";
@@ -33,6 +34,13 @@ contract EventMarket is Initializable, IEventMarket, ReentrancyGuard {
     mapping(address => uint256) public yesBalance;
     mapping(address => uint256) public noBalance;
 
+    // ---- APPENDED (Fix B) — objective-resolution config. MUST stay the LAST declared state var. ----
+    // Minimal-proxy clones are frozen at creation; a clone initialized under the OLD impl reads this
+    // trailing slot group as all-zero => ResolutionConfig{source: UMA(0), ...} => it transparently
+    // keeps the exact UMA path. Only clones created after the V2 impl is activated (and initialized
+    // via `initializeV2`) carry a non-default config. NEVER insert state above this line.
+    IEventMarket.ResolutionConfig private _resolution;
+
     event SharesBought(address indexed buyer, bool isYes, uint256 usdcAmount, uint256 sharesMinted);
     event SharesSold(address indexed seller, bool isYes, uint256 sharesAmount, uint256 usdcReturned);
     event MarketResolved(Outcome finalOutcome);
@@ -44,6 +52,8 @@ contract EventMarket is Initializable, IEventMarket, ReentrancyGuard {
     error InsufficientBalance();
     error SlippageExceeded(uint256 got, uint256 minRequired);
 
+    /// @notice Legacy initializer (UMA path). Retained for any in-flight bytecode expectations; the
+    ///         V2 factory always calls `initializeV2`. Leaves `_resolution` zero => source == UMA.
     function initialize(IERC20 usdc_, UMAAdapter umaAdapter_, MarketParams memory params_) external initializer {
         usdc = usdc_;
         factory = IEventMarketFactory(msg.sender);
@@ -51,6 +61,31 @@ contract EventMarket is Initializable, IEventMarket, ReentrancyGuard {
         _params = params_;
         _status = Status.OPEN;
         _outcome = Outcome.UNRESOLVED;
+    }
+
+    /// @notice V2 initializer. Identical to `initialize` plus it captures the objective-resolution
+    ///         config `rc`. The legacy 7-arg factory path passes `rc` with `source == UMA` (a
+    ///         zero-value/empty struct), which is byte-for-byte the legacy behaviour. For the
+    ///         ORACLE_ROUTER source, `rc.metricId/threshold/comparator/settleNotBefore/oracleRouter`
+    ///         drive `settleResolution`'s objective branch.
+    /// @dev    Shares the SAME `initializer` guard slot as `initialize`, so exactly one of the two
+    ///         can ever run on a given clone.
+    function initializeV2(
+        IERC20 usdc_,
+        UMAAdapter umaAdapter_,
+        MarketParams memory params_,
+        ResolutionConfig memory rc
+    )
+        external
+        initializer
+    {
+        usdc = usdc_;
+        factory = IEventMarketFactory(msg.sender);
+        umaAdapter = umaAdapter_;
+        _params = params_;
+        _status = Status.OPEN;
+        _outcome = Outcome.UNRESOLVED;
+        _resolution = rc;
     }
 
     modifier onlyOpen() {
@@ -206,6 +241,10 @@ contract EventMarket is Initializable, IEventMarket, ReentrancyGuard {
 
     /// @inheritdoc IEventMarket
     function proposeResolution(Outcome proposedOutcome) external onlyOpen {
+        // Objective (ORACLE_ROUTER) markets have no bonded proposal step — `settleResolution` reads
+        // the feed directly — so a UMA proposal here would be meaningless. Reject it.
+        if (_resolution.source != ResolutionSource.UMA) revert WrongResolutionSource();
+
         // This acts as a wrapper around UMAAdapter's proposeAssertion to conveniently format the claim
         // The user must still have approved UMAAdapter to spend the bond.
         // We use the eventId as the metricId for the UMA metric.
@@ -233,14 +272,23 @@ contract EventMarket is Initializable, IEventMarket, ReentrancyGuard {
     function settleResolution() external nonReentrant {
         require(_status == Status.OPEN || _status == Status.PENDING_RESOLUTION, "EventMarket: already resolved");
 
-        // Read the latest value from UMAAdapter
-        (uint256 value,) = umaAdapter.latestValue(_params.eventId);
-        require(
-            value == uint256(Outcome.YES) || value == uint256(Outcome.NO) || value == uint256(Outcome.VOID),
-            "EventMarket: unsupported or unresolved value"
-        );
+        // Resolve the outcome via the market's configured source. Legacy/zero-value clones read
+        // `source == UMA` and take the UNCHANGED path below.
+        Outcome resolved;
+        if (_resolution.source == ResolutionSource.UMA) {
+            // ---- UMA (default): byte-for-byte the original logic. ----
+            (uint256 value,) = umaAdapter.latestValue(_params.eventId);
+            require(
+                value == uint256(Outcome.YES) || value == uint256(Outcome.NO) || value == uint256(Outcome.VOID),
+                "EventMarket: unsupported or unresolved value"
+            );
+            resolved = Outcome(value);
+        } else {
+            // ---- ORACLE_ROUTER (objective): read a numeric metric and compare to a threshold. ----
+            resolved = _resolveObjective();
+        }
 
-        _outcome = Outcome(value);
+        _outcome = resolved;
         _status = Status.RESOLVED;
 
         // Calculate AMM liability based on outcome
@@ -376,5 +424,46 @@ contract EventMarket is Initializable, IEventMarket, ReentrancyGuard {
 
     function params() external view returns (MarketParams memory) {
         return _params;
+    }
+
+    /// @inheritdoc IEventMarket
+    function resolutionConfig() external view returns (ResolutionConfig memory) {
+        return _resolution;
+    }
+
+    // ------------------------------------------------------------------------------------------
+    // Objective (ORACLE_ROUTER) resolution
+    // ------------------------------------------------------------------------------------------
+
+    /// @dev Reads the configured OracleRouter metric and maps it to YES/NO via the comparator.
+    ///      Guards, in order:
+    ///        1. `block.timestamp >= settleNotBefore` — cannot settle on an early/partial reading.
+    ///        2. `router.read(metricId)` — THIS is the stale/unregistered/degraded-no-fallback
+    ///           guard: it REVERTS on `MetricNotRegistered` / `StaleReading` / `DegradedAndNoFallback`.
+    ///           A stale or unready feed therefore CANNOT settle — the tx reverts, funds stay
+    ///           redeemable-after-a-real-settle, and the market never mis-settles.
+    ///        3. `reading.degraded == false` — fail closed even if a fallback exists: an objective
+    ///           binary settlement must run on a healthy primary source.
+    ///      There is NO on-chain VOID on this path: a valid numeric reading always yields YES or NO.
+    ///      An event that may need void semantics must be configured `source == UMA` instead.
+    function _resolveObjective() internal view returns (Outcome) {
+        require(block.timestamp >= _resolution.settleNotBefore, "EventMarket: before settleNotBefore");
+
+        IOracleRouter.OracleReading memory reading = IOracleRouter(_resolution.oracleRouter).read(_resolution.metricId);
+        require(!reading.degraded, "EventMarket: degraded feed");
+
+        bool yes = _compare(reading.value, _resolution.threshold, _resolution.comparator);
+        return yes ? Outcome.YES : Outcome.NO;
+    }
+
+    /// @dev Pure integer comparison of a feed reading against the threshold. Decimals must match how
+    ///      the adapter stores the metric value (governance responsibility, documented in
+    ///      `ResolutionConfig`).
+    function _compare(uint256 value, uint256 threshold, Comparator cmp) internal pure returns (bool) {
+        if (cmp == Comparator.GTE) return value >= threshold;
+        if (cmp == Comparator.LTE) return value <= threshold;
+        if (cmp == Comparator.GT) return value > threshold;
+        if (cmp == Comparator.LT) return value < threshold;
+        return value == threshold; // Comparator.EQ
     }
 }

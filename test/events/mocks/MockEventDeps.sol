@@ -1,8 +1,9 @@
 // SPDX-License-Identifier: BUSL-1.1
 pragma solidity 0.8.24;
 
-import {IFeedbackController} from "../../../src/feedback/IFeedbackController.sol";
 import {IEventMarket} from "../../../src/events/IEventMarket.sol";
+import {IFeedbackController} from "../../../src/feedback/IFeedbackController.sol";
+import {IOracleRouter} from "../../../src/oracle/IOracleRouter.sol";
 import {UMAAdapter} from "../../../src/oracle/UMAAdapter.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 
@@ -66,10 +67,27 @@ contract MockFeedbackController {
 contract MockUMAAdapter {
     uint256 internal _value;
     uint64 internal _ts;
+    // Fix D readiness gate: metrics are registered BY DEFAULT so pre-existing tests (which never
+    // registered a UMA metric) keep passing. A test can call `setRegistered(id, false)` to exercise
+    // the `MetricNotReady` revert path.
+    mapping(bytes32 => bool) internal _unregistered;
 
     function setLatestValue(uint256 value_, uint64 ts_) external {
         _value = value_;
         _ts = ts_;
+    }
+
+    /// @dev Test helper for the factory's Fix D readiness gate
+    ///      (`umaAdapter.metricOf(eventId).registered`). Default is registered; pass `false` to
+    ///      simulate an un-activated metric.
+    function setRegistered(bytes32 metricId, bool registered) external {
+        _unregistered[metricId] = !registered;
+    }
+
+    /// @dev Mirrors `UMAAdapter.metricOf` shape: the factory only reads `.registered`. ABI-compatible
+    ///      with the real `UMAAdapter.UMAMetric`. Registered unless explicitly un-set.
+    function metricOf(bytes32 metricId) external view returns (UMAAdapter.UMAMetric memory m) {
+        m.registered = !_unregistered[metricId];
     }
 
     function proposeAssertion(bytes32, uint256 claimedValue, bytes calldata) external returns (bytes32) {
@@ -99,8 +117,16 @@ contract MockEventMarketImpl {
         return keccak256("MockEventMarketImpl.v1");
     }
 
-    /// @dev Selector-compatible with EventMarket.initialize so `createMarket` can clone + init this.
-    function initialize(IERC20, UMAAdapter, IEventMarket.MarketParams memory params_) external {
+    /// @dev Selector-compatible with EventMarket.initializeV2 so `createMarket`/`_create` can clone
+    ///      + init this. (The factory now always calls `initializeV2`.)
+    function initializeV2(
+        IERC20,
+        UMAAdapter,
+        IEventMarket.MarketParams memory params_,
+        IEventMarket.ResolutionConfig memory
+    )
+        external
+    {
         require(!_initialized, "already init");
         _initialized = true;
         eventId = params_.eventId;
@@ -158,5 +184,121 @@ contract ReentrantToken is IERC20 {
     function _move(address from, address to, uint256 amount) internal {
         balanceOf[from] -= amount;
         balanceOf[to] += amount;
+    }
+}
+
+/// @notice OracleRouter stand-in for the objective (ORACLE_ROUTER) resolution path. Reproduces the
+///         exact read-time guards the real router enforces — `MetricNotRegistered`, `StaleReading`,
+///         `DegradedAndNoFallback` — and the `configOf().sourceType` surface the factory's Fix D
+///         readiness gate reads. Only the surface EventMarket + EventMarketFactory touch is modelled.
+contract MockOracleRouter is IOracleRouter {
+    struct Feed {
+        bool registered;
+        uint256 value;
+        uint64 updatedAt;
+        uint32 staleAfter;
+        bool degraded;
+        bool hasFallback;
+        SourceType sourceType;
+    }
+
+    mapping(bytes32 => Feed) internal _feeds;
+
+    /// @dev Register a metric with an initial reading. `sourceType` != UNSET is what the factory
+    ///      readiness gate checks; SIGNED is the natural objective-feed type.
+    function registerMetric(bytes32 metricId, uint256 value, uint64 updatedAt, uint32 staleAfter) external {
+        _feeds[metricId] = Feed({
+            registered: true,
+            value: value,
+            updatedAt: updatedAt,
+            staleAfter: staleAfter,
+            degraded: false,
+            hasFallback: false,
+            sourceType: SourceType.SIGNED
+        });
+    }
+
+    function setValue(bytes32 metricId, uint256 value, uint64 updatedAt) external {
+        _feeds[metricId].value = value;
+        _feeds[metricId].updatedAt = updatedAt;
+    }
+
+    /// @dev Flip degraded; `hasFallback` decides whether `read` reverts (no fallback) or returns a
+    ///      degraded reading (fallback present) — the market fails closed on degraded either way.
+    function setDegraded(bytes32 metricId, bool degraded, bool hasFallback) external {
+        _feeds[metricId].degraded = degraded;
+        _feeds[metricId].hasFallback = hasFallback;
+    }
+
+    // -- Reads (the only surface EventMarket + factory use) --
+
+    function read(bytes32 metricId) external view returns (OracleReading memory reading) {
+        Feed memory f = _feeds[metricId];
+        if (f.sourceType == SourceType.UNSET) revert MetricNotRegistered(metricId);
+        if (f.degraded && !f.hasFallback) revert DegradedAndNoFallback(metricId);
+        if (uint64(block.timestamp) > f.updatedAt + uint64(f.staleAfter)) {
+            revert StaleReading(metricId, f.updatedAt, f.staleAfter);
+        }
+        reading = OracleReading({value: f.value, updatedAt: f.updatedAt, degraded: f.degraded});
+    }
+
+    function configOf(bytes32 metricId) external view returns (MetricConfig memory c) {
+        Feed memory f = _feeds[metricId];
+        c.sourceType = f.sourceType;
+        c.staleAfter = f.staleAfter;
+        c.degraded = f.degraded;
+    }
+
+    // -- Unused interface surface (revert if ever hit so a test misuse is loud). --
+    function cadenceOf(bytes32) external pure returns (uint32) {
+        return 0;
+    }
+
+    function proposeRegister(bytes32, MetricConfig calldata) external pure {
+        revert("unused");
+    }
+
+    function activateRegister(bytes32) external pure {
+        revert("unused");
+    }
+
+    function cancelProposal(bytes32) external pure {
+        revert("unused");
+    }
+
+    function setDegraded(bytes32, bool, bytes32) external pure {
+        revert("unused");
+    }
+
+    function proposeSetFallback(bytes32, address) external pure {
+        revert("unused");
+    }
+
+    function activateSetFallback(bytes32) external pure {
+        revert("unused");
+    }
+
+    function markIfStale(bytes32) external pure {
+        revert("unused");
+    }
+
+    function proposeGovernanceTransfer(address) external pure {
+        revert("unused");
+    }
+
+    function activateGovernanceTransfer() external pure {
+        revert("unused");
+    }
+
+    function cancelGovernanceTransfer() external pure {
+        revert("unused");
+    }
+
+    function setOperator(address) external pure {
+        revert("unused");
+    }
+
+    function pendingGovernance() external pure returns (address, uint64) {
+        return (address(0), 0);
     }
 }

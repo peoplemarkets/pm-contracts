@@ -8,6 +8,8 @@ import {LPVault} from "../src/core/LPVault.sol";
 import {EventMarket} from "../src/events/EventMarket.sol";
 import {EventMarketFactory} from "../src/events/EventMarketFactory.sol";
 import {EventMarketRouter} from "../src/events/EventMarketRouter.sol";
+import {FeedbackController} from "../src/feedback/FeedbackController.sol";
+import {IFeedbackController} from "../src/feedback/IFeedbackController.sol";
 
 import {UUPSUpgradeable} from "@openzeppelin/contracts-upgradeable/proxy/utils/UUPSUpgradeable.sol";
 
@@ -72,28 +74,87 @@ contract UpgradeEventStack is Script {
     // ------------------------------------------------------------------------------------------
     // PHASE 1 — deploy the three new implementations (plain `new`, no proxies, no wiring changes).
     // ------------------------------------------------------------------------------------------
-    function deploy() public returns (address newVaultImpl, address newFactoryImpl, address newEventMarketImpl) {
+    function deploy()
+        public
+        returns (address newVaultImpl, address newFactoryImpl, address newEventMarketImpl, address newFeedbackImpl)
+    {
         console2.log("=== UpgradeEventStack: PHASE 1 DEPLOY (impls only) ===");
         _beginBroadcast();
 
         LPVault vaultImpl = new LPVault();
         EventMarketFactory factoryImpl = new EventMarketFactory();
         EventMarket eventMarketImpl = new EventMarket();
+        // Launch-critical: the FeedbackController V2 impl carries the appended election/sports/
+        // milestone EventClasses + the idempotent seedV2Coefficients() backfiller.
+        FeedbackController feedbackImpl = new FeedbackController();
 
         vm.stopBroadcast();
 
         newVaultImpl = address(vaultImpl);
         newFactoryImpl = address(factoryImpl);
         newEventMarketImpl = address(eventMarketImpl);
+        newFeedbackImpl = address(feedbackImpl);
 
         console2.log("New LPVault impl            :", newVaultImpl);
         console2.log("New EventMarketFactory impl :", newFactoryImpl);
         console2.log("New EventMarket impl        :", newEventMarketImpl);
+        console2.log("New FeedbackController impl :", newFeedbackImpl);
         console2.log("--------------------------------------");
         console2.log("Export these, then run PHASE 2 upgrade():");
         console2.log("  export NEW_LPVAULT_IMPL=", newVaultImpl);
         console2.log("  export NEW_FACTORY_IMPL=", newFactoryImpl);
         console2.log("  export NEW_EVENT_MARKET_IMPL=", newEventMarketImpl);
+        console2.log("  export NEW_FEEDBACK_IMPL=", newFeedbackImpl);
+        console2.log("Ceremony after PHASE 4 (setMarketImpl activate):");
+        console2.log("  - upgradeFeedback()  : upgradeToAndCall on the FeedbackController proxy");
+        console2.log("  - seedFeedbackV2()   : feedback.seedV2Coefficients() (idempotent backfill)");
+    }
+
+    // ------------------------------------------------------------------------------------------
+    // PHASE 2b — upgrade the FeedbackController proxy to the V2 impl (NO reinit; append-only).
+    //
+    // Storage is append-safe: the appended EventClasses live in the existing coefficients mapping
+    // (keyed by enum value), so no reinitializer is needed. Run seedFeedbackV2() AFTER this.
+    // ------------------------------------------------------------------------------------------
+    function upgradeFeedback() public {
+        FeedbackController feedback = FeedbackController(vm.envAddress("FEEDBACK_CONTROLLER"));
+        address newFeedbackImpl = vm.envAddress("NEW_FEEDBACK_IMPL");
+        require(newFeedbackImpl.code.length != 0, "NEW_FEEDBACK_IMPL has no code");
+
+        console2.log("=== UpgradeEventStack: PHASE 2b UPGRADE FeedbackController ===");
+        console2.log("feedback proxy :", address(feedback));
+        console2.log("new impl       :", newFeedbackImpl);
+
+        _beginBroadcast();
+        UUPSUpgradeable(address(feedback)).upgradeToAndCall(newFeedbackImpl, "");
+        vm.stopBroadcast();
+
+        console2.log("[feedback] upgraded. Next: seedFeedbackV2() to backfill the new-class coeffs.");
+    }
+
+    // ------------------------------------------------------------------------------------------
+    // PHASE 2c — seed the appended-class default coefficients on the live FeedbackController proxy.
+    //
+    // Idempotent + governance-only: writes ONLY the appended classes that are currently unset, never
+    // clobbers a governance-tuned value, and is a no-op on re-run. MUST run after upgradeFeedback().
+    // ------------------------------------------------------------------------------------------
+    function seedFeedbackV2() public {
+        FeedbackController feedback = FeedbackController(vm.envAddress("FEEDBACK_CONTROLLER"));
+
+        console2.log("=== UpgradeEventStack: PHASE 2c seedV2Coefficients ===");
+        console2.log("feedback proxy :", address(feedback));
+
+        _beginBroadcast();
+        feedback.seedV2Coefficients();
+        vm.stopBroadcast();
+
+        console2.log("[feedback] ELECTION_WIN coeff  :");
+        console2.logInt(feedback.coefficientOf(IFeedbackController.EventClass.ELECTION_WIN));
+        console2.log("[feedback] SPORTS_WIN coeff    :");
+        console2.logInt(feedback.coefficientOf(IFeedbackController.EventClass.SPORTS_WIN));
+        console2.log("[feedback] MILESTONE_HIT coeff :");
+        console2.logInt(feedback.coefficientOf(IFeedbackController.EventClass.MILESTONE_HIT));
+        console2.log("[feedback] seedV2Coefficients complete (idempotent).");
     }
 
     // ------------------------------------------------------------------------------------------

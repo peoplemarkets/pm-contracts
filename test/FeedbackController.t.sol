@@ -833,6 +833,160 @@ contract FeedbackControllerTest is Test {
     }
 
     // ------------------------------------------------------------------------------------------
+    // Fix A — appended election/sports/milestone classes: defaults, valence, seeder
+    // ------------------------------------------------------------------------------------------
+
+    // Local mirrors of the appended defaults (see FeedbackController constants).
+    int256 internal constant DEFAULT_COEFF_ELECTION_WIN = 12e16;
+    int256 internal constant DEFAULT_COEFF_ELECTION_LOSS = -12e16;
+    int256 internal constant DEFAULT_COEFF_SPORTS_WIN = 8e16;
+    int256 internal constant DEFAULT_COEFF_SPORTS_LOSS = -8e16;
+    int256 internal constant DEFAULT_COEFF_EVENT_CANCELLED = -3e16;
+    int256 internal constant DEFAULT_COEFF_MILESTONE_HIT = 7e16;
+    int256 internal constant DEFAULT_COEFF_MILESTONE_MISS = -5e16;
+
+    function test_V2_DefaultsSeededOnInitialize() public view {
+        assertEq(feedback.coefficientOf(IFeedbackController.EventClass.ELECTION_WIN), DEFAULT_COEFF_ELECTION_WIN);
+        assertEq(feedback.coefficientOf(IFeedbackController.EventClass.ELECTION_LOSS), DEFAULT_COEFF_ELECTION_LOSS);
+        assertEq(feedback.coefficientOf(IFeedbackController.EventClass.SPORTS_WIN), DEFAULT_COEFF_SPORTS_WIN);
+        assertEq(feedback.coefficientOf(IFeedbackController.EventClass.SPORTS_LOSS), DEFAULT_COEFF_SPORTS_LOSS);
+        assertEq(feedback.coefficientOf(IFeedbackController.EventClass.EVENT_CANCELLED), DEFAULT_COEFF_EVENT_CANCELLED);
+        assertEq(feedback.coefficientOf(IFeedbackController.EventClass.MILESTONE_HIT), DEFAULT_COEFF_MILESTONE_HIT);
+        assertEq(feedback.coefficientOf(IFeedbackController.EventClass.MILESTONE_MISS), DEFAULT_COEFF_MILESTONE_MISS);
+    }
+
+    /// @dev A WIN nudges the subject UP: ELECTION_WIN coeff +0.12, score +1e18 => +1200 bps raw,
+    ///      capped at +1500 (does not bind), lateBy=0 => mark 100 -> 112.
+    function test_V2_ElectionWin_NudgesUp() public {
+        IFeedbackController.ResolutionInput memory input = _baseInput(IFeedbackController.EventClass.ELECTION_WIN, 1e18);
+        vm.prank(resolutionWriter);
+        feedback.applyResolution(input);
+        (uint256 newMark,) = engine.markOf(SUBJECT_ID);
+        assertEq(newMark, 112 * ONE_18, "election win nudges up +12%");
+    }
+
+    /// @dev A "loss"-valence class resolving YES (the loss happened) nudges DOWN: ELECTION_LOSS
+    ///      coeff -0.12 × YES(+1e18) => -1200 bps => 100 -> 88.
+    function test_V2_ElectionLoss_YesNudgesDown() public {
+        IFeedbackController.ResolutionInput memory input =
+            _baseInput(IFeedbackController.EventClass.ELECTION_LOSS, 1e18);
+        vm.prank(resolutionWriter);
+        feedback.applyResolution(input);
+        (uint256 newMark,) = engine.markOf(SUBJECT_ID);
+        assertEq(newMark, 88 * ONE_18, "loss-class YES nudges down -12%");
+    }
+
+    /// @dev NO on a loss-class means the loss did NOT happen => nudge UP: -0.12 × NO(-1e18) =
+    ///      +1200 bps => 100 -> 112.
+    function test_V2_ElectionLoss_NoNudgesUp() public {
+        IFeedbackController.ResolutionInput memory input =
+            _baseInput(IFeedbackController.EventClass.ELECTION_LOSS, -1e18);
+        vm.prank(resolutionWriter);
+        feedback.applyResolution(input);
+        (uint256 newMark,) = engine.markOf(SUBJECT_ID);
+        assertEq(newMark, 112 * ONE_18, "loss-class NO nudges up +12%");
+    }
+
+    function test_V2_SportsWin_NudgesUp() public {
+        IFeedbackController.ResolutionInput memory input = _baseInput(IFeedbackController.EventClass.SPORTS_WIN, 1e18);
+        vm.prank(resolutionWriter);
+        feedback.applyResolution(input);
+        (uint256 newMark,) = engine.markOf(SUBJECT_ID);
+        assertEq(newMark, 108 * ONE_18, "sports win +8%");
+    }
+
+    function test_V2_SportsLoss_YesNudgesDown() public {
+        IFeedbackController.ResolutionInput memory input = _baseInput(IFeedbackController.EventClass.SPORTS_LOSS, 1e18);
+        vm.prank(resolutionWriter);
+        feedback.applyResolution(input);
+        (uint256 newMark,) = engine.markOf(SUBJECT_ID);
+        assertEq(newMark, 92 * ONE_18, "sports loss YES -8%");
+    }
+
+    function test_V2_EventCancelled_MildNegative() public {
+        IFeedbackController.ResolutionInput memory input =
+            _baseInput(IFeedbackController.EventClass.EVENT_CANCELLED, 1e18);
+        vm.prank(resolutionWriter);
+        feedback.applyResolution(input);
+        (uint256 newMark,) = engine.markOf(SUBJECT_ID);
+        assertEq(newMark, 97 * ONE_18, "cancellation mild -3%");
+    }
+
+    function test_V2_MilestoneHit_NudgesUp() public {
+        IFeedbackController.ResolutionInput memory input =
+            _baseInput(IFeedbackController.EventClass.MILESTONE_HIT, 1e18);
+        vm.prank(resolutionWriter);
+        feedback.applyResolution(input);
+        (uint256 newMark,) = engine.markOf(SUBJECT_ID);
+        assertEq(newMark, 107 * ONE_18, "milestone hit +7%");
+    }
+
+    function test_V2_MilestoneMiss_NudgesDown() public {
+        IFeedbackController.ResolutionInput memory input =
+            _baseInput(IFeedbackController.EventClass.MILESTONE_MISS, 1e18);
+        vm.prank(resolutionWriter);
+        feedback.applyResolution(input);
+        (uint256 newMark,) = engine.markOf(SUBJECT_ID);
+        assertEq(newMark, 95 * ONE_18, "milestone miss -5%");
+    }
+
+    /// @dev All appended-class magnitudes stay UNDER the ±1500bps cap (largest is election ±1200).
+    function test_V2_MagnitudesUnderCap() public view {
+        // |coeff| × 1e18 × 10000 / 1e36 must be < 1500 for each class.
+        assertLt(uint256(DEFAULT_COEFF_ELECTION_WIN) * 10000 / 1e18, 1500);
+        assertLt(uint256(-DEFAULT_COEFF_ELECTION_LOSS) * 10000 / 1e18, 1500);
+        assertLt(uint256(DEFAULT_COEFF_SPORTS_WIN) * 10000 / 1e18, 1500);
+        assertLt(uint256(DEFAULT_COEFF_MILESTONE_HIT) * 10000 / 1e18, 1500);
+    }
+
+    /// @dev Seeder is idempotent: on a proxy that already seeded the classes (via initialize) it
+    ///      writes 0 and emits `V2CoefficientsSeeded(0)`.
+    function test_V2_Seeder_IdempotentNoOp() public {
+        vm.expectEmit(false, false, false, true, address(feedback));
+        emit IFeedbackController.V2CoefficientsSeeded(0);
+        vm.prank(governance);
+        feedback.seedV2Coefficients();
+        // Values unchanged.
+        assertEq(feedback.coefficientOf(IFeedbackController.EventClass.ELECTION_WIN), DEFAULT_COEFF_ELECTION_WIN);
+    }
+
+    /// @dev Seeder backfills ONLY unset classes and never clobbers a governance-tuned value.
+    function test_V2_Seeder_BackfillsOnlyUnset() public {
+        // Simulate the live-proxy state: zero out the appended classes (as if never seeded), and
+        // set ONE of them to a governance-tuned value the seeder must NOT overwrite.
+        vm.startPrank(governance);
+        feedback.setCoefficient(IFeedbackController.EventClass.ELECTION_WIN, int256(0));
+        feedback.setCoefficient(IFeedbackController.EventClass.ELECTION_LOSS, int256(0));
+        feedback.setCoefficient(IFeedbackController.EventClass.SPORTS_WIN, int256(0));
+        feedback.setCoefficient(IFeedbackController.EventClass.SPORTS_LOSS, int256(0));
+        feedback.setCoefficient(IFeedbackController.EventClass.EVENT_CANCELLED, int256(0));
+        feedback.setCoefficient(IFeedbackController.EventClass.MILESTONE_HIT, int256(0));
+        // MILESTONE_MISS pre-tuned by governance to a custom value.
+        feedback.setCoefficient(IFeedbackController.EventClass.MILESTONE_MISS, int256(-9e16));
+        vm.stopPrank();
+
+        // Seeder writes the 6 unset ones (not the tuned MILESTONE_MISS).
+        vm.expectEmit(false, false, false, true, address(feedback));
+        emit IFeedbackController.V2CoefficientsSeeded(6);
+        vm.prank(governance);
+        feedback.seedV2Coefficients();
+
+        assertEq(feedback.coefficientOf(IFeedbackController.EventClass.ELECTION_WIN), DEFAULT_COEFF_ELECTION_WIN);
+        assertEq(feedback.coefficientOf(IFeedbackController.EventClass.MILESTONE_HIT), DEFAULT_COEFF_MILESTONE_HIT);
+        // Governance-tuned value preserved.
+        assertEq(feedback.coefficientOf(IFeedbackController.EventClass.MILESTONE_MISS), int256(-9e16), "tuned kept");
+
+        // Original nine classes untouched by the seeder.
+        assertEq(feedback.coefficientOf(IFeedbackController.EventClass.AWARD_WIN), DEFAULT_COEFF_AWARD_WIN);
+    }
+
+    function test_V2_Seeder_RevertOnNonGovernance() public {
+        vm.prank(stranger);
+        vm.expectRevert(abi.encodeWithSelector(IFeedbackController.Unauthorized.selector, stranger));
+        feedback.seedV2Coefficients();
+    }
+
+    // ------------------------------------------------------------------------------------------
     // setImpulseCapBps
     // ------------------------------------------------------------------------------------------
 

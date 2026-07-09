@@ -136,7 +136,13 @@ contract EventNavArbTest is Test {
 
     /// @dev Post an outcome to the UMA mock WITHOUT settling the market (the pre-settle "outcome
     ///      known" window that the redemption arb exploited).
-    function _postOutcome(bytes32, /*eventId*/ IEventMarket.Outcome o) internal {
+    function _postOutcome(
+        bytes32,
+        /*eventId*/
+        IEventMarket.Outcome o
+    )
+        internal
+    {
         uma.setLatestValue(uint256(o), uint64(block.timestamp));
     }
 
