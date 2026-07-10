@@ -11,13 +11,8 @@ import {EventMarketFactory} from "../../src/events/EventMarketFactory.sol";
 import {IFeedbackController} from "../../src/feedback/IFeedbackController.sol";
 import {UMAAdapter} from "../../src/oracle/UMAAdapter.sol";
 
-import {
-    MockEventMarketImpl,
-    MockFeedbackController,
-    MockLPVault,
-    MockUMAAdapter
-} from "./mocks/MockEventDeps.sol";
 import {MockUSDC} from "../mocks/MockUSDC.sol";
+import {MockEventMarketImpl, MockFeedbackController, MockLPVault, MockUMAAdapter} from "./mocks/MockEventDeps.sol";
 
 /// @title  EventFactorySetMarketImpl — governance-timelocked market-implementation setter.
 ///
@@ -186,9 +181,7 @@ contract EventFactorySetMarketImpl is Test {
         factory.proposeSetMarketImplementation(address(first));
 
         vm.prank(governance);
-        vm.expectRevert(
-            abi.encodeWithSelector(EventMarketFactory.PendingImplementationExists.selector, address(first))
-        );
+        vm.expectRevert(abi.encodeWithSelector(EventMarketFactory.PendingImplementationExists.selector, address(first)));
         factory.proposeSetMarketImplementation(address(second));
     }
 
@@ -269,9 +262,8 @@ contract EventFactorySetMarketImpl is Test {
         // A market created against the ORIGINAL EventMarket template first, to prove pre-existing
         // markets are unaffected by a later swap.
         vm.prank(governance);
-        address oldMarket = factory.createMarket(
-            keccak256("event.old"), keccak256("event.old"), uint8(1), "Old?", DEADLINE, 0, LMSR_B
-        );
+        address oldMarket =
+            factory.createMarket(keccak256("event.old"), keccak256("event.old"), uint8(1), "Old?", DEADLINE, 0, LMSR_B);
         // The original clone is NOT a MockEventMarketImpl: calling implTag() would not return the
         // mock marker. (EventMarket has no implTag(); we just record it stayed the old template.)
         assertTrue(factory.isMarket(oldMarket), "old market registered");
@@ -286,9 +278,7 @@ contract EventFactorySetMarketImpl is Test {
 
         // A market created AFTER activation clones the mock template.
         vm.prank(governance);
-        address newMarket = factory.createMarket(
-            SUBJECT_ID, EVENT_ID, uint8(1), "New?", DEADLINE, 0, LMSR_B
-        );
+        address newMarket = factory.createMarket(SUBJECT_ID, EVENT_ID, uint8(1), "New?", DEADLINE, 0, LMSR_B);
 
         assertEq(
             MockEventMarketImpl(newMarket).implTag(),
@@ -329,16 +319,8 @@ contract EventFactorySetMarketImpl is Test {
         // Slot 12 is the single NEW appended word: the 20-byte address in the low bytes and the
         // uint64 activatesAt packed at byte offset 20. Slot 13 must be untouched (empty).
         uint256 slot12 = uint256(vm.load(address(factory), bytes32(uint256(12))));
-        assertEq(
-            address(uint160(slot12)),
-            address(newImpl),
-            "slot 12 low 20 bytes == pendingMarketImplementation"
-        );
-        assertEq(
-            uint64(slot12 >> 160),
-            activatesAt,
-            "slot 12 bytes 20-27 == pendingMarketImplementationActivatesAt"
-        );
+        assertEq(address(uint160(slot12)), address(newImpl), "slot 12 low 20 bytes == pendingMarketImplementation");
+        assertEq(uint64(slot12 >> 160), activatesAt, "slot 12 bytes 20-27 == pendingMarketImplementationActivatesAt");
         assertEq(
             uint256(vm.load(address(factory), bytes32(uint256(13)))),
             0,
@@ -347,10 +329,6 @@ contract EventFactorySetMarketImpl is Test {
 
         // Cross-check the storage reads agree with the public getters (layout matches ABI).
         assertEq(factory.pendingMarketImplementation(), address(newImpl), "getter matches slot 12");
-        assertEq(
-            factory.pendingMarketImplementationActivatesAt(),
-            activatesAt,
-            "getter matches slot 12 offset 20"
-        );
+        assertEq(factory.pendingMarketImplementationActivatesAt(), activatesAt, "getter matches slot 12 offset 20");
     }
 }

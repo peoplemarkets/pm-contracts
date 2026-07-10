@@ -15,15 +15,21 @@
 # Then allowlists the operator relay path (router->factory, EVENT_OPERATOR->router).
 #
 # Phases (each write SIMULATES first, then broadcasts; read-only cast checks run between steps):
-#   deploy                  -> deploy the 3 new impls (prints their addresses)
+#   deploy                  -> deploy the 4 new impls (LPVault, Factory, EventMarket, FeedbackController)
 #   upgrade                 -> upgradeToAndCall on the LPVault + Factory proxies (asserts perp reads unchanged)
 #   set-market-impl-propose -> factory.proposeSetMarketImplementation(new EventMarket)
 #   ...wait 1 hour (factory timelockDelay = 3600s)...
 #   set-market-impl-activate-> factory.activateSetMarketImplementation()
+#   upgrade-feedback        -> upgradeToAndCall on the FeedbackController proxy (append-only, no reinit)
+#   seed-feedback-v2        -> feedback.seedV2Coefficients() (idempotent backfill of the new classes)
 #   operator-propose        -> factory.proposeAddOperator(router) + router.proposeAddOperator(EVENT_OPERATOR)
 #   ...wait 1 hour (router MIN_TIMELOCK_DELAY floor)...
 #   operator-activate       -> activateAddOperator on both
 #   verify                  -> read-only sanity checks
+#
+# Extra env for the feedback legs:
+#   export NEW_FEEDBACK_IMPL=0x...   # from deploy output
+#   export FEEDBACK_CONTROLLER=0x... # the live FeedbackController proxy
 #
 # Usage:
 #   export DEPLOYER_PK=0x<governance private key>   # 0x0183A2e2F30264ebB89995854e09Bab51Ca251bE
@@ -108,6 +114,16 @@ case "${1:-}" in
     run_forge --sig 'activateSetMarketImpl()'
     echo "factory.marketImplementation(): $(cast call "$EVENT_MARKET_FACTORY" 'marketImplementation()(address)' --rpc-url "$RPC")"
     echo "  (want == NEW_EVENT_MARKET_IMPL = ${NEW_EVENT_MARKET_IMPL:-<unset>})"
+    echo ">>> next: $0 upgrade-feedback"
+    ;;
+  upgrade-feedback)
+    need DEPLOYER_PK; need NEW_FEEDBACK_IMPL; need FEEDBACK_CONTROLLER
+    run_forge --sig 'upgradeFeedback()'
+    echo ">>> next: $0 seed-feedback-v2"
+    ;;
+  seed-feedback-v2)
+    need DEPLOYER_PK; need FEEDBACK_CONTROLLER
+    run_forge --sig 'seedFeedbackV2()'
     echo ">>> next: $0 operator-propose"
     ;;
   operator-propose)
@@ -135,7 +151,7 @@ case "${1:-}" in
     cast balance "$EVENT_OPERATOR" --rpc-url "$RPC"
     ;;
   *)
-    echo "usage: $0 {deploy|upgrade|set-market-impl-propose|set-market-impl-activate|operator-propose|operator-activate|verify}"
+    echo "usage: $0 {deploy|upgrade|set-market-impl-propose|set-market-impl-activate|upgrade-feedback|seed-feedback-v2|operator-propose|operator-activate|verify}"
     exit 1
     ;;
 esac

@@ -10,6 +10,7 @@ import {LPVault} from "../../src/core/LPVault.sol";
 import {EventMarket} from "../../src/events/EventMarket.sol";
 import {EventMarketFactory} from "../../src/events/EventMarketFactory.sol";
 import {EventMarketRouter} from "../../src/events/EventMarketRouter.sol";
+import {UMAAdapter} from "../../src/oracle/UMAAdapter.sol";
 
 /// @title  UpgradeCeremonyFork — the real safety proof for the Base Sepolia event-stack upgrade.
 ///
@@ -205,6 +206,22 @@ contract UpgradeCeremonyForkTest is Test {
         // FORK-ONLY convenience for the E2E leg; every money-safety assertion above already ran on the
         // untouched live balance, so this does not weaken the safety proof.
         deal(USDC, LP_VAULT, IERC20(USDC).balanceOf(LP_VAULT) + VAULT_TOPUP);
+
+        // Fix D readiness gate: the new factory refuses to create a UMA market whose metric is not
+        // registered. Register `eventId` on the live UMAAdapter via ITS OWN governance (which may
+        // differ from the vault/factory GOVERNANCE) — propose -> warp -> activate — exactly the
+        // RegisterEventMetric runbook step a live ceremony runs before createMarket.
+        UMAAdapter umaAdapter = UMAAdapter(factory.umaAdapter());
+        address umaGov = umaAdapter.governance();
+        // Read the args BEFORE the prank — a call in the arg list would otherwise consume the prank
+        // (vm.prank only affects the very next external call), leaving proposeRegisterMetric unpranked.
+        uint64 umaLiveness = umaAdapter.MIN_LIVENESS();
+        uint32 umaDelay = umaAdapter.timelockDelay();
+        vm.prank(umaGov);
+        umaAdapter.proposeRegisterMetric(eventId, 1e6, umaLiveness, bytes32("ASSERT_TRUTH"), USDC);
+        vm.warp(block.timestamp + umaDelay + 1);
+        umaAdapter.activateRegisterMetric(eventId); // permissionless once the timelock elapses
+        assertTrue(umaAdapter.metricOf(eventId).registered, "fork: UMA metric not registered pre-create");
 
         vm.prank(GOVERNANCE);
         address market =

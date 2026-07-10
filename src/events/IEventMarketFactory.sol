@@ -1,7 +1,11 @@
 // SPDX-License-Identifier: BUSL-1.1
 pragma solidity 0.8.24;
 
+import {IEventMarket} from "./IEventMarket.sol";
+
 interface IEventMarketFactory {
+    /// @notice Create a UMA-resolved market (default path). Reverts `MetricNotReady(eventId)` if the
+    ///         UMA metric for `eventId` is not yet registered (Fix D readiness gate).
     function createMarket(
         bytes32 subjectId,
         bytes32 eventId,
@@ -10,6 +14,22 @@ interface IEventMarketFactory {
         uint64 resolutionDeadline,
         uint256 initialLiquidity,
         uint256 lmsrB
+    )
+        external
+        returns (address);
+
+    /// @notice Create a market with an explicit resolution source (`rc.source`): UMA (subjective,
+    ///         other `rc` fields ignored) or ORACLE_ROUTER (objective metric + threshold +
+    ///         comparator). Reverts `MetricNotReady` if the declared metric is not registered/active.
+    function createMarketWithResolution(
+        bytes32 subjectId,
+        bytes32 eventId,
+        uint8 eventClass,
+        string calldata question,
+        uint64 resolutionDeadline,
+        uint256 initialLiquidity,
+        uint256 lmsrB,
+        IEventMarket.ResolutionConfig calldata rc
     )
         external
         returns (address);

@@ -13,8 +13,8 @@ import {EventMarketFactory} from "../../src/events/EventMarketFactory.sol";
 import {IFeedbackController} from "../../src/feedback/IFeedbackController.sol";
 import {UMAAdapter} from "../../src/oracle/UMAAdapter.sol";
 
-import {MockUSDC} from "../mocks/MockUSDC.sol";
 import {MockFeedbackController, MockUMAAdapter} from "../events/mocks/MockEventDeps.sol";
+import {MockUSDC} from "../mocks/MockUSDC.sol";
 import {EventNavHandler} from "./EventNavHandler.sol";
 
 /// @title EventNavInvariants — fuzz the event-NAV accounting with a live market.
@@ -53,8 +53,7 @@ contract EventNavInvariants is Test {
                 new ERC1967Proxy(
                     address(vaultImpl),
                     abi.encodeCall(
-                        LPVault.initialize,
-                        (IERC20(address(usdc)), governance, operator, TIMELOCK, "pm LP", "pmUSDC")
+                        LPVault.initialize, (IERC20(address(usdc)), governance, operator, TIMELOCK, "pm LP", "pmUSDC")
                     )
                 )
             )
@@ -105,7 +104,9 @@ contract EventNavInvariants is Test {
         vm.prank(lps[0]);
         vault.deposit(3_000_000 * ONE_USDC, lps[0]);
         vm.prank(governance);
-        market = EventMarket(factory.createMarket(keccak256("inv.event"), keccak256("inv.event"), uint8(1), "Q?", DEADLINE, 0, LMSR_B));
+        market = EventMarket(
+            factory.createMarket(keccak256("inv.event"), keccak256("inv.event"), uint8(1), "Q?", DEADLINE, 0, LMSR_B)
+        );
 
         handler = new EventNavHandler(vault, market, usdc, lps, traders);
         targetContract(address(handler));

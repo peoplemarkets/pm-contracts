@@ -24,6 +24,14 @@ interface IFeedbackController {
     /// @notice Event classes per spec §2 line 81-89. Coefficients indexed by this enum.
     /// @dev    `UNSET` is the zero value and is never a valid input — it lets us detect the
     ///         "field never written" state and reject calls that did not populate `eventClass`.
+    /// @dev    APPEND-ONLY ENUM. This enum is stored as a `uint8` in `MarketParams.eventClass`
+    ///         on every live EventMarket clone and cast back to `EventClass` at resolution time.
+    ///         Coefficients are held in a mapping KEYED BY THE ENUM VALUE (not a storage slot), so
+    ///         appending new members shifts NOTHING and is fully layout-safe on the live proxy.
+    ///         NEVER insert or reorder members — doing so would silently reinterpret the stored
+    ///         `uint8 eventClass` on already-created clones. Only ever add to the END.
+    ///         Members [10..16] were APPENDED in the launch-critical batch (Fix A): election +
+    ///         sports result classes plus objective-milestone symmetry (Fix B).
     enum EventClass {
         UNSET,
         BREAKUP_DIVORCE,
@@ -34,7 +42,15 @@ interface IFeedbackController {
         AWARD_WIN,
         SCANDAL,
         BRAND_DEAL,
-        LEGAL_FILING
+        LEGAL_FILING,
+        // ---- APPENDED (Fix A: elections + sports; Fix B: objective-milestone symmetry) ----
+        ELECTION_WIN, // 10 — subject's election resolved in their favour (nudges UP)
+        ELECTION_LOSS, // 11 — a "loss"-valence election class; YES=loss-happened nudges DOWN
+        SPORTS_WIN, // 12 — subject's sporting event resolved in their favour (nudges UP)
+        SPORTS_LOSS, // 13 — a "loss"-valence sports class; YES=loss-happened nudges DOWN
+        EVENT_CANCELLED, // 14 — VOID-adjacent cancellation; mild negative
+        MILESTONE_HIT, // 15 — objective YES milestone reached (nudges UP)
+        MILESTONE_MISS // 16 — objective NO / milestone missed (nudges DOWN)
     }
 
     /// @notice Resolution input passed from the off-chain resolver to `applyResolution`.
@@ -67,6 +83,16 @@ interface IFeedbackController {
     /// @notice Set the coefficient (signed, 1e18 scale) for `eventClass`. Range
     ///         `[-1e18, 1e18]`. `UNSET` cannot be configured.
     function setCoefficient(EventClass eventClass, int256 coefficient_e18) external;
+
+    /// @notice One-time, idempotent, governance-only seeder for the APPENDED launch-critical event
+    ///         classes (ELECTION_*, SPORTS_*, EVENT_CANCELLED, MILESTONE_*). Writes the default
+    ///         coefficient for each of those classes ONLY IF it is currently unset (== 0), so it is
+    ///         safe to call post-upgrade during the ceremony and safe to re-run. It NEVER touches
+    ///         the nine original classes and NEVER overwrites a governance-tuned value. Existing
+    ///         `setCoefficient` remains the re-tune lever.
+    /// @dev    Required because the live FeedbackController proxy already ran `initialize()`; the
+    ///         new-class defaults cannot be seeded there. This function backfills them exactly once.
+    function seedV2Coefficients() external;
 
     /// @notice Set the per-resolution impulse cap (basis points of mark). Range `[100, 5000]`.
     function setImpulseCapBps(uint16 capBps) external;
@@ -147,6 +173,9 @@ interface IFeedbackController {
         address indexed writer
     );
     event CoefficientSet(EventClass indexed eventClass, int256 oldCoeff, int256 newCoeff);
+    /// @notice Emitted once by `seedV2Coefficients` summarising how many appended-class coefficients
+    ///         were backfilled (0 on a re-run where everything was already set).
+    event V2CoefficientsSeeded(uint256 written);
     event ImpulseCapBpsSet(uint16 oldBps, uint16 newBps);
     event LateMoveParamsSet(uint64 denominator, uint64 slope, uint16 maxDiscountBps);
     /// @notice Emitted by the timelocked PerpEngine pointer-rotation dance.

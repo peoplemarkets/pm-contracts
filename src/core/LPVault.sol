@@ -14,8 +14,8 @@ import {UUPSUpgradeable} from "@openzeppelin/contracts-upgradeable/proxy/utils/U
 
 import {ReentrancyGuard} from "solady/utils/ReentrancyGuard.sol";
 
-import {VaultStorage} from "../libraries/StorageLib.sol";
 import {IEventMarket} from "../events/IEventMarket.sol";
+import {VaultStorage} from "../libraries/StorageLib.sol";
 import {IInsuranceFund} from "./IInsuranceFund.sol";
 import {ILPVault} from "./ILPVault.sol";
 

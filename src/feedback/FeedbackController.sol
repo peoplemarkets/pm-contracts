@@ -108,6 +108,21 @@ contract FeedbackController is Initializable, UUPSUpgradeable, ReentrancyGuard, 
     int256 internal constant DEFAULT_COEFF_BRAND_DEAL = 6e16; // +0.06
     int256 internal constant DEFAULT_COEFF_LEGAL_FILING = -7e16; // -0.07
 
+    /// @dev Launch-critical APPENDED classes (Fix A + Fix B). Signed 1e18 coefficients applied as
+    ///      `coeff × outcomeScore` where a YES resolution scores +1e18 and NO scores -1e18. All are
+    ///      chosen an order of magnitude below the ±1500bps impulse cap so the score sign and the
+    ///      late-move discount dominate — an election/sports result nudges, it never slams.
+    ///        - WIN classes are POSITIVE: YES (+1e18) → up. A "loss did not happen" NO on a *_LOSS
+    ///          class (-1e18 × negative coeff) → up; the loss happening (YES) → down.
+    ///      Magnitudes: election result > sports game > objective milestone > cancellation.
+    int256 internal constant DEFAULT_COEFF_ELECTION_WIN = 12e16; // +0.12 → +120bps raw
+    int256 internal constant DEFAULT_COEFF_ELECTION_LOSS = -12e16; // -0.12 (symmetric, loss-valence)
+    int256 internal constant DEFAULT_COEFF_SPORTS_WIN = 8e16; // +0.08
+    int256 internal constant DEFAULT_COEFF_SPORTS_LOSS = -8e16; // -0.08
+    int256 internal constant DEFAULT_COEFF_EVENT_CANCELLED = -3e16; // -0.03 (mild, VOID-adjacent)
+    int256 internal constant DEFAULT_COEFF_MILESTONE_HIT = 7e16; // +0.07 (objective YES)
+    int256 internal constant DEFAULT_COEFF_MILESTONE_MISS = -5e16; // -0.05 (objective NO)
+
     /// @custom:oz-upgrades-unsafe-allow constructor
     constructor() {
         _disableInitializers();
@@ -158,6 +173,15 @@ contract FeedbackController is Initializable, UUPSUpgradeable, ReentrancyGuard, 
         s.coefficients_e18[EventClass.SCANDAL] = DEFAULT_COEFF_SCANDAL;
         s.coefficients_e18[EventClass.BRAND_DEAL] = DEFAULT_COEFF_BRAND_DEAL;
         s.coefficients_e18[EventClass.LEGAL_FILING] = DEFAULT_COEFF_LEGAL_FILING;
+        // Launch-critical appended classes (Fix A + Fix B). Fresh deploys get them here; the live
+        // already-initialized proxy backfills them via the idempotent `seedV2Coefficients()`.
+        s.coefficients_e18[EventClass.ELECTION_WIN] = DEFAULT_COEFF_ELECTION_WIN;
+        s.coefficients_e18[EventClass.ELECTION_LOSS] = DEFAULT_COEFF_ELECTION_LOSS;
+        s.coefficients_e18[EventClass.SPORTS_WIN] = DEFAULT_COEFF_SPORTS_WIN;
+        s.coefficients_e18[EventClass.SPORTS_LOSS] = DEFAULT_COEFF_SPORTS_LOSS;
+        s.coefficients_e18[EventClass.EVENT_CANCELLED] = DEFAULT_COEFF_EVENT_CANCELLED;
+        s.coefficients_e18[EventClass.MILESTONE_HIT] = DEFAULT_COEFF_MILESTONE_HIT;
+        s.coefficients_e18[EventClass.MILESTONE_MISS] = DEFAULT_COEFF_MILESTONE_MISS;
 
         emit Initialized(governance_, perpEngine_, oracleRouter_);
     }
@@ -274,6 +298,34 @@ contract FeedbackController is Initializable, UUPSUpgradeable, ReentrancyGuard, 
         int256 old = s.coefficients_e18[eventClass];
         s.coefficients_e18[eventClass] = coefficient_e18;
         emit CoefficientSet(eventClass, old, coefficient_e18);
+    }
+
+    /// @inheritdoc IFeedbackController
+    /// @dev Idempotent, governance-only. Backfills the launch-critical appended-class defaults on a
+    ///      proxy that already ran `initialize()`. Each class is written ONLY if its current
+    ///      coefficient is 0 (never configured), so a re-run is a no-op and a governance-tuned value
+    ///      is never clobbered. Emits `CoefficientSet` per class actually written plus a summary
+    ///      `V2CoefficientsSeeded`.
+    function seedV2Coefficients() external onlyGovernance {
+        Layout storage s = _s();
+        uint256 written;
+        written += _seedIfUnset(s, EventClass.ELECTION_WIN, DEFAULT_COEFF_ELECTION_WIN);
+        written += _seedIfUnset(s, EventClass.ELECTION_LOSS, DEFAULT_COEFF_ELECTION_LOSS);
+        written += _seedIfUnset(s, EventClass.SPORTS_WIN, DEFAULT_COEFF_SPORTS_WIN);
+        written += _seedIfUnset(s, EventClass.SPORTS_LOSS, DEFAULT_COEFF_SPORTS_LOSS);
+        written += _seedIfUnset(s, EventClass.EVENT_CANCELLED, DEFAULT_COEFF_EVENT_CANCELLED);
+        written += _seedIfUnset(s, EventClass.MILESTONE_HIT, DEFAULT_COEFF_MILESTONE_HIT);
+        written += _seedIfUnset(s, EventClass.MILESTONE_MISS, DEFAULT_COEFF_MILESTONE_MISS);
+        emit V2CoefficientsSeeded(written);
+    }
+
+    /// @dev Writes `coeff` for `ec` iff its current stored coefficient is 0. Returns 1 if written,
+    ///      0 otherwise. Only ever called with the appended launch-critical classes.
+    function _seedIfUnset(Layout storage s, EventClass ec, int256 coeff) internal returns (uint256) {
+        if (s.coefficients_e18[ec] != 0) return 0;
+        s.coefficients_e18[ec] = coeff;
+        emit CoefficientSet(ec, int256(0), coeff);
+        return 1;
     }
 
     /// @inheritdoc IFeedbackController

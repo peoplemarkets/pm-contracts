@@ -99,6 +99,8 @@ contract EventMarketTest is Test {
     // ------------------------------------------------------------------------------------------
 
     function _createMarket(bytes32 eventId) internal returns (EventMarket m) {
+        // Fix D: the readiness gate requires the UMA metric registered before creation.
+        uma.setRegistered(eventId, true);
         vm.prank(governance);
         address addr = factory.createMarket(SUBJECT_ID, eventId, uint8(1), "Will Drake win?", DEADLINE, 0, LMSR_B);
         m = EventMarket(addr);

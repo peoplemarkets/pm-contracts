@@ -9,6 +9,7 @@ import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol
 
 import {ILPVault} from "../core/ILPVault.sol";
 import {IFeedbackController} from "../feedback/IFeedbackController.sol";
+import {IOracleRouter} from "../oracle/IOracleRouter.sol";
 import {UMAAdapter} from "../oracle/UMAAdapter.sol";
 import {EventMarket} from "./EventMarket.sol";
 import {IEventMarket} from "./IEventMarket.sol";
@@ -81,6 +82,10 @@ contract EventMarketFactory is Initializable, UUPSUpgradeable, IEventMarketFacto
     error OperatorNotSet(address operator);
     error PendingImplementationExists(address implementation);
     error NoPendingImplementation();
+    /// @dev Fix D (resolution-readiness gate): thrown by `createMarket*` when the market's
+    ///      resolution metric is not yet registered/ready, so it could never settle. `id` is the
+    ///      UMA `eventId` (UMA source) or the OracleRouter `metricId` (ORACLE_ROUTER source).
+    error MetricNotReady(bytes32 id);
 
     /// @custom:oz-upgrades-unsafe-allow constructor
     constructor() {
@@ -114,6 +119,10 @@ contract EventMarketFactory is Initializable, UUPSUpgradeable, IEventMarketFacto
         _;
     }
 
+    /// @notice Create a market resolved via the DEFAULT UMA path (unchanged 7-arg signature; ABI +
+    ///         existing tests untouched). Reverts `MetricNotReady` if the UMA metric for `eventId`
+    ///         is not yet registered (Fix D readiness gate — closes the trapped-funds trap on the
+    ///         default path too).
     function createMarket(
         bytes32 subjectId,
         bytes32 eventId,
@@ -127,7 +136,65 @@ contract EventMarketFactory is Initializable, UUPSUpgradeable, IEventMarketFacto
         onlyGovernance
         returns (address)
     {
+        // Empty ResolutionConfig => source == UMA (zero-value default). The legacy behaviour.
+        IEventMarket.ResolutionConfig memory rc;
+        return _create(subjectId, eventId, eventClass, question, resolutionDeadline, initialLiquidity, lmsrB, rc);
+    }
+
+    /// @notice Create a market with an explicit resolution source. Pass `rc.source == UMA` for the
+    ///         subjective path (`rc`'s other fields ignored) or `rc.source == ORACLE_ROUTER` for an
+    ///         objective numeric metric + threshold + comparator. Same first 7 args as `createMarket`
+    ///         plus the config; a distinct selector so the legacy ABI is preserved. Reverts
+    ///         `MetricNotReady` if the declared metric is not registered/active (Fix D).
+    function createMarketWithResolution(
+        bytes32 subjectId,
+        bytes32 eventId,
+        uint8 eventClass,
+        string calldata question,
+        uint64 resolutionDeadline,
+        uint256 initialLiquidity,
+        uint256 lmsrB,
+        IEventMarket.ResolutionConfig calldata rc
+    )
+        external
+        onlyGovernance
+        returns (address)
+    {
+        return _create(subjectId, eventId, eventClass, question, resolutionDeadline, initialLiquidity, lmsrB, rc);
+    }
+
+    /// @dev Shared creation path for both entrypoints. Runs the Fix D resolution-readiness gate
+    ///      BEFORE any cloning/funding, then clones + `initializeV2`s + seeds the market. Funnelling
+    ///      both public entrypoints through here guarantees the readiness gate cannot be bypassed.
+    function _create(
+        bytes32 subjectId,
+        bytes32 eventId,
+        uint8 eventClass,
+        string memory question,
+        uint64 resolutionDeadline,
+        uint256 initialLiquidity,
+        uint256 lmsrB,
+        IEventMarket.ResolutionConfig memory rc
+    )
+        internal
+        returns (address)
+    {
         require(markets[eventId] == address(0), "EventMarketFactory: already exists");
+
+        // --- Fix D: resolution-readiness gate. A market whose metric can never settle would trap
+        // funds forever; refuse to create it. Checked for BOTH sources, BEFORE cloning/funding. ---
+        if (rc.source == IEventMarket.ResolutionSource.UMA) {
+            // eventId IS the UMA metricId. It must be registered (propose->activate on UMAAdapter).
+            if (!umaAdapter.metricOf(eventId).registered) revert MetricNotReady(eventId);
+        } else {
+            // ORACLE_ROUTER: the metric must be registered/active on the router.
+            if (IOracleRouter(rc.oracleRouter).configOf(rc.metricId).sourceType == IOracleRouter.SourceType.UNSET) {
+                revert MetricNotReady(rc.metricId);
+            }
+            // Coherence: an objective settle guarded by settleNotBefore must be reachable at/after
+            // the market's own resolution deadline.
+            require(rc.settleNotBefore <= resolutionDeadline, "EventMarketFactory: settleNotBefore > deadline");
+        }
 
         address clone = Clones.clone(marketImplementation);
 
@@ -149,7 +216,8 @@ contract EventMarketFactory is Initializable, UUPSUpgradeable, IEventMarketFacto
         // live (`fundEventMarket`) the clone can already answer `currentRecoverable()` (needs usdc /
         // umaAdapter / eventId set). The brief intra-tx window where a registered clone holds 0 USDC
         // is harmless: it is atomic and no external `freeAssets`/NAV read happens between the calls.
-        EventMarket(clone).initialize(usdc, umaAdapter, params);
+        // initializeV2 with rc.source == UMA is byte-for-byte the legacy behaviour.
+        EventMarket(clone).initializeV2(usdc, umaAdapter, params, rc);
 
         // Pull seed liquidity from LPVault (registers `clone` in the live NAV set), then forward it.
         lpVault.fundEventMarket(clone, originalSeed);
@@ -217,7 +285,9 @@ contract EventMarketFactory is Initializable, UUPSUpgradeable, IEventMarketFacto
     /// @inheritdoc IEventMarketFactory
     function proposeSetMarketImplementation(address newImpl) external onlyGovernance {
         if (newImpl == address(0) || newImpl.code.length == 0) revert InvalidConfig();
-        if (pendingMarketImplementationActivatesAt != 0) revert PendingImplementationExists(pendingMarketImplementation);
+        if (pendingMarketImplementationActivatesAt != 0) {
+            revert PendingImplementationExists(pendingMarketImplementation);
+        }
         uint64 activatesAt = uint64(block.timestamp + timelockDelay);
         pendingMarketImplementation = newImpl;
         pendingMarketImplementationActivatesAt = activatesAt;
