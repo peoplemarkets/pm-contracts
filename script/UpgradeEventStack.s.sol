@@ -12,6 +12,7 @@ import {FeedbackController} from "../src/feedback/FeedbackController.sol";
 import {IFeedbackController} from "../src/feedback/IFeedbackController.sol";
 
 import {UUPSUpgradeable} from "@openzeppelin/contracts-upgradeable/proxy/utils/UUPSUpgradeable.sol";
+import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 
 /// @title  UpgradeEventStack — in-place upgrade ceremony for the LIVE Base Sepolia event-market stack.
 ///
@@ -180,6 +181,7 @@ contract UpgradeEventStack is Script {
         uint256 ppsBefore = vault.convertToAssets(1e18);
         uint256 pcBefore = vault.positionCollateral();
         uint256 faBefore = vault.freeAssets();
+        uint256 usdcBefore = IERC20(vault.asset()).balanceOf(address(vault));
         console2.log("PRE  totalAssets        :", taBefore);
         console2.log("PRE  pps(1e18 shares)   :", ppsBefore);
         console2.log("PRE  positionCollateral :", pcBefore);
@@ -201,12 +203,19 @@ contract UpgradeEventStack is Script {
         console2.log("POST positionCollateral :", pcAfter);
         console2.log("POST freeAssets         :", faAfter);
 
-        // Perp-money-safety guard: with NO live event markets present, NAV accounting is byte-identical.
-        require(taAfter == taBefore, "MONEY-SAFETY FAIL: totalAssets changed");
-        require(ppsAfter == ppsBefore, "MONEY-SAFETY FAIL: share price changed");
+        // Money-safety guard. The upgrade calls only upgradeToAndCall (no transfers), so the vault's
+        // real USDC and perp collateral MUST be untouched. totalAssets / share price legitimately
+        // DROP: the #13 fix stops the pre-upgrade impl over-marking an outstanding event-market seed
+        // at face value (a correction, not a loss). So we forbid an INCREASE (NAV inflation) and any
+        // over-marking above real backing — NOT any change.
+        uint256 usdcAfter = IERC20(vault.asset()).balanceOf(address(vault));
         require(pcAfter == pcBefore, "MONEY-SAFETY FAIL: positionCollateral changed");
+        require(usdcAfter == usdcBefore, "MONEY-SAFETY FAIL: vault USDC balance moved");
+        require(taAfter <= taBefore, "MONEY-SAFETY FAIL: totalAssets INCREASED (NAV inflation)");
+        require(ppsAfter <= ppsBefore, "MONEY-SAFETY FAIL: share price INCREASED (NAV inflation)");
+        require(taAfter <= usdcAfter + pcAfter, "MONEY-SAFETY FAIL: totalAssets over-marks USDC+collateral");
         console2.log("--------------------------------------");
-        console2.log("Vault perp reads UNCHANGED across upgrade. Next: PHASE 3 proposeSetMarketImpl().");
+        console2.log("Perp collateral + vault USDC UNTOUCHED; NAV corrected down, no inflation. Next: PHASE 3.");
     }
 
     // ------------------------------------------------------------------------------------------
