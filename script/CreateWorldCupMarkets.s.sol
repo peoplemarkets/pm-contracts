@@ -4,8 +4,8 @@ pragma solidity 0.8.24;
 import "forge-std/Script.sol";
 import "forge-std/console2.sol";
 
-import {EventMarketFactory} from "../src/events/EventMarketFactory.sol";
 import {LPVault} from "../src/core/LPVault.sol";
+import {EventMarketFactory} from "../src/events/EventMarketFactory.sol";
 import {LMSRMath} from "../src/events/LMSRMath.sol";
 
 /// @title  CreateWorldCupMarkets — seed a handful of World-Cup event markets on the deployed factory.
@@ -76,9 +76,8 @@ contract CreateWorldCupMarkets is Script {
         for (uint256 i = 0; i < defs.length; i++) {
             bytes32 subjectId = keccak256(bytes(defs[i].name));
             bytes32 eventId = keccak256(abi.encodePacked(defs[i].name, "-WC2026-WIN"));
-            address market = factory.createMarket(
-                subjectId, eventId, EVENT_CLASS_UNSET, defs[i].question, deadline, 0, lmsrB
-            );
+            address market =
+                factory.createMarket(subjectId, eventId, EVENT_CLASS_UNSET, defs[i].question, deadline, 0, lmsrB);
             console2.log("--------------------------------------");
             console2.log(defs[i].name);
             console2.log("  market  :", market);

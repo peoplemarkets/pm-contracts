@@ -71,10 +71,12 @@ contract DeployEventMarkets is Script {
 
         console2.log("------------------------------------------");
         console2.log("Deployment Complete. Next steps (governance + ops, NOT done here):");
-        console2.log("1. Upgrade LPVault proxy:");
-        console2.log("   LPVault(proxy).upgradeTo(New LPVault Impl)");
-        console2.log("2. Grant EVENT_MARKET_ROLE to the Factory:");
-        console2.log("   LPVault(proxy).grantRole(EVENT_MARKET_ROLE, EventMarketFactory)");
+        console2.log("1. Upgrade LPVault proxy (only if its impl predates the event surface):");
+        console2.log("   UUPSUpgradeable(proxy).upgradeToAndCall(New LPVault Impl, \"\")");
+        console2.log("2. Wire the Factory into the vault (governance, timelocked):");
+        console2.log("   LPVault(proxy).proposeSetEventMarketFactory(EventMarketFactory)");
+        console2.log("   ...wait LPVault.timelockDelay seconds...");
+        console2.log("   LPVault(proxy).activateSetEventMarketFactory()");
         console2.log("3. Enable the custodial path (layers i + ii) via EnableEventOperator:");
         console2.log("   export EVENT_MARKET_FACTORY=<factory proxy above>");
         console2.log("   export EVENT_MARKET_ROUTER=<router proxy above>");
