@@ -1,0 +1,41 @@
+name: nightly deep fuzz
+
+# The deep-fuzz/invariant sweep that used to (nominally) run on every PR under
+# profile.ci — it never actually completed there: 50k fuzz runs plus a 5k x 200
+# invariant campaign cannot fit a PR job's time budget on a GitHub runner, so
+# every run since 2026-07-08 died at the timeout and the gate was red air
+# cover. Here it gets a real budget on a schedule, plus manual dispatch for
+# pre-release sweeps.
+
+on:
+  schedule:
+    - cron: "17 2 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  FOUNDRY_PROFILE: deep
+
+jobs:
+  deep-fuzz:
+    name: deep fuzz · invariants
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install Foundry
+        uses: foundry-rs/foundry-toolchain@v1
+        with:
+          version: stable
+
+      - name: Show forge version
+        run: forge --version
+
+      - name: Deep fuzz + invariant sweep
+        run: forge test -vvv

@@ -34,8 +34,21 @@ depth = 100
 fail_on_revert = false
 call_override = false
 
+# PR-gate profile: same rigor as profile.default (what developers run
+# locally), tuned to FIT the ci job's time budget. The old 50k-fuzz settings
+# never completed on a GitHub runner — every main-branch run since 2026-07-08
+# died at the 30-minute job timeout (twice over: forge coverage reran the
+# whole suite unoptimized at the same fuzz count), so merges happened on red
+# and the gate protected nothing. Deep rigor lives in profile.deep, run
+# nightly with a real time budget (.github/workflows/nightly-deep.yml).
 [profile.ci]
-fuzz = { runs = 50_000 }
+fuzz = { runs = 10_000, max_test_rejects = 200_000 }
+invariant = { runs = 1_000, depth = 100 }
+verbosity = 3
+
+# Nightly deep-fuzz profile — the former ci settings.
+[profile.deep]
+fuzz = { runs = 50_000, max_test_rejects = 1_000_000 }
 invariant = { runs = 5_000, depth = 200 }
 verbosity = 3
 

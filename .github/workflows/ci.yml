@@ -16,7 +16,9 @@ jobs:
   build-and-test:
     name: build · fmt · test
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    # Headroom over the observed green-path duration, NOT a budget to grow
+    # into — the deep-fuzz sweep lives in nightly-deep.yml.
+    timeout-minutes: 45
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -44,7 +46,13 @@ jobs:
         # Coverage is informational on every push; the 100% line / 95% branch gate is enforced
         # in a follow-up job once we lock in lcov tooling. We still want a coverage signal in
         # every PR so reviewers can see whether new code has been exercised.
+        # Runs on the LITE profile: forge coverage rebuilds without the
+        # optimizer and reruns the whole suite, so at the gate profile's fuzz
+        # count it alone blew the job's time budget (part of why every run
+        # since 2026-07-08 timed out at 30 minutes).
         run: forge coverage --report summary --no-match-coverage "test/.*|script/.*"
+        env:
+          FOUNDRY_PROFILE: lite
         continue-on-error: true
 
   slither:
