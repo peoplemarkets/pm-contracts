@@ -322,6 +322,20 @@ contract LiquidationADLTest is Test {
         liqEngine.adl(badId, cps);
     }
 
+    function test_Adl_RevertOnStaleMark() public {
+        bytes32 badId = _open(badTrader, IPerpEngine.Side.LONG, 100_000 * ONE_USDC, 400_000 * ONE_USDC);
+        bytes32 cpId = _open(cpTrader, IPerpEngine.Side.SHORT, 100_000 * ONE_USDC, 400_000 * ONE_USDC);
+        _crashTo20();
+        (, uint64 updatedAt) = engine.markOf(SUBJECT_ID);
+        vm.warp(uint256(updatedAt) + uint256(engine.markStaleAfter()) + 1);
+
+        bytes32[] memory cps = new bytes32[](1);
+        cps[0] = cpId;
+        vm.prank(liquidator);
+        vm.expectRevert(abi.encodeWithSelector(ILiquidationEngine.MarkStale.selector, SUBJECT_ID, updatedAt));
+        liqEngine.adl(badId, cps);
+    }
+
     /// @dev Only registered liquidators may call ADL.
     function test_Adl_RevertOnNonLiquidator() public {
         bytes32 badId = _open(badTrader, IPerpEngine.Side.LONG, 100_000 * ONE_USDC, 400_000 * ONE_USDC);

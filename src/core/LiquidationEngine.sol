@@ -19,9 +19,9 @@ import {IPerpEngine} from "./IPerpEngine.sol";
 /// @title  LiquidationEngine — v0 of the 5-tier waterfall (spec §3 lines 141-155).
 ///
 /// @notice The sole entry point for liquidating positions that have crossed the liquidation
-///         buffer. Implements Tiers 1-4 in this wave (PARTIAL, FULL, INSURANCE, SOCIALIZATION).
-///         Tier 5 (ADL) is deferred: any path that would require it reverts with
-///         `ADLNotImplemented`. The ADL queue iteration over open positions is gated for v1.
+///         buffer. Implements all five tiers: PARTIAL, FULL, INSURANCE, SOCIALIZATION, and ADL.
+///         ADL consumes keeper-supplied counterparties; global priority ordering remains an
+///         off-chain keeper responsibility.
 ///
 /// @dev    Why each tier:
 ///           1. PARTIAL — close 25% of the position, restore equity to MM + 100bps buffer.
@@ -36,7 +36,8 @@ import {IPerpEngine} from "./IPerpEngine.sol";
 ///              `settleLiquidation`. Capped at `socializationCapBps × totalAssets()` per single
 ///              liquidation event. Excess reverts `SocializationCapExceeded` — that residual
 ///              would land on Tier 5 in v1.
-///           5. ADL — deferred. Reverts.
+///           5. ADL — close a bankrupt position and profitable opposite-side counterparties at
+///              the bankruptcy price when the normal waterfall would breach its cap.
 ///
 /// @dev    Liquidators are a registered set (timelocked add, immediate remove) — matches the
 ///         mark-writer pattern. The bounty is the incentive; gating to a registered set caps
@@ -180,7 +181,7 @@ contract LiquidationEngine is Initializable, UUPSUpgradeable, ReentrancyGuard, I
     }
 
     // ------------------------------------------------------------------------------------------
-    // The waterfall — Tier 1, 2, 3, 4 (Tier 5 reverts)
+    // The waterfall — Tiers 1-4, with explicit Tier-5 ADL below
     // ------------------------------------------------------------------------------------------
 
     /// @inheritdoc ILiquidationEngine
@@ -196,8 +197,9 @@ contract LiquidationEngine is Initializable, UUPSUpgradeable, ReentrancyGuard, I
         IPerpEngine.Position memory pos = pe.positionOf(positionId);
         if (pos.size == 0) revert PositionNotFound(positionId);
 
-        (uint256 mark,) = pe.markOf(pos.subjectId);
+        (uint256 mark, uint64 markUpdatedAt) = pe.markOf(pos.subjectId);
         if (mark == 0) revert NotUnderBuffer(positionId);
+        _requireFreshMark(pe, pos.subjectId, markUpdatedAt);
 
         // Liquidation gate: position must be below MM + liquidation buffer. We re-derive the gate
         // here using LiquidationMath rather than calling MarginEngine, because MarginEngine
@@ -407,8 +409,9 @@ contract LiquidationEngine is Initializable, UUPSUpgradeable, ReentrancyGuard, I
         if (bad.size == 0) revert PositionNotFound(badPositionId);
         if (bad.owner == msg.sender) revert ADLSelfLiquidation(msg.sender);
 
-        (uint256 mark,) = pe.markOf(bad.subjectId);
+        (uint256 mark, uint64 markUpdatedAt) = pe.markOf(bad.subjectId);
         if (mark == 0) revert NotUnderBuffer(badPositionId);
+        _requireFreshMark(pe, bad.subjectId, markUpdatedAt);
 
         // Gate 1 — the bad position must be under the liquidation buffer.
         (, uint16 mmBps, uint16 bufBps,,) = IMarginEngine(s.marginEngine).marginParams();
@@ -468,6 +471,15 @@ contract LiquidationEngine is Initializable, UUPSUpgradeable, ReentrancyGuard, I
         uint256 socialized = shortfall - drawn;
         uint256 cap = (IERC4626(s.lpVault).totalAssets() * uint256(s.socializationCapBps)) / BPS_DENOMINATOR;
         if (socialized <= cap) revert ADLNotRequired(badPositionId);
+    }
+
+    /// @dev Use PerpEngine's single canonical staleness threshold so risk-increasing trades,
+    ///      liquidations, and ADL cannot disagree about whether a mark is usable. The exact
+    ///      boundary remains valid, matching PerpEngine._readFreshMark.
+    function _requireFreshMark(IPerpEngine pe, bytes32 subjectId, uint64 updatedAt) internal view {
+        if (block.timestamp > uint256(updatedAt) + uint256(pe.markStaleAfter())) {
+            revert MarkStale(subjectId, updatedAt);
+        }
     }
 
     /// @dev Validate + force-close one counterparty at the bankruptcy price. Returns the updated

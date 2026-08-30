@@ -672,6 +672,27 @@ contract LiquidationEngineTest is Test {
         liqEngine.liquidate(positionId);
     }
 
+    function test_Liquidate_RevertOnStaleMark() public {
+        bytes32 positionId = _openLong(trader);
+        (, uint64 updatedAt) = engine.markOf(SUBJECT_ID);
+        vm.warp(uint256(updatedAt) + uint256(engine.markStaleAfter()) + 1);
+
+        vm.prank(liquidator);
+        vm.expectRevert(abi.encodeWithSelector(ILiquidationEngine.MarkStale.selector, SUBJECT_ID, updatedAt));
+        liqEngine.liquidate(positionId);
+    }
+
+    function test_Liquidate_MarkAtExactStaleBoundaryRemainsUsable() public {
+        bytes32 positionId = _openLong(trader);
+        (, uint64 updatedAt) = engine.markOf(SUBJECT_ID);
+        vm.warp(uint256(updatedAt) + uint256(engine.markStaleAfter()));
+
+        // The healthy position reaches the buffer check, proving the mark was accepted.
+        vm.prank(liquidator);
+        vm.expectRevert(abi.encodeWithSelector(ILiquidationEngine.NotUnderBuffer.selector, positionId));
+        liqEngine.liquidate(positionId);
+    }
+
     function test_Liquidate_RevertOnUnauthorized() public {
         bytes32 positionId = _openLong(trader);
         _pushMark(84 * ONE_18);
@@ -853,6 +874,7 @@ contract LiquidationEngineTest is Test {
         liqEngine.proposeAddLiquidator(trader);
         vm.warp(block.timestamp + TIMELOCK_DELAY);
         liqEngine.activateAddLiquidator(trader);
+        _pushMark(84 * ONE_18);
 
         vm.prank(trader);
         vm.expectRevert(abi.encodeWithSelector(ILPVault.LiquidatorIsTrader.selector, trader));
