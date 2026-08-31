@@ -12,14 +12,15 @@ import {IPerpEngine} from "../core/IPerpEngine.sol";
 import {IMatchedFillRouter} from "./IMatchedFillRouter.sol";
 
 /// @title MatchedFillRouter
-/// @notice Verifies two trader-signed orders and atomically opens both sides of one CLOB fill.
-/// @dev The signed maker limit is the deterministic execution price. V1 deliberately accepts
-///      full-fill OPEN orders only: the current one-position model cannot safely account for
-///      partial increases without per-lot entry/funding state. Unsupported shapes revert before
-///      any funds or positions move.
+/// @notice Verifies two trader-signed orders and atomically settles one two-sided CLOB fill.
+/// @dev The signed maker limit is the deterministic execution price. V2 matches exact base
+///      quantity so an immediate reduce-only CLOSE can bind a precise position slice without
+///      price-dependent sizing. The maker must OPEN; the taker may OPEN or CLOSE. This keeps
+///      reduce-only orders off the resting book until the matcher has live position-aware cancel
+///      logic. Unsupported shapes revert before any funds or positions move.
 contract MatchedFillRouter is Initializable, UUPSUpgradeable, EIP712, ReentrancyGuard, IMatchedFillRouter {
     bytes32 public constant ORDER_TYPEHASH = keccak256(
-        "Order(address trader,address executor,bytes32 subaccount,bytes32 subjectId,uint8 side,uint8 intent,uint256 sizeNotional,uint256 collateralAmount,uint256 limitPrice,uint256 maxFee,uint16 maxMarkDivergenceBps,uint256 nonce,uint64 deadline,bool reduceOnly,bool postOnly)"
+        "Order(address trader,address executor,bytes32 subaccount,bytes32 subjectId,bytes32 positionId,uint8 side,uint8 intent,uint256 quantity,uint256 collateralAmount,uint256 limitPrice,uint256 maxFee,uint16 maxMarkDivergenceBps,uint256 nonce,uint64 deadline,bool reduceOnly,bool postOnly)"
     );
 
     bytes32 internal constant MATCHED_FILL_ROUTER_SLOT =
@@ -35,7 +36,7 @@ contract MatchedFillRouter is Initializable, UUPSUpgradeable, EIP712, Reentrancy
         address pendingGovernance;
         uint64 pendingGovernanceActivatesAt;
         address perpEngine;
-        mapping(bytes32 orderHash => uint256 size) filledSize;
+        mapping(bytes32 orderHash => uint256 quantity) filledQuantity;
         mapping(bytes32 orderHash => bool cancelled) cancelled;
         mapping(bytes32 fillId => bool used) fillUsed;
         mapping(address trader => uint256 minimum) minimumValidNonce;
@@ -75,7 +76,7 @@ contract MatchedFillRouter is Initializable, UUPSUpgradeable, EIP712, Reentrancy
     }
 
     /// @inheritdoc IMatchedFillRouter
-    function settleOpen(
+    function settle(
         bytes32 fillId,
         Order calldata maker,
         bytes calldata makerSignature,
@@ -99,16 +100,22 @@ contract MatchedFillRouter is Initializable, UUPSUpgradeable, EIP712, Reentrancy
 
         // CEI. Any PerpEngine or vault revert unwinds these replay markers and the other leg.
         s.fillUsed[fillId] = true;
-        s.filledSize[makerHash] = maker.sizeNotional;
-        s.filledSize[takerHash] = taker.sizeNotional;
+        s.filledQuantity[makerHash] = maker.quantity;
+        s.filledQuantity[takerHash] = taker.quantity;
 
         IPerpEngine engine = IPerpEngine(s.perpEngine);
-        result.makerPositionId =
-            engine.openPositionForMatched(maker.trader, _matchedParams(maker, executionPrice, true));
-        result.takerPositionId =
-            engine.openPositionForMatched(taker.trader, _matchedParams(taker, executionPrice, false));
+        if (taker.intent == OrderIntent.CLOSE) {
+            // Release the existing exposure before opening the replacement leg. This makes the
+            // atomic fill respect final-state OI/cap risk instead of failing on a transient gross
+            // increase. A later maker revert still unwinds the close and both replay markers.
+            result.takerPositionId = _apply(engine, taker, executionPrice, false);
+            result.makerPositionId = _apply(engine, maker, executionPrice, true);
+        } else {
+            result.makerPositionId = _apply(engine, maker, executionPrice, true);
+            result.takerPositionId = _apply(engine, taker, executionPrice, false);
+        }
 
-        emit MatchedOpenSettled(
+        emit MatchedFillSettled(
             fillId,
             makerHash,
             takerHash,
@@ -116,7 +123,9 @@ contract MatchedFillRouter is Initializable, UUPSUpgradeable, EIP712, Reentrancy
             taker.trader,
             maker.subjectId,
             executionPrice,
-            maker.sizeNotional,
+            maker.quantity,
+            maker.intent,
+            taker.intent,
             result.makerPositionId,
             result.takerPositionId
         );
@@ -133,9 +142,11 @@ contract MatchedFillRouter is Initializable, UUPSUpgradeable, EIP712, Reentrancy
             revert SubjectMismatch(maker.subjectId, taker.subjectId);
         }
         if (maker.side == taker.side) revert SideMismatch(maker.side, taker.side);
-        if (maker.sizeNotional == 0 || maker.sizeNotional != taker.sizeNotional) {
-            revert FullFillRequired(maker.sizeNotional, taker.sizeNotional);
+        if (maker.quantity == 0 || maker.quantity != taker.quantity) {
+            revert FullFillRequired(maker.quantity, taker.quantity);
         }
+        if (maker.intent == OrderIntent.CLOSE) revert CloseMakerUnsupported();
+        if (taker.intent == OrderIntent.CLOSE && taker.postOnly) revert CloseMustBeImmediate();
         if (!maker.postOnly || taker.postOnly) {
             revert InvalidLiquidityRole(maker.postOnly, taker.postOnly);
         }
@@ -151,10 +162,25 @@ contract MatchedFillRouter is Initializable, UUPSUpgradeable, EIP712, Reentrancy
         view
         returns (bytes32 digest)
     {
-        if (order.intent != OrderIntent.OPEN) revert InvalidOrderIntent(order.intent);
+        if (order.intent == OrderIntent.UNSET) revert InvalidOrderIntent(order.intent);
         if (order.subaccount != bytes32(0)) revert UnsupportedSubaccount(order.subaccount);
-        if (order.reduceOnly) revert ReduceOnlyUnsupported();
-        if (order.collateralAmount == 0 || order.limitPrice == 0) revert InvalidConfig();
+        if (order.intent == OrderIntent.OPEN) {
+            if (order.positionId != bytes32(0)) revert InvalidPositionBinding(order.intent, order.positionId);
+            if (order.collateralAmount == 0) {
+                revert InvalidCollateralForIntent(order.intent, order.collateralAmount);
+            }
+            if (order.reduceOnly) revert InvalidReduceOnlyForIntent(order.intent, order.reduceOnly);
+        } else if (order.intent == OrderIntent.CLOSE) {
+            if (order.positionId == bytes32(0)) revert InvalidPositionBinding(order.intent, order.positionId);
+            if (order.collateralAmount != 0) {
+                revert InvalidCollateralForIntent(order.intent, order.collateralAmount);
+            }
+            if (!order.reduceOnly) revert InvalidReduceOnlyForIntent(order.intent, order.reduceOnly);
+            if (order.postOnly) revert CloseMustBeImmediate();
+        } else {
+            revert InvalidOrderIntent(order.intent);
+        }
+        if (order.limitPrice == 0 || order.quantity == 0) revert InvalidConfig();
         if (order.maxMarkDivergenceBps > BPS_DENOMINATOR) {
             revert MarkDivergenceBpsOutOfRange(order.maxMarkDivergenceBps);
         }
@@ -162,13 +188,29 @@ contract MatchedFillRouter is Initializable, UUPSUpgradeable, EIP712, Reentrancy
         uint256 minimum = s.minimumValidNonce[order.trader];
         if (order.nonce < minimum) revert NonceInvalid(order.trader, order.nonce, minimum);
         digest = _hashOrder(order);
-        if (s.cancelled[digest] || s.filledSize[digest] != 0) revert OrderUnavailable(digest);
+        if (s.cancelled[digest] || s.filledQuantity[digest] != 0) revert OrderUnavailable(digest);
         if (!SignatureCheckerLib.isValidSignatureNowCalldata(order.trader, digest, signature)) {
             revert InvalidSignature(order.trader, digest);
         }
     }
 
-    function _matchedParams(
+    function _apply(
+        IPerpEngine engine,
+        Order calldata order,
+        uint256 executionPrice,
+        bool isMaker
+    )
+        private
+        returns (bytes32 positionId)
+    {
+        if (order.intent == OrderIntent.OPEN) {
+            return engine.openPositionForMatched(order.trader, _matchedOpenParams(order, executionPrice, isMaker));
+        }
+        engine.closePositionForMatched(order.trader, _matchedCloseParams(order, executionPrice, isMaker));
+        return order.positionId;
+    }
+
+    function _matchedOpenParams(
         Order calldata order,
         uint256 executionPrice,
         bool isMaker
@@ -181,7 +223,29 @@ contract MatchedFillRouter is Initializable, UUPSUpgradeable, EIP712, Reentrancy
             subjectId: order.subjectId,
             side: order.side,
             collateralAmount: order.collateralAmount,
-            sizeNotional: order.sizeNotional,
+            quantity: order.quantity,
+            executionPrice: executionPrice,
+            maxMarkDivergenceBps: order.maxMarkDivergenceBps,
+            maxFee: order.maxFee,
+            deadline: order.deadline,
+            isMaker: isMaker
+        });
+    }
+
+    function _matchedCloseParams(
+        Order calldata order,
+        uint256 executionPrice,
+        bool isMaker
+    )
+        private
+        pure
+        returns (IPerpEngine.MatchedCloseParams memory p)
+    {
+        p = IPerpEngine.MatchedCloseParams({
+            subjectId: order.subjectId,
+            positionId: order.positionId,
+            side: order.side,
+            quantity: order.quantity,
             executionPrice: executionPrice,
             maxMarkDivergenceBps: order.maxMarkDivergenceBps,
             maxFee: order.maxFee,
@@ -225,9 +289,10 @@ contract MatchedFillRouter is Initializable, UUPSUpgradeable, EIP712, Reentrancy
                 order.executor,
                 order.subaccount,
                 order.subjectId,
+                order.positionId,
                 order.side,
                 order.intent,
-                order.sizeNotional,
+                order.quantity,
                 order.collateralAmount,
                 order.limitPrice,
                 order.maxFee,
@@ -242,7 +307,7 @@ contract MatchedFillRouter is Initializable, UUPSUpgradeable, EIP712, Reentrancy
     }
 
     function _domainNameAndVersion() internal pure override returns (string memory name, string memory version) {
-        return ("PeopleMarketsMatchedOrders", "1");
+        return ("PeopleMarketsMatchedOrders", "2");
     }
 
     /// @inheritdoc IMatchedFillRouter
@@ -251,8 +316,8 @@ contract MatchedFillRouter is Initializable, UUPSUpgradeable, EIP712, Reentrancy
     }
 
     /// @inheritdoc IMatchedFillRouter
-    function filledSize(bytes32 orderHash) external view returns (uint256) {
-        return _s().filledSize[orderHash];
+    function filledQuantity(bytes32 orderHash) external view returns (uint256) {
+        return _s().filledQuantity[orderHash];
     }
 
     /// @inheritdoc IMatchedFillRouter

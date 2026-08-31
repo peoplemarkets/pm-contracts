@@ -200,6 +200,22 @@ contract PerpEngine is Initializable, UUPSUpgradeable, ReentrancyGuard, IPerpEng
         return PerpInternals.openPositionForMatched(trader, p);
     }
 
+    /// @inheritdoc IPerpEngine
+    /// @dev The matched-fill router has already verified the trader signature, exact position
+    ///      binding, reduce-only flag, order direction, role, price limit, and atomic counterparty.
+    ///      The linked implementation re-checks all position-sensitive constraints at settlement.
+    function closePositionForMatched(
+        address trader,
+        MatchedCloseParams calldata p
+    )
+        external
+        nonReentrant
+        onlyRouter
+        returns (int256 realizedPnl)
+    {
+        return PerpInternals.closePositionForMatched(trader, p);
+    }
+
     /// @dev Shared open-path implementation. Both `openPosition` (where `trader == msg.sender`)
     ///      and `openPositionFor` (where `trader` is supplied by a trusted router) delegate here
     ///      so the open-side semantics stay in lockstep.

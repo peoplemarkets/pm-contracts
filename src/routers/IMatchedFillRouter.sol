@@ -8,21 +8,25 @@ import {IPerpEngine} from "../core/IPerpEngine.sol";
 interface IMatchedFillRouter {
     enum OrderIntent {
         UNSET,
-        OPEN
+        OPEN,
+        CLOSE
     }
 
     /// @notice One trader-authorized order. Every execution-sensitive field is signed.
-    /// @dev V1 supports only the zero subaccount and full-fill OPEN orders. Unsupported shapes
-    ///      fail closed instead of being reinterpreted. `executor` binds the order to the matching
-    ///      operator selected by the trader; the EIP-712 domain binds chain and router.
+    /// @dev V2 supports the zero subaccount and full-fill OPEN or immediate reduce-only CLOSE
+    ///      orders. `quantity` is absolute base quantity in the same units as `Position.size`.
+    ///      A close binds the exact position id so an old resting signature cannot unwind a later
+    ///      position. Unsupported shapes fail closed instead of being reinterpreted. `executor`
+    ///      binds the order to the matching operator; the EIP-712 domain binds chain and router.
     struct Order {
         address trader;
         address executor;
         bytes32 subaccount;
         bytes32 subjectId;
+        bytes32 positionId;
         IPerpEngine.Side side;
         OrderIntent intent;
-        uint256 sizeNotional;
+        uint256 quantity;
         uint256 collateralAmount;
         uint256 limitPrice;
         uint256 maxFee;
@@ -38,7 +42,7 @@ interface IMatchedFillRouter {
         bytes32 takerPositionId;
     }
 
-    function settleOpen(
+    function settle(
         bytes32 fillId,
         Order calldata maker,
         bytes calldata makerSignature,
@@ -52,7 +56,7 @@ interface IMatchedFillRouter {
     function invalidateNoncesBelow(uint256 newMinimum) external;
 
     function hashOrder(Order calldata order) external view returns (bytes32 digest);
-    function filledSize(bytes32 orderHash) external view returns (uint256);
+    function filledQuantity(bytes32 orderHash) external view returns (uint256);
     function isOrderCancelled(bytes32 orderHash) external view returns (bool);
     function isFillUsed(bytes32 fillId) external view returns (bool);
     function minimumValidNonce(address trader) external view returns (uint256);
@@ -67,7 +71,7 @@ interface IMatchedFillRouter {
     function cancelGovernanceTransfer() external;
 
     event Initialized(address governance, address perpEngine);
-    event MatchedOpenSettled(
+    event MatchedFillSettled(
         bytes32 indexed fillId,
         bytes32 indexed makerOrderHash,
         bytes32 indexed takerOrderHash,
@@ -75,7 +79,9 @@ interface IMatchedFillRouter {
         address taker,
         bytes32 subjectId,
         uint256 executionPrice,
-        uint256 sizeNotional,
+        uint256 quantity,
+        OrderIntent makerIntent,
+        OrderIntent takerIntent,
         bytes32 makerPositionId,
         bytes32 takerPositionId
     );
@@ -92,12 +98,16 @@ interface IMatchedFillRouter {
     error TimelockNotElapsed(uint64 readyAt);
     error InvalidOrderIntent(OrderIntent intent);
     error UnsupportedSubaccount(bytes32 subaccount);
-    error ReduceOnlyUnsupported();
+    error InvalidPositionBinding(OrderIntent intent, bytes32 positionId);
+    error InvalidCollateralForIntent(OrderIntent intent, uint256 collateralAmount);
+    error InvalidReduceOnlyForIntent(OrderIntent intent, bool reduceOnly);
+    error CloseMustBeImmediate();
+    error CloseMakerUnsupported();
     error InvalidLiquidityRole(bool makerPostOnly, bool takerPostOnly);
     error InvalidCounterparties(address maker, address taker);
     error SubjectMismatch(bytes32 makerSubject, bytes32 takerSubject);
     error SideMismatch(IPerpEngine.Side makerSide, IPerpEngine.Side takerSide);
-    error FullFillRequired(uint256 makerSize, uint256 takerSize);
+    error FullFillRequired(uint256 makerQuantity, uint256 takerQuantity);
     error DeadlineExpired(uint64 deadline);
     error UnauthorizedExecutor(address expected, address actual);
     error LimitPriceExceeded(IPerpEngine.Side side, uint256 limitPrice, uint256 executionPrice);

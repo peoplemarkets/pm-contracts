@@ -12,12 +12,14 @@ import {MatchedFillRouter} from "../src/routers/MatchedFillRouter.sol";
 contract MockMatchedPerpEngine {
     error SecondLegFailed();
 
-    struct RecordedOpen {
+    struct RecordedCall {
         address trader;
         bytes32 subjectId;
+        bytes32 positionId;
         IPerpEngine.Side side;
+        IMatchedFillRouter.OrderIntent intent;
         uint256 collateralAmount;
-        uint256 sizeNotional;
+        uint256 quantity;
         uint256 executionPrice;
         uint256 maxMarkDivergenceBps;
         uint256 maxFee;
@@ -25,7 +27,7 @@ contract MockMatchedPerpEngine {
         bool isMaker;
     }
 
-    RecordedOpen[] private _calls;
+    RecordedCall[] private _calls;
     bool public revertOnSecond;
 
     function setRevertOnSecond(bool enabled) external {
@@ -40,14 +42,16 @@ contract MockMatchedPerpEngine {
         returns (bytes32 positionId)
     {
         if (revertOnSecond && _calls.length == 1) revert SecondLegFailed();
-        positionId = keccak256(abi.encode(trader, p.subjectId, p.side, p.sizeNotional, p.executionPrice, _calls.length));
+        positionId = keccak256(abi.encode(trader, p.subjectId, p.side, p.quantity, p.executionPrice, _calls.length));
         _calls.push(
-            RecordedOpen({
+            RecordedCall({
                 trader: trader,
                 subjectId: p.subjectId,
+                positionId: positionId,
                 side: p.side,
+                intent: IMatchedFillRouter.OrderIntent.OPEN,
                 collateralAmount: p.collateralAmount,
-                sizeNotional: p.sizeNotional,
+                quantity: p.quantity,
                 executionPrice: p.executionPrice,
                 maxMarkDivergenceBps: p.maxMarkDivergenceBps,
                 maxFee: p.maxFee,
@@ -57,11 +61,38 @@ contract MockMatchedPerpEngine {
         );
     }
 
+    function closePositionForMatched(
+        address trader,
+        IPerpEngine.MatchedCloseParams calldata p
+    )
+        external
+        returns (int256 realizedPnl)
+    {
+        if (revertOnSecond && _calls.length == 1) revert SecondLegFailed();
+        _calls.push(
+            RecordedCall({
+                trader: trader,
+                subjectId: p.subjectId,
+                positionId: p.positionId,
+                side: p.side,
+                intent: IMatchedFillRouter.OrderIntent.CLOSE,
+                collateralAmount: 0,
+                quantity: p.quantity,
+                executionPrice: p.executionPrice,
+                maxMarkDivergenceBps: p.maxMarkDivergenceBps,
+                maxFee: p.maxFee,
+                deadline: p.deadline,
+                isMaker: p.isMaker
+            })
+        );
+        return 0;
+    }
+
     function callCount() external view returns (uint256) {
         return _calls.length;
     }
 
-    function callAt(uint256 index) external view returns (RecordedOpen memory) {
+    function callAt(uint256 index) external view returns (RecordedCall memory) {
         return _calls[index];
     }
 }
@@ -88,7 +119,7 @@ contract MatchedFillRouterTest is Test {
     uint256 internal constant TAKER_KEY = 0xB0B;
     uint32 internal constant TIMELOCK_DELAY = 1 hours;
     bytes32 internal constant SUBJECT_ID = keccak256("drake");
-    uint256 internal constant SIZE_NOTIONAL = 10_000e6;
+    uint256 internal constant QUANTITY = 100e6;
     uint256 internal constant MAKER_LIMIT = 100e18;
 
     address internal governance = makeAddr("governance");
@@ -117,9 +148,10 @@ contract MatchedFillRouterTest is Test {
             executor: executor,
             subaccount: bytes32(0),
             subjectId: SUBJECT_ID,
+            positionId: bytes32(0),
             side: IPerpEngine.Side.LONG,
             intent: IMatchedFillRouter.OrderIntent.OPEN,
-            sizeNotional: SIZE_NOTIONAL,
+            quantity: QUANTITY,
             collateralAmount: 2_000e6,
             limitPrice: MAKER_LIMIT,
             maxFee: 20e6,
@@ -137,9 +169,10 @@ contract MatchedFillRouterTest is Test {
             executor: executor,
             subaccount: bytes32(0),
             subjectId: SUBJECT_ID,
+            positionId: bytes32(0),
             side: IPerpEngine.Side.SHORT,
             intent: IMatchedFillRouter.OrderIntent.OPEN,
-            sizeNotional: SIZE_NOTIONAL,
+            quantity: QUANTITY,
             collateralAmount: 2_500e6,
             limitPrice: 99e18,
             maxFee: 20e6,
@@ -149,6 +182,14 @@ contract MatchedFillRouterTest is Test {
             reduceOnly: false,
             postOnly: false
         });
+    }
+
+    function _closeTakerOrder() internal view returns (IMatchedFillRouter.Order memory order) {
+        order = _takerOrder();
+        order.positionId = keccak256("taker-long-position");
+        order.intent = IMatchedFillRouter.OrderIntent.CLOSE;
+        order.collateralAmount = 0;
+        order.reduceOnly = true;
     }
 
     function _sign(uint256 privateKey, IMatchedFillRouter.Order memory order) internal view returns (bytes memory) {
@@ -167,7 +208,7 @@ contract MatchedFillRouterTest is Test {
         returns (IMatchedFillRouter.MatchResult memory result)
     {
         vm.prank(executor);
-        return router.settleOpen(fillId, maker, makerSignature, taker, takerSignature);
+        return router.settle(fillId, maker, makerSignature, taker, takerSignature);
     }
 
     function test_Initialize_StoresConfigAndDomain() public view {
@@ -205,16 +246,16 @@ contract MatchedFillRouterTest is Test {
         assertNotEq(result.makerPositionId, bytes32(0));
         assertNotEq(result.takerPositionId, bytes32(0));
         assertTrue(router.isFillUsed(fillId));
-        assertEq(router.filledSize(makerHash), SIZE_NOTIONAL);
-        assertEq(router.filledSize(takerHash), SIZE_NOTIONAL);
+        assertEq(router.filledQuantity(makerHash), QUANTITY);
+        assertEq(router.filledQuantity(takerHash), QUANTITY);
         assertEq(engine.callCount(), 2);
 
-        MockMatchedPerpEngine.RecordedOpen memory makerCall = engine.callAt(0);
-        MockMatchedPerpEngine.RecordedOpen memory takerCall = engine.callAt(1);
+        MockMatchedPerpEngine.RecordedCall memory makerCall = engine.callAt(0);
+        MockMatchedPerpEngine.RecordedCall memory takerCall = engine.callAt(1);
         assertEq(makerCall.trader, makerTrader);
         assertEq(uint8(makerCall.side), uint8(IPerpEngine.Side.LONG));
         assertEq(makerCall.executionPrice, MAKER_LIMIT);
-        assertEq(makerCall.sizeNotional, SIZE_NOTIONAL);
+        assertEq(makerCall.quantity, QUANTITY);
         assertEq(makerCall.maxFee, maker.maxFee);
         assertTrue(makerCall.isMaker);
         assertEq(takerCall.trader, takerTrader);
@@ -238,6 +279,48 @@ contract MatchedFillRouterTest is Test {
         assertEq(engine.callAt(1).executionPrice, MAKER_LIMIT);
     }
 
+    function test_SettleClose_HappyPath_BindsExactPositionAndQuantity() public {
+        IMatchedFillRouter.Order memory maker = _makerOrder();
+        IMatchedFillRouter.Order memory taker = _closeTakerOrder();
+
+        IMatchedFillRouter.MatchResult memory result =
+            _settle(keccak256("close"), maker, _sign(MAKER_KEY, maker), taker, _sign(TAKER_KEY, taker));
+
+        assertNotEq(result.makerPositionId, bytes32(0));
+        assertEq(result.takerPositionId, taker.positionId);
+        assertEq(engine.callCount(), 2);
+        MockMatchedPerpEngine.RecordedCall memory closeCall = engine.callAt(0);
+        MockMatchedPerpEngine.RecordedCall memory openCall = engine.callAt(1);
+        assertEq(uint8(closeCall.intent), uint8(IMatchedFillRouter.OrderIntent.CLOSE));
+        assertEq(closeCall.positionId, taker.positionId);
+        assertEq(closeCall.quantity, QUANTITY);
+        assertEq(closeCall.collateralAmount, 0);
+        assertEq(uint8(closeCall.side), uint8(IPerpEngine.Side.SHORT));
+        assertFalse(closeCall.isMaker);
+        assertEq(uint8(openCall.intent), uint8(IMatchedFillRouter.OrderIntent.OPEN));
+        assertTrue(openCall.isMaker);
+    }
+
+    function test_SettleClose_IsAtomicWhenMakerOpenFailsAfterClose() public {
+        IMatchedFillRouter.Order memory maker = _makerOrder();
+        IMatchedFillRouter.Order memory taker = _closeTakerOrder();
+        bytes32 makerHash = router.hashOrder(maker);
+        bytes32 takerHash = router.hashOrder(taker);
+        bytes32 fillId = keccak256("reverting-close");
+        bytes memory makerSignature = _sign(MAKER_KEY, maker);
+        bytes memory takerSignature = _sign(TAKER_KEY, taker);
+        engine.setRevertOnSecond(true);
+
+        vm.prank(executor);
+        vm.expectRevert(MockMatchedPerpEngine.SecondLegFailed.selector);
+        router.settle(fillId, maker, makerSignature, taker, takerSignature);
+
+        assertFalse(router.isFillUsed(fillId));
+        assertEq(router.filledQuantity(makerHash), 0);
+        assertEq(router.filledQuantity(takerHash), 0);
+        assertEq(engine.callCount(), 0);
+    }
+
     function test_SettleOpen_SupportsERC1271Trader() public {
         MockERC1271Signer wallet = new MockERC1271Signer();
         IMatchedFillRouter.Order memory maker = _makerOrder();
@@ -249,7 +332,7 @@ contract MatchedFillRouterTest is Test {
         _settle(keccak256("erc1271"), maker, bytes("wallet-signature"), taker, _sign(TAKER_KEY, taker));
 
         assertEq(engine.callAt(0).trader, address(wallet));
-        assertEq(router.filledSize(makerHash), SIZE_NOTIONAL);
+        assertEq(router.filledQuantity(makerHash), QUANTITY);
     }
 
     function test_SettleOpen_IsAtomicWhenSecondLegFails() public {
@@ -264,11 +347,11 @@ contract MatchedFillRouterTest is Test {
 
         vm.prank(executor);
         vm.expectRevert(MockMatchedPerpEngine.SecondLegFailed.selector);
-        router.settleOpen(fillId, maker, makerSignature, taker, takerSignature);
+        router.settle(fillId, maker, makerSignature, taker, takerSignature);
 
         assertFalse(router.isFillUsed(fillId));
-        assertEq(router.filledSize(makerHash), 0);
-        assertEq(router.filledSize(takerHash), 0);
+        assertEq(router.filledQuantity(makerHash), 0);
+        assertEq(router.filledQuantity(takerHash), 0);
         assertEq(engine.callCount(), 0);
     }
 
@@ -282,12 +365,12 @@ contract MatchedFillRouterTest is Test {
 
         vm.prank(executor);
         vm.expectRevert(abi.encodeWithSelector(IMatchedFillRouter.FillAlreadyUsed.selector, fillId));
-        router.settleOpen(fillId, maker, makerSignature, taker, takerSignature);
+        router.settle(fillId, maker, makerSignature, taker, takerSignature);
 
         bytes32 makerHash = router.hashOrder(maker);
         vm.prank(executor);
         vm.expectRevert(abi.encodeWithSelector(IMatchedFillRouter.OrderUnavailable.selector, makerHash));
-        router.settleOpen(keccak256("different-fill"), maker, makerSignature, taker, takerSignature);
+        router.settle(keccak256("different-fill"), maker, makerSignature, taker, takerSignature);
     }
 
     function test_SettleOpen_RejectsInvalidSignature() public {
@@ -299,7 +382,7 @@ contract MatchedFillRouterTest is Test {
 
         vm.prank(executor);
         vm.expectRevert(abi.encodeWithSelector(IMatchedFillRouter.InvalidSignature.selector, makerTrader, makerHash));
-        router.settleOpen(keccak256("bad-signature"), maker, invalidMakerSignature, taker, takerSignature);
+        router.settle(keccak256("bad-signature"), maker, invalidMakerSignature, taker, takerSignature);
     }
 
     function test_SettleOpen_RejectsSignatureFromAnotherRouterDomain() public {
@@ -314,7 +397,7 @@ contract MatchedFillRouterTest is Test {
         vm.expectRevert(
             abi.encodeWithSelector(IMatchedFillRouter.InvalidSignature.selector, makerTrader, otherMakerHash)
         );
-        otherRouter.settleOpen(keccak256("wrong-domain"), maker, makerSignature, taker, takerSignature);
+        otherRouter.settle(keccak256("wrong-domain"), maker, makerSignature, taker, takerSignature);
     }
 
     function test_SettleOpen_RejectsUnauthorizedExecutor() public {
@@ -324,7 +407,7 @@ contract MatchedFillRouterTest is Test {
         bytes memory takerSignature = _sign(TAKER_KEY, taker);
         vm.prank(stranger);
         vm.expectRevert(abi.encodeWithSelector(IMatchedFillRouter.UnauthorizedExecutor.selector, executor, stranger));
-        router.settleOpen(keccak256("wrong-executor"), maker, makerSignature, taker, takerSignature);
+        router.settle(keccak256("wrong-executor"), maker, makerSignature, taker, takerSignature);
     }
 
     function test_SettleOpen_RejectsIncompatiblePair() public {
@@ -335,21 +418,21 @@ contract MatchedFillRouterTest is Test {
         vm.expectRevert(
             abi.encodeWithSelector(IMatchedFillRouter.SubjectMismatch.selector, SUBJECT_ID, taker.subjectId)
         );
-        router.settleOpen(keccak256("wrong-subject"), maker, "", taker, "");
+        router.settle(keccak256("wrong-subject"), maker, "", taker, "");
 
         taker = _takerOrder();
         taker.side = maker.side;
         vm.prank(executor);
         vm.expectRevert(abi.encodeWithSelector(IMatchedFillRouter.SideMismatch.selector, maker.side, taker.side));
-        router.settleOpen(keccak256("same-side"), maker, "", taker, "");
+        router.settle(keccak256("same-side"), maker, "", taker, "");
 
         taker = _takerOrder();
-        taker.sizeNotional -= 1;
+        taker.quantity -= 1;
         vm.prank(executor);
         vm.expectRevert(
-            abi.encodeWithSelector(IMatchedFillRouter.FullFillRequired.selector, maker.sizeNotional, taker.sizeNotional)
+            abi.encodeWithSelector(IMatchedFillRouter.FullFillRequired.selector, maker.quantity, taker.quantity)
         );
-        router.settleOpen(keccak256("partial"), maker, "", taker, "");
+        router.settle(keccak256("partial"), maker, "", taker, "");
     }
 
     function test_SettleOpen_RejectsInvalidLiquidityRoles() public {
@@ -358,7 +441,7 @@ contract MatchedFillRouterTest is Test {
         maker.postOnly = false;
         vm.prank(executor);
         vm.expectRevert(abi.encodeWithSelector(IMatchedFillRouter.InvalidLiquidityRole.selector, false, false));
-        router.settleOpen(keccak256("wrong-role"), maker, "", taker, "");
+        router.settle(keccak256("wrong-role"), maker, "", taker, "");
     }
 
     function test_SettleOpen_RejectsTakerLimitViolation() public {
@@ -373,7 +456,7 @@ contract MatchedFillRouterTest is Test {
                 IMatchedFillRouter.LimitPriceExceeded.selector, taker.side, taker.limitPrice, maker.limitPrice
             )
         );
-        router.settleOpen(keccak256("bad-price"), maker, makerSignature, taker, takerSignature);
+        router.settle(keccak256("bad-price"), maker, makerSignature, taker, takerSignature);
     }
 
     function test_SettleOpen_FailsClosedOnUnsupportedOrderShapes() public {
@@ -386,21 +469,85 @@ contract MatchedFillRouterTest is Test {
         vm.expectRevert(
             abi.encodeWithSelector(IMatchedFillRouter.InvalidOrderIntent.selector, IMatchedFillRouter.OrderIntent.UNSET)
         );
-        router.settleOpen(keccak256("unset"), maker, makerSignature, taker, takerSignature);
+        router.settle(keccak256("unset"), maker, makerSignature, taker, takerSignature);
 
         maker = _makerOrder();
         maker.subaccount = keccak256("subaccount");
         makerSignature = _sign(MAKER_KEY, maker);
         vm.prank(executor);
         vm.expectRevert(abi.encodeWithSelector(IMatchedFillRouter.UnsupportedSubaccount.selector, maker.subaccount));
-        router.settleOpen(keccak256("subaccount"), maker, makerSignature, taker, takerSignature);
+        router.settle(keccak256("subaccount"), maker, makerSignature, taker, takerSignature);
 
         maker = _makerOrder();
         maker.reduceOnly = true;
         makerSignature = _sign(MAKER_KEY, maker);
         vm.prank(executor);
-        vm.expectRevert(IMatchedFillRouter.ReduceOnlyUnsupported.selector);
-        router.settleOpen(keccak256("reduce-only"), maker, makerSignature, taker, takerSignature);
+        vm.expectRevert(
+            abi.encodeWithSelector(
+                IMatchedFillRouter.InvalidReduceOnlyForIntent.selector, IMatchedFillRouter.OrderIntent.OPEN, true
+            )
+        );
+        router.settle(keccak256("reduce-only"), maker, makerSignature, taker, takerSignature);
+    }
+
+    function test_SettleClose_FailsClosedOnInvalidIntentBindings() public {
+        IMatchedFillRouter.Order memory maker = _makerOrder();
+        IMatchedFillRouter.Order memory taker = _closeTakerOrder();
+        bytes memory makerSignature = _sign(MAKER_KEY, maker);
+
+        taker.positionId = bytes32(0);
+        bytes memory takerSignature = _sign(TAKER_KEY, taker);
+        vm.prank(executor);
+        vm.expectRevert(
+            abi.encodeWithSelector(
+                IMatchedFillRouter.InvalidPositionBinding.selector, IMatchedFillRouter.OrderIntent.CLOSE, bytes32(0)
+            )
+        );
+        router.settle(keccak256("close-no-position"), maker, makerSignature, taker, takerSignature);
+
+        taker = _closeTakerOrder();
+        taker.collateralAmount = 1;
+        takerSignature = _sign(TAKER_KEY, taker);
+        vm.prank(executor);
+        vm.expectRevert(
+            abi.encodeWithSelector(
+                IMatchedFillRouter.InvalidCollateralForIntent.selector, IMatchedFillRouter.OrderIntent.CLOSE, uint256(1)
+            )
+        );
+        router.settle(keccak256("close-collateral"), maker, makerSignature, taker, takerSignature);
+
+        taker = _closeTakerOrder();
+        taker.reduceOnly = false;
+        takerSignature = _sign(TAKER_KEY, taker);
+        vm.prank(executor);
+        vm.expectRevert(
+            abi.encodeWithSelector(
+                IMatchedFillRouter.InvalidReduceOnlyForIntent.selector, IMatchedFillRouter.OrderIntent.CLOSE, false
+            )
+        );
+        router.settle(keccak256("close-not-reduce-only"), maker, makerSignature, taker, takerSignature);
+
+        taker = _closeTakerOrder();
+        taker.postOnly = true;
+        takerSignature = _sign(TAKER_KEY, taker);
+        vm.prank(executor);
+        vm.expectRevert(IMatchedFillRouter.CloseMustBeImmediate.selector);
+        router.settle(keccak256("close-post-only"), maker, makerSignature, taker, takerSignature);
+    }
+
+    function test_SettleClose_RejectsRestingCloseMaker() public {
+        IMatchedFillRouter.Order memory maker = _makerOrder();
+        IMatchedFillRouter.Order memory taker = _takerOrder();
+        maker.positionId = keccak256("maker-short-position");
+        maker.intent = IMatchedFillRouter.OrderIntent.CLOSE;
+        maker.collateralAmount = 0;
+        maker.reduceOnly = true;
+        bytes memory makerSignature = _sign(MAKER_KEY, maker);
+        bytes memory takerSignature = _sign(TAKER_KEY, taker);
+
+        vm.prank(executor);
+        vm.expectRevert(IMatchedFillRouter.CloseMakerUnsupported.selector);
+        router.settle(keccak256("close-maker"), maker, makerSignature, taker, takerSignature);
     }
 
     function test_SettleOpen_RejectsExpiredAndOutOfRangeOrders() public {
@@ -411,7 +558,7 @@ contract MatchedFillRouterTest is Test {
         bytes memory takerSignature = _sign(TAKER_KEY, taker);
         vm.prank(executor);
         vm.expectRevert(abi.encodeWithSelector(IMatchedFillRouter.DeadlineExpired.selector, maker.deadline));
-        router.settleOpen(keccak256("expired"), maker, makerSignature, taker, takerSignature);
+        router.settle(keccak256("expired"), maker, makerSignature, taker, takerSignature);
 
         maker = _makerOrder();
         maker.maxMarkDivergenceBps = 10_001;
@@ -420,7 +567,7 @@ contract MatchedFillRouterTest is Test {
         vm.expectRevert(
             abi.encodeWithSelector(IMatchedFillRouter.MarkDivergenceBpsOutOfRange.selector, maker.maxMarkDivergenceBps)
         );
-        router.settleOpen(keccak256("bad-bps"), maker, makerSignature, taker, takerSignature);
+        router.settle(keccak256("bad-bps"), maker, makerSignature, taker, takerSignature);
     }
 
     function test_CancelOrder_PreventsSettlement() public {
@@ -435,7 +582,7 @@ contract MatchedFillRouterTest is Test {
 
         vm.prank(executor);
         vm.expectRevert(abi.encodeWithSelector(IMatchedFillRouter.OrderUnavailable.selector, makerHash));
-        router.settleOpen(keccak256("cancelled"), maker, makerSignature, taker, takerSignature);
+        router.settle(keccak256("cancelled"), maker, makerSignature, taker, takerSignature);
     }
 
     function test_InvalidateNoncesBelow_PreventsSettlement() public {
@@ -449,7 +596,7 @@ contract MatchedFillRouterTest is Test {
         vm.expectRevert(
             abi.encodeWithSelector(IMatchedFillRouter.NonceInvalid.selector, makerTrader, maker.nonce, uint256(2))
         );
-        router.settleOpen(keccak256("old-nonce"), maker, "", taker, "");
+        router.settle(keccak256("old-nonce"), maker, "", taker, "");
     }
 
     function test_GovernanceTransfer_IsTimelocked() public {

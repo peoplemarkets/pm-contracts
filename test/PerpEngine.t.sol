@@ -182,17 +182,39 @@ contract PerpEngineTest is Test {
     }
 
     function _baseMatchedOpenParams() internal view returns (IPerpEngine.MatchedOpenParams memory p) {
-        uint256 sizeNotional = 50_000 * ONE_USDC;
+        uint256 quantity = 500 * ONE_USDC;
+        uint256 sizeNotional = (quantity * (99 * ONE_18)) / ONE_18;
         p = IPerpEngine.MatchedOpenParams({
             subjectId: SUBJECT_ID,
             side: IPerpEngine.Side.LONG,
             collateralAmount: 10_000 * ONE_USDC,
-            sizeNotional: sizeNotional,
+            quantity: quantity,
             executionPrice: 99 * ONE_18,
             maxMarkDivergenceBps: 200,
             maxFee: (sizeNotional * 250) / 1_000_000,
             deadline: uint64(block.timestamp + 1 hours),
             isMaker: true
+        });
+    }
+
+    function _baseMatchedCloseParams(bytes32 positionId)
+        internal
+        view
+        returns (IPerpEngine.MatchedCloseParams memory p)
+    {
+        uint256 quantity = 200 * ONE_USDC;
+        uint256 executionPrice = 101 * ONE_18;
+        uint256 executionNotional = (quantity * executionPrice) / ONE_18;
+        p = IPerpEngine.MatchedCloseParams({
+            subjectId: SUBJECT_ID,
+            positionId: positionId,
+            side: IPerpEngine.Side.SHORT,
+            quantity: quantity,
+            executionPrice: executionPrice,
+            maxMarkDivergenceBps: 200,
+            maxFee: (executionNotional * 750) / 1_000_000,
+            deadline: uint64(block.timestamp + 1 hours),
+            isMaker: false
         });
     }
 
@@ -208,7 +230,7 @@ contract PerpEngineTest is Test {
         address owner,
         address executor,
         IPerpEngine.Side side,
-        uint256 sizeNotional,
+        uint256 quantity,
         uint256 collateralAmount,
         uint256 limitPrice,
         uint256 maxFee,
@@ -223,9 +245,10 @@ contract PerpEngineTest is Test {
             executor: executor,
             subaccount: bytes32(0),
             subjectId: SUBJECT_ID,
+            positionId: bytes32(0),
             side: side,
             intent: IMatchedFillRouter.OrderIntent.OPEN,
-            sizeNotional: sizeNotional,
+            quantity: quantity,
             collateralAmount: collateralAmount,
             limitPrice: limitPrice,
             maxFee: maxFee,
@@ -235,6 +258,25 @@ contract PerpEngineTest is Test {
             reduceOnly: false,
             postOnly: postOnly
         });
+    }
+
+    function _matchedCloseOrder(
+        address owner,
+        address executor,
+        IPerpEngine.Side side,
+        bytes32 positionId,
+        uint256 quantity,
+        uint256 limitPrice,
+        uint256 maxFee
+    )
+        internal
+        view
+        returns (IMatchedFillRouter.Order memory order)
+    {
+        order = _matchedOrder(owner, executor, side, quantity, 0, limitPrice, maxFee, false);
+        order.positionId = positionId;
+        order.intent = IMatchedFillRouter.OrderIntent.CLOSE;
+        order.reduceOnly = true;
     }
 
     function _signMatchedOrder(
@@ -2747,7 +2789,8 @@ contract PerpEngineTest is Test {
         bytes32 positionId = engine.openPositionForMatched(trader, p);
 
         IPerpEngine.Position memory pos = engine.positionOf(positionId);
-        int256 expectedSize = int256((p.sizeNotional * ONE_18) / p.executionPrice);
+        uint256 sizeNotional = (p.quantity * p.executionPrice) / ONE_18;
+        int256 expectedSize = int256(p.quantity);
         assertEq(pos.owner, trader);
         assertEq(pos.subjectId, SUBJECT_ID);
         assertEq(pos.entryPrice, p.executionPrice);
@@ -2756,7 +2799,7 @@ contract PerpEngineTest is Test {
         assertEq(engine.positionIdOf(trader, SUBJECT_ID), positionId);
         assertEq(usdc.balanceOf(trader), traderBalanceBefore - p.collateralAmount - p.maxFee);
         (uint256 longOi, uint256 shortOi) = engine.openInterestOf(SUBJECT_ID);
-        assertEq(longOi, p.sizeNotional);
+        assertEq(longOi, sizeNotional);
         assertEq(shortOi, 0);
     }
 
@@ -2766,19 +2809,21 @@ contract PerpEngineTest is Test {
 
         IPerpEngine.MatchedOpenParams memory p = _baseMatchedOpenParams();
         p.side = IPerpEngine.Side.SHORT;
+        p.quantity = 490 * ONE_USDC;
         p.executionPrice = 101 * ONE_18;
         p.isMaker = false;
-        p.maxFee = (p.sizeNotional * 750) / 1_000_000;
+        uint256 sizeNotional = (p.quantity * p.executionPrice) / ONE_18;
+        p.maxFee = (sizeNotional * 750) / 1_000_000;
 
         vm.prank(router);
         bytes32 positionId = engine.openPositionForMatched(trader, p);
         IPerpEngine.Position memory pos = engine.positionOf(positionId);
-        int256 expectedSize = -int256((p.sizeNotional * ONE_18) / p.executionPrice);
+        int256 expectedSize = -int256(p.quantity);
         assertEq(pos.entryPrice, p.executionPrice);
         assertEq(pos.size, expectedSize);
         (uint256 longOi, uint256 shortOi) = engine.openInterestOf(SUBJECT_ID);
         assertEq(longOi, 0);
-        assertEq(shortOi, p.sizeNotional);
+        assertEq(shortOi, sizeNotional);
     }
 
     function test_OpenPositionForMatched_RevertsWhenFeeExceedsSignedMaximum() public {
@@ -2787,7 +2832,8 @@ contract PerpEngineTest is Test {
 
         IPerpEngine.MatchedOpenParams memory p = _baseMatchedOpenParams();
         p.isMaker = false;
-        uint256 takerFee = (p.sizeNotional * 750) / 1_000_000;
+        uint256 sizeNotional = (p.quantity * p.executionPrice) / ONE_18;
+        uint256 takerFee = (sizeNotional * 750) / 1_000_000;
         p.maxFee = takerFee - 1;
 
         vm.prank(router);
@@ -2835,11 +2881,136 @@ contract PerpEngineTest is Test {
         engine.openPositionForMatched(address(0), _baseMatchedOpenParams());
     }
 
+    function test_ClosePositionForMatched_RevertsOnNonRouter() public {
+        IPerpEngine.MatchedCloseParams memory p = _baseMatchedCloseParams(keccak256("position"));
+        vm.prank(stranger);
+        vm.expectRevert(abi.encodeWithSelector(IPerpEngine.OnlyRouter.selector, stranger));
+        engine.closePositionForMatched(trader, p);
+    }
+
+    function test_ClosePositionForMatched_HappyPath_ReducesExactBaseQuantityAtExecutionPrice() public {
+        address router = makeAddr("matchedRouter");
+        _activateRouter(router);
+
+        IPerpEngine.MatchedOpenParams memory openParams = _baseMatchedOpenParams();
+        vm.prank(router);
+        bytes32 positionId = engine.openPositionForMatched(trader, openParams);
+
+        IPerpEngine.MatchedCloseParams memory closeParams = _baseMatchedCloseParams(positionId);
+        uint256 balanceBefore = usdc.balanceOf(trader);
+        uint256 closeCollateral = (openParams.collateralAmount * closeParams.quantity) / openParams.quantity;
+        int256 expectedPnl =
+            int256((closeParams.quantity * (closeParams.executionPrice - openParams.executionPrice)) / ONE_18);
+
+        vm.prank(router);
+        int256 realizedPnl = engine.closePositionForMatched(trader, closeParams);
+
+        assertEq(realizedPnl, expectedPnl);
+        IPerpEngine.Position memory position = engine.positionOf(positionId);
+        assertEq(position.size, int256(openParams.quantity - closeParams.quantity));
+        assertEq(position.collateral, openParams.collateralAmount - closeCollateral);
+        assertEq(position.entryPrice, openParams.executionPrice);
+        assertEq(engine.positionIdOf(trader, SUBJECT_ID), positionId);
+        assertEq(usdc.balanceOf(trader), balanceBefore + closeCollateral + uint256(expectedPnl) - closeParams.maxFee);
+        (uint256 longOi, uint256 shortOi) = engine.openInterestOf(SUBJECT_ID);
+        assertEq(longOi, ((openParams.quantity - closeParams.quantity) * openParams.executionPrice) / ONE_18);
+        assertEq(shortOi, 0);
+    }
+
+    function test_ClosePositionForMatched_HappyPath_FullCloseClearsPosition() public {
+        address router = makeAddr("matchedRouter");
+        _activateRouter(router);
+
+        IPerpEngine.MatchedOpenParams memory openParams = _baseMatchedOpenParams();
+        vm.prank(router);
+        bytes32 positionId = engine.openPositionForMatched(trader, openParams);
+
+        IPerpEngine.MatchedCloseParams memory closeParams = _baseMatchedCloseParams(positionId);
+        closeParams.quantity = openParams.quantity;
+        uint256 executionNotional = (closeParams.quantity * closeParams.executionPrice) / ONE_18;
+        closeParams.maxFee = (executionNotional * 750) / 1_000_000;
+        int256 expectedPnl =
+            int256((closeParams.quantity * (closeParams.executionPrice - openParams.executionPrice)) / ONE_18);
+        uint256 balanceBefore = usdc.balanceOf(trader);
+
+        vm.prank(router);
+        assertEq(engine.closePositionForMatched(trader, closeParams), expectedPnl);
+
+        assertEq(engine.positionIdOf(trader, SUBJECT_ID), bytes32(0));
+        assertEq(engine.positionOf(positionId).size, 0);
+        assertEq(
+            usdc.balanceOf(trader),
+            balanceBefore + openParams.collateralAmount + uint256(expectedPnl) - closeParams.maxFee
+        );
+        (uint256 longOi, uint256 shortOi) = engine.openInterestOf(SUBJECT_ID);
+        assertEq(longOi, 0);
+        assertEq(shortOi, 0);
+    }
+
+    function test_ClosePositionForMatched_RejectsStalePositionBinding() public {
+        address router = makeAddr("matchedRouter");
+        _activateRouter(router);
+
+        IPerpEngine.MatchedOpenParams memory openParams = _baseMatchedOpenParams();
+        vm.prank(router);
+        bytes32 currentPositionId = engine.openPositionForMatched(trader, openParams);
+        IPerpEngine.MatchedCloseParams memory closeParams = _baseMatchedCloseParams(keccak256("stale-position"));
+
+        vm.prank(router);
+        vm.expectRevert(
+            abi.encodeWithSelector(IPerpEngine.PositionIdMismatch.selector, closeParams.positionId, currentPositionId)
+        );
+        engine.closePositionForMatched(trader, closeParams);
+    }
+
+    function test_ClosePositionForMatched_RejectsIncreaseOrCrossThroughZero() public {
+        address router = makeAddr("matchedRouter");
+        _activateRouter(router);
+
+        IPerpEngine.MatchedOpenParams memory openParams = _baseMatchedOpenParams();
+        vm.prank(router);
+        bytes32 positionId = engine.openPositionForMatched(trader, openParams);
+        IPerpEngine.MatchedCloseParams memory closeParams = _baseMatchedCloseParams(positionId);
+        closeParams.quantity = openParams.quantity + 1;
+
+        vm.prank(router);
+        vm.expectRevert(
+            abi.encodeWithSelector(
+                IPerpEngine.ReduceOnlySizeExceeded.selector, closeParams.quantity, openParams.quantity
+            )
+        );
+        engine.closePositionForMatched(trader, closeParams);
+
+        IPerpEngine.Position memory position = engine.positionOf(positionId);
+        assertEq(position.size, int256(openParams.quantity));
+        assertEq(position.collateral, openParams.collateralAmount);
+    }
+
+    function test_ClosePositionForMatched_RejectsOrderOnPositionSide() public {
+        address router = makeAddr("matchedRouter");
+        _activateRouter(router);
+
+        IPerpEngine.MatchedOpenParams memory openParams = _baseMatchedOpenParams();
+        vm.prank(router);
+        bytes32 positionId = engine.openPositionForMatched(trader, openParams);
+        IPerpEngine.MatchedCloseParams memory closeParams = _baseMatchedCloseParams(positionId);
+        closeParams.side = IPerpEngine.Side.LONG;
+
+        vm.prank(router);
+        vm.expectRevert(
+            abi.encodeWithSelector(
+                IPerpEngine.ReduceOnlySideMismatch.selector, closeParams.side, int256(openParams.quantity)
+            )
+        );
+        engine.closePositionForMatched(trader, closeParams);
+    }
+
     function test_MatchedFillRouter_RealStack_SettlesBothSidesAtOneExecutionPrice() public {
         address maker = vm.addr(MATCH_MAKER_KEY);
         address taker = vm.addr(MATCH_TAKER_KEY);
         address executor = makeAddr("matchedExecutor");
-        uint256 sizeNotional = 40_000 * ONE_USDC;
+        uint256 quantity = 400 * ONE_USDC;
+        uint256 sizeNotional = (quantity * (99 * ONE_18)) / ONE_18;
         uint256 makerCollateral = 10_000 * ONE_USDC;
         uint256 takerCollateral = 12_000 * ONE_USDC;
         uint256 makerFee = (sizeNotional * 250) / 1_000_000;
@@ -2858,10 +3029,10 @@ contract PerpEngineTest is Test {
 
         MatchedFillRouter matchedRouter = _deployMatchedFillRouter();
         IMatchedFillRouter.Order memory makerOrder = _matchedOrder(
-            maker, executor, IPerpEngine.Side.LONG, sizeNotional, makerCollateral, 99 * ONE_18, makerFee, true
+            maker, executor, IPerpEngine.Side.LONG, quantity, makerCollateral, 99 * ONE_18, makerFee, true
         );
         IMatchedFillRouter.Order memory takerOrder = _matchedOrder(
-            taker, executor, IPerpEngine.Side.SHORT, sizeNotional, takerCollateral, 98 * ONE_18, takerFee, false
+            taker, executor, IPerpEngine.Side.SHORT, quantity, takerCollateral, 98 * ONE_18, takerFee, false
         );
         bytes memory makerSignature = _signMatchedOrder(matchedRouter, MATCH_MAKER_KEY, makerOrder);
         bytes memory takerSignature = _signMatchedOrder(matchedRouter, MATCH_TAKER_KEY, takerOrder);
@@ -2869,13 +3040,12 @@ contract PerpEngineTest is Test {
         uint256 takerBalanceBefore = usdc.balanceOf(taker);
 
         vm.prank(executor);
-        IMatchedFillRouter.MatchResult memory result = matchedRouter.settleOpen(
-            keccak256("real-stack-fill"), makerOrder, makerSignature, takerOrder, takerSignature
-        );
+        IMatchedFillRouter.MatchResult memory result =
+            matchedRouter.settle(keccak256("real-stack-fill"), makerOrder, makerSignature, takerOrder, takerSignature);
 
         IPerpEngine.Position memory makerPosition = engine.positionOf(result.makerPositionId);
         IPerpEngine.Position memory takerPosition = engine.positionOf(result.takerPositionId);
-        int256 expectedSize = int256((sizeNotional * ONE_18) / makerOrder.limitPrice);
+        int256 expectedSize = int256(quantity);
         assertEq(makerPosition.owner, maker);
         assertEq(takerPosition.owner, taker);
         assertEq(makerPosition.entryPrice, makerOrder.limitPrice);
@@ -2889,11 +3059,128 @@ contract PerpEngineTest is Test {
         assertEq(shortOi, sizeNotional);
     }
 
+    function test_MatchedFillRouter_RealStack_CloseRotatesExactExposureWithoutTransientCapFailure() public {
+        address maker = vm.addr(MATCH_MAKER_KEY);
+        address taker = vm.addr(MATCH_TAKER_KEY);
+        address executor = makeAddr("matchedExecutor");
+        uint256 closeQuantity = 200 * ONE_USDC;
+        uint256 executionPrice = 101 * ONE_18;
+        uint256 executionNotional = (closeQuantity * executionPrice) / ONE_18;
+        uint256 makerCollateral = 5_000 * ONE_USDC;
+        uint256 makerFee = (executionNotional * 250) / 1_000_000;
+        uint256 takerFee = (executionNotional * 750) / 1_000_000;
+
+        vm.startPrank(kycWriter);
+        registry.setKycTier(maker, 2);
+        registry.setKycTier(taker, 2);
+        vm.stopPrank();
+        usdc.mint(maker, USDC_1M);
+        usdc.mint(taker, USDC_1M);
+        vm.prank(maker);
+        usdc.approve(address(vault), type(uint256).max);
+        vm.prank(taker);
+        usdc.approve(address(vault), type(uint256).max);
+
+        MatchedFillRouter matchedRouter = _deployMatchedFillRouter();
+        IPerpEngine.MatchedOpenParams memory seedParams = _baseMatchedOpenParams();
+        vm.prank(address(matchedRouter));
+        bytes32 takerPositionId = engine.openPositionForMatched(taker, seedParams);
+
+        IMatchedFillRouter.Order memory makerOrder = _matchedOrder(
+            maker, executor, IPerpEngine.Side.LONG, closeQuantity, makerCollateral, executionPrice, makerFee, true
+        );
+        IMatchedFillRouter.Order memory takerOrder = _matchedCloseOrder(
+            taker, executor, IPerpEngine.Side.SHORT, takerPositionId, closeQuantity, 100 * ONE_18, takerFee
+        );
+        uint256 makerBalanceBefore = usdc.balanceOf(maker);
+        uint256 takerBalanceBefore = usdc.balanceOf(taker);
+        bytes memory makerSignature = _signMatchedOrder(matchedRouter, MATCH_MAKER_KEY, makerOrder);
+        bytes memory takerSignature = _signMatchedOrder(matchedRouter, MATCH_TAKER_KEY, takerOrder);
+
+        vm.prank(executor);
+        IMatchedFillRouter.MatchResult memory result =
+            matchedRouter.settle(keccak256("real-stack-close"), makerOrder, makerSignature, takerOrder, takerSignature);
+
+        assertEq(result.takerPositionId, takerPositionId);
+        IPerpEngine.Position memory makerPosition = engine.positionOf(result.makerPositionId);
+        IPerpEngine.Position memory takerPosition = engine.positionOf(takerPositionId);
+        assertEq(makerPosition.size, int256(closeQuantity));
+        assertEq(makerPosition.entryPrice, executionPrice);
+        assertEq(takerPosition.size, int256(seedParams.quantity - closeQuantity));
+        uint256 closeCollateral = (seedParams.collateralAmount * closeQuantity) / seedParams.quantity;
+        assertEq(takerPosition.collateral, seedParams.collateralAmount - closeCollateral);
+        uint256 pnl = (closeQuantity * (executionPrice - seedParams.executionPrice)) / ONE_18;
+        assertEq(usdc.balanceOf(maker), makerBalanceBefore - makerCollateral - makerFee);
+        assertEq(usdc.balanceOf(taker), takerBalanceBefore + closeCollateral + pnl - takerFee);
+        (uint256 longOi, uint256 shortOi) = engine.openInterestOf(SUBJECT_ID);
+        uint256 residualOpeningNotional = ((seedParams.quantity - closeQuantity) * seedParams.executionPrice) / ONE_18;
+        assertEq(longOi, residualOpeningNotional + executionNotional);
+        assertEq(shortOi, 0);
+    }
+
+    function test_MatchedFillRouter_RealStack_MakerFailureRollsBackPriorClose() public {
+        address maker = vm.addr(MATCH_MAKER_KEY);
+        address taker = vm.addr(MATCH_TAKER_KEY);
+        address executor = makeAddr("matchedExecutor");
+        uint256 closeQuantity = 200 * ONE_USDC;
+        uint256 executionPrice = 101 * ONE_18;
+        uint256 executionNotional = (closeQuantity * executionPrice) / ONE_18;
+
+        vm.startPrank(kycWriter);
+        registry.setKycTier(maker, 2);
+        registry.setKycTier(taker, 2);
+        vm.stopPrank();
+        usdc.mint(maker, USDC_1M);
+        usdc.mint(taker, USDC_1M);
+        vm.prank(taker);
+        usdc.approve(address(vault), type(uint256).max);
+
+        MatchedFillRouter matchedRouter = _deployMatchedFillRouter();
+        IPerpEngine.MatchedOpenParams memory seedParams = _baseMatchedOpenParams();
+        vm.prank(address(matchedRouter));
+        bytes32 takerPositionId = engine.openPositionForMatched(taker, seedParams);
+
+        uint256 makerFee = (executionNotional * 250) / 1_000_000;
+        uint256 takerFee = (executionNotional * 750) / 1_000_000;
+        IMatchedFillRouter.Order memory makerOrder = _matchedOrder(
+            maker, executor, IPerpEngine.Side.LONG, closeQuantity, 5_000 * ONE_USDC, executionPrice, makerFee, true
+        );
+        IMatchedFillRouter.Order memory takerOrder = _matchedCloseOrder(
+            taker, executor, IPerpEngine.Side.SHORT, takerPositionId, closeQuantity, 100 * ONE_18, takerFee
+        );
+        bytes32 fillId = keccak256("real-stack-close-rollback");
+        bytes32 makerHash = matchedRouter.hashOrder(makerOrder);
+        bytes32 takerHash = matchedRouter.hashOrder(takerOrder);
+        uint256 takerBalanceBefore = usdc.balanceOf(taker);
+        bytes memory makerSignature = _signMatchedOrder(matchedRouter, MATCH_MAKER_KEY, makerOrder);
+        bytes memory takerSignature = _signMatchedOrder(matchedRouter, MATCH_TAKER_KEY, takerOrder);
+
+        // The close is applied first. The maker has deliberately not approved the vault, so the
+        // subsequent OPEN fails and the transaction must restore the closed position and funds.
+        vm.prank(executor);
+        vm.expectRevert();
+        matchedRouter.settle(fillId, makerOrder, makerSignature, takerOrder, takerSignature);
+
+        IPerpEngine.Position memory restoredPosition = engine.positionOf(takerPositionId);
+        assertEq(restoredPosition.size, int256(seedParams.quantity));
+        assertEq(restoredPosition.collateral, seedParams.collateralAmount);
+        assertEq(usdc.balanceOf(taker), takerBalanceBefore);
+        assertEq(engine.positionIdOf(maker, SUBJECT_ID), bytes32(0));
+        assertEq(engine.positionIdOf(taker, SUBJECT_ID), takerPositionId);
+        (uint256 longOi, uint256 shortOi) = engine.openInterestOf(SUBJECT_ID);
+        assertEq(longOi, (seedParams.quantity * seedParams.executionPrice) / ONE_18);
+        assertEq(shortOi, 0);
+        assertFalse(matchedRouter.isFillUsed(fillId));
+        assertEq(matchedRouter.filledQuantity(makerHash), 0);
+        assertEq(matchedRouter.filledQuantity(takerHash), 0);
+    }
+
     function test_MatchedFillRouter_RealStack_SecondLegFailureRollsBackEverything() public {
         address maker = vm.addr(MATCH_MAKER_KEY);
         address taker = vm.addr(MATCH_TAKER_KEY);
         address executor = makeAddr("matchedExecutor");
-        uint256 sizeNotional = 20_000 * ONE_USDC;
+        uint256 quantity = 200 * ONE_USDC;
+        uint256 sizeNotional = (quantity * (99 * ONE_18)) / ONE_18;
         uint256 collateralAmount = 5_000 * ONE_USDC;
         uint256 makerFee = (sizeNotional * 250) / 1_000_000;
         uint256 takerFee = (sizeNotional * 750) / 1_000_000;
@@ -2911,10 +3198,10 @@ contract PerpEngineTest is Test {
 
         MatchedFillRouter matchedRouter = _deployMatchedFillRouter();
         IMatchedFillRouter.Order memory makerOrder = _matchedOrder(
-            maker, executor, IPerpEngine.Side.LONG, sizeNotional, collateralAmount, 99 * ONE_18, makerFee, true
+            maker, executor, IPerpEngine.Side.LONG, quantity, collateralAmount, 99 * ONE_18, makerFee, true
         );
         IMatchedFillRouter.Order memory takerOrder = _matchedOrder(
-            taker, executor, IPerpEngine.Side.SHORT, sizeNotional, collateralAmount, 98 * ONE_18, takerFee, false
+            taker, executor, IPerpEngine.Side.SHORT, quantity, collateralAmount, 98 * ONE_18, takerFee, false
         );
         bytes memory makerSignature = _signMatchedOrder(matchedRouter, MATCH_MAKER_KEY, makerOrder);
         bytes memory takerSignature = _signMatchedOrder(matchedRouter, MATCH_TAKER_KEY, takerOrder);
@@ -2925,7 +3212,7 @@ contract PerpEngineTest is Test {
 
         vm.prank(executor);
         vm.expectRevert();
-        matchedRouter.settleOpen(fillId, makerOrder, makerSignature, takerOrder, takerSignature);
+        matchedRouter.settle(fillId, makerOrder, makerSignature, takerOrder, takerSignature);
 
         assertEq(usdc.balanceOf(maker), makerBalanceBefore);
         assertEq(engine.positionIdOf(maker, SUBJECT_ID), bytes32(0));
@@ -2934,8 +3221,8 @@ contract PerpEngineTest is Test {
         assertEq(longOi, 0);
         assertEq(shortOi, 0);
         assertFalse(matchedRouter.isFillUsed(fillId));
-        assertEq(matchedRouter.filledSize(makerHash), 0);
-        assertEq(matchedRouter.filledSize(takerHash), 0);
+        assertEq(matchedRouter.filledQuantity(makerHash), 0);
+        assertEq(matchedRouter.filledQuantity(takerHash), 0);
     }
 
     // ------------------------------------------------------------------------------------------

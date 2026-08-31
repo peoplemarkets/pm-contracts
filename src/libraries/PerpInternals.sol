@@ -52,6 +52,18 @@ library PerpInternals {
         uint256 fee
     );
 
+    event PositionClosed(
+        bytes32 indexed positionId,
+        address indexed trader,
+        bytes32 indexed subjectId,
+        int256 realizedPnl,
+        uint256 fee,
+        uint256 returnedToTrader,
+        bool isFullClose,
+        int256 size,
+        bool isLong
+    );
+
     // BREAKING: `size` + `isLong` appended (see IPerpEngine) — signature MUST match the interface
     // so delegatecall-emitted logs stay selector-compatible. Forced settlement is always a full
     // close, so `size` is the full signed position size.
@@ -84,6 +96,9 @@ library PerpInternals {
     error InvalidConfig();
     error PositionAlreadyOpen(address trader, bytes32 subjectId);
     error PositionNotOpen(bytes32 subjectId);
+    error PositionIdMismatch(bytes32 expected, bytes32 actual);
+    error ReduceOnlySideMismatch(IPerpEngine.Side orderSide, int256 positionSize);
+    error ReduceOnlySizeExceeded(uint256 quantity, uint256 positionQuantity);
     error KycTierMissing(address trader);
     error DeadlineExpired(uint64 deadline);
     error SlippageExceeded(uint256 expected, uint256 actual, uint256 maxBps);
@@ -100,6 +115,7 @@ library PerpInternals {
     error FundingMarkMismatch(uint256 expectedMark, uint256 providedMark);
     error InvalidFundingQuoteIndex(int256 expectedIndex, int256 providedIndex);
     error AmountZero();
+    error UnderwaterClose(int256 equity);
     error GlobalHaltedError();
     error SubjectIsForceSettled(bytes32 subjectId);
     error MaintenanceMarginShort(uint256 mmBps, uint256 ratioBps);
@@ -122,7 +138,8 @@ library PerpInternals {
         if (trader == address(0)) revert InvalidConfig();
         if (perpS.globalHalt) revert GlobalHaltedError();
         if (block.timestamp > p.deadline) revert DeadlineExpired(p.deadline);
-        if (p.collateralAmount == 0 || p.sizeNotional == 0) revert AmountZero();
+        if (p.collateralAmount == 0 || p.quantity == 0) revert AmountZero();
+        if (p.quantity > uint256(type(int256).max)) revert InvalidConfig();
         if (p.executionPrice < MIN_MARK || p.executionPrice > MAX_MARK) {
             revert MarkValueOutOfRange(p.executionPrice);
         }
@@ -141,18 +158,20 @@ library PerpInternals {
             revert PositionAlreadyOpen(trader, p.subjectId);
         }
 
+        uint256 sizeNotional = (p.quantity * p.executionPrice) / ONE;
+        if (sizeNotional == 0) revert AmountZero();
+
         IMarginEngine me = IMarginEngine(perpS.marginEngine);
         if (address(me) == address(0)) revert MarginEngineUnset();
-        me.checkInitialMargin(p.sizeNotional, p.collateralAmount);
+        me.checkInitialMargin(sizeNotional, p.collateralAmount);
         bytes32 categoryId = _categoryOf(perpS, p.subjectId);
-        _enforceOpenCaps(me, perpS, trader, p, categoryId, tier);
+        _enforceOpenCaps(me, perpS, trader, p, sizeNotional, categoryId, tier);
 
         (uint256 fee, uint256 lpRebate, uint256 insuranceShare) =
-            PerpFeeMath.compute(p.sizeNotional, p.isMaker, perpS.lpRebatePct);
+            PerpFeeMath.compute(sizeNotional, p.isMaker, perpS.lpRebatePct);
         if (fee > p.maxFee) revert FeeLimitExceeded(fee, p.maxFee);
 
-        int256 absSize = int256((p.sizeNotional * ONE) / p.executionPrice);
-        if (absSize == 0) revert AmountZero();
+        int256 absSize = int256(p.quantity);
         int256 signedSize = p.side == IPerpEngine.Side.LONG ? absSize : -absSize;
 
         unchecked {
@@ -175,16 +194,148 @@ library PerpInternals {
         perpS.openPositionId[trader][p.subjectId] = positionId;
 
         if (p.side == IPerpEngine.Side.LONG) {
-            perpS.totalLongOI[p.subjectId] += p.sizeNotional;
+            perpS.totalLongOI[p.subjectId] += sizeNotional;
         } else {
-            perpS.totalShortOI[p.subjectId] += p.sizeNotional;
+            perpS.totalShortOI[p.subjectId] += sizeNotional;
         }
-        me.recordOpenDelta(trader, categoryId, IMarginEngine.Side(uint8(p.side)), p.sizeNotional, tier);
+        me.recordOpenDelta(trader, categoryId, IMarginEngine.Side(uint8(p.side)), sizeNotional, tier);
 
         ILPVault(perpS.lpVault).openPositionFlow(trader, p.collateralAmount, fee, lpRebate, insuranceShare);
         emit PositionOpened(
             positionId, trader, p.subjectId, p.side, signedSize, p.executionPrice, p.collateralAmount, fee
         );
+    }
+
+    struct MatchedCloseValues {
+        int256 closeSize;
+        uint256 closeCollateral;
+        uint256 openingNotionalDelta;
+        int256 realizedPnl;
+        int256 fundingDebt6;
+        int256 settlePnl;
+        uint256 fee;
+        uint256 lpRebate;
+        uint256 insuranceShare;
+        uint256 returned;
+        bool isLong;
+        bool fullClose;
+    }
+
+    /// @notice Apply an exact EIP-712-authorized reduce-only slice at its matched price.
+    /// @dev The position id, side, and quantity are revalidated against live storage so a stale
+    ///      signature cannot close a replacement position or cross through zero. Unlike OPEN,
+    ///      this path deliberately does not call `requireTradeable`: a risk-reducing close remains
+    ///      valid during a subject pause, although the paired OPEN leg will still fail atomically.
+    function closePositionForMatched(
+        address trader,
+        IPerpEngine.MatchedCloseParams memory p
+    )
+        public
+        returns (int256 realizedPnl)
+    {
+        PerpStorage.Layout storage perpS = PerpStorage.load();
+        if (trader == address(0)) revert InvalidConfig();
+        if (perpS.globalHalt) revert GlobalHaltedError();
+        if (block.timestamp > p.deadline) revert DeadlineExpired(p.deadline);
+        if (p.quantity == 0) revert AmountZero();
+        if (p.quantity > uint256(type(int256).max)) revert InvalidConfig();
+        if (p.executionPrice < MIN_MARK || p.executionPrice > MAX_MARK) {
+            revert MarkValueOutOfRange(p.executionPrice);
+        }
+        if (p.maxMarkDivergenceBps > BPS_DENOMINATOR) {
+            revert MarkDivergenceBpsOutOfRange(p.maxMarkDivergenceBps);
+        }
+        if (perpS.subjectForceSettled[p.subjectId]) revert SubjectIsForceSettled(p.subjectId);
+
+        bytes32 currentPositionId = perpS.openPositionId[trader][p.subjectId];
+        if (currentPositionId != p.positionId) revert PositionIdMismatch(p.positionId, currentPositionId);
+        IPerpEngine.Position memory orig = perpS.positions[p.positionId];
+        if (orig.size == 0 || orig.owner != trader || orig.subjectId != p.subjectId) {
+            revert PositionIdMismatch(p.positionId, currentPositionId);
+        }
+
+        bool isLong = orig.size > 0;
+        IPerpEngine.Side requiredOrderSide = isLong ? IPerpEngine.Side.SHORT : IPerpEngine.Side.LONG;
+        if (p.side != requiredOrderSide) revert ReduceOnlySideMismatch(p.side, orig.size);
+
+        uint256 positionQuantity = isLong ? uint256(orig.size) : uint256(-orig.size);
+        if (p.quantity > positionQuantity) revert ReduceOnlySizeExceeded(p.quantity, positionQuantity);
+
+        uint256 markNow = _readFreshMark(perpS, p.subjectId);
+        _checkSlippage(markNow, p.executionPrice, p.maxMarkDivergenceBps);
+
+        QuoteFundingStorage.Layout storage quoteS = QuoteFundingStorage.load();
+        MatchedCloseValues memory v = _computeMatchedCloseValues(
+            orig,
+            p.quantity,
+            p.executionPrice,
+            p.isMaker,
+            quoteS.cumulativeQuoteIndex[p.subjectId],
+            quoteS.entryQuoteIndex[p.positionId]
+        );
+        if (v.fee > p.maxFee) revert FeeLimitExceeded(v.fee, p.maxFee);
+
+        if (v.fullClose) {
+            delete perpS.positions[p.positionId];
+            delete perpS.openPositionId[trader][p.subjectId];
+            delete quoteS.entryQuoteIndex[p.positionId];
+        } else {
+            IPerpEngine.Position storage position = perpS.positions[p.positionId];
+            position.size = orig.size - v.closeSize;
+            position.collateral = orig.collateral - v.closeCollateral;
+            position.lastInteractionAt = uint64(block.timestamp);
+        }
+
+        if (v.isLong) {
+            perpS.totalLongOI[p.subjectId] -= v.openingNotionalDelta;
+        } else {
+            perpS.totalShortOI[p.subjectId] -= v.openingNotionalDelta;
+        }
+        if (perpS.marginEngine != address(0)) {
+            IMarginEngine(perpS.marginEngine)
+                .recordCloseDelta(trader, _categoryOf(perpS, p.subjectId), v.openingNotionalDelta, v.isLong);
+        }
+
+        ILPVault(perpS.lpVault)
+            .settlePosition(trader, v.closeCollateral, v.settlePnl, v.fee, v.lpRebate, v.insuranceShare);
+
+        emit FundingSettled(p.positionId, trader, v.fundingDebt6);
+        emit PositionClosed(
+            p.positionId, trader, p.subjectId, v.realizedPnl, v.fee, v.returned, v.fullClose, v.closeSize, v.isLong
+        );
+        return v.realizedPnl;
+    }
+
+    function _computeMatchedCloseValues(
+        IPerpEngine.Position memory orig,
+        uint256 quantity,
+        uint256 executionPrice,
+        bool isMaker,
+        int256 currentQuoteIndex,
+        int256 entryQuoteIndex
+    )
+        private
+        view
+        returns (MatchedCloseValues memory v)
+    {
+        v.isLong = orig.size > 0;
+        uint256 positionQuantity = v.isLong ? uint256(orig.size) : uint256(-orig.size);
+        v.fullClose = quantity == positionQuantity;
+        v.closeSize = v.isLong ? int256(quantity) : -int256(quantity);
+        v.closeCollateral = v.fullClose ? orig.collateral : (orig.collateral * quantity) / positionQuantity;
+        v.openingNotionalDelta = (quantity * orig.entryPrice) / ONE;
+
+        uint256 executionNotional = (quantity * executionPrice) / ONE;
+        if (executionNotional == 0) revert AmountZero();
+        v.realizedPnl = PositionMath.unrealizedPnl(v.closeSize, orig.entryPrice, executionPrice);
+        (v.fee, v.lpRebate, v.insuranceShare) =
+            PerpFeeMath.compute(executionNotional, isMaker, PerpStorage.load().lpRebatePct);
+        v.fundingDebt6 = FundingMath.computeFundingDebt(v.closeSize, currentQuoteIndex, entryQuoteIndex);
+        v.settlePnl = v.realizedPnl - v.fundingDebt6;
+
+        int256 returnedSigned = int256(v.closeCollateral) + v.settlePnl - int256(v.fee);
+        if (returnedSigned < 0) revert UnderwaterClose(returnedSigned);
+        v.returned = uint256(returnedSigned);
     }
 
     /// @notice Validate and store one cumulative quote-funding update for PerpEngine.
@@ -469,6 +620,7 @@ library PerpInternals {
         PerpStorage.Layout storage perpS,
         address trader,
         IPerpEngine.MatchedOpenParams memory p,
+        uint256 sizeNotional,
         bytes32 categoryId,
         uint8 tier
     )
@@ -482,7 +634,7 @@ library PerpInternals {
             p.subjectId,
             categoryId,
             IMarginEngine.Side(uint8(p.side)),
-            p.sizeNotional,
+            sizeNotional,
             tier,
             perpS.totalLongOI[p.subjectId],
             perpS.totalShortOI[p.subjectId],

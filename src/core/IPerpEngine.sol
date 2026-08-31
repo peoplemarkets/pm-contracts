@@ -53,12 +53,30 @@ interface IPerpEngine {
     /// @notice Router-only open parameters for a cryptographically authorized matched fill.
     /// @dev `executionPrice` is the signed maker limit and becomes the accounting entry price;
     ///      the fresh mark remains the risk/slippage reference. `maxFee` and maker/taker role are
-    ///      derived from the signed orders by the trusted matched-fill router.
+    ///      derived from the signed orders by the trusted matched-fill router. `quantity` is
+    ///      absolute base quantity in the same fixed-point units as `Position.size`; quote
+    ///      notional is derived at the execution price.
     struct MatchedOpenParams {
         bytes32 subjectId;
         Side side;
         uint256 collateralAmount;
-        uint256 sizeNotional;
+        uint256 quantity;
+        uint256 executionPrice;
+        uint256 maxMarkDivergenceBps;
+        uint256 maxFee;
+        uint64 deadline;
+        bool isMaker;
+    }
+
+    /// @notice Router-only reduce-only close parameters for a signed matched fill.
+    /// @dev `side` is order direction, not current position side: SHORT reduces a LONG and LONG
+    ///      reduces a SHORT. `positionId` and `quantity` bind the exact live exposure. The call
+    ///      rejects a stale/replaced position, an increase, or any cross-through-zero reversal.
+    struct MatchedCloseParams {
+        bytes32 subjectId;
+        bytes32 positionId;
+        Side side;
+        uint256 quantity;
         uint256 executionPrice;
         uint256 maxMarkDivergenceBps;
         uint256 maxFee;
@@ -88,6 +106,15 @@ interface IPerpEngine {
     ///      authority, nonce/deadline, limits, role, and atomic counterparty compatibility before
     ///      calling this method twice in one transaction. A revert on either side unwinds both.
     function openPositionForMatched(address trader, MatchedOpenParams calldata p) external returns (bytes32 positionId);
+
+    /// @notice Close one exact base-quantity slice of `trader`'s existing position at a signed
+    ///         matched execution price. Caller MUST be a timelocked trusted router.
+    function closePositionForMatched(
+        address trader,
+        MatchedCloseParams calldata p
+    )
+        external
+        returns (int256 realizedPnl);
 
     /// @notice Close (or partially close) the caller's position on `subjectId`. Returns signed
     ///         realized PnL on the closed slice.
@@ -464,6 +491,9 @@ interface IPerpEngine {
     error MarkNotSet(bytes32 subjectId);
     error PositionAlreadyOpen(address trader, bytes32 subjectId);
     error PositionNotOpen(bytes32 subjectId);
+    error PositionIdMismatch(bytes32 expected, bytes32 actual);
+    error ReduceOnlySideMismatch(Side orderSide, int256 positionSize);
+    error ReduceOnlySizeExceeded(uint256 quantity, uint256 positionQuantity);
     error LeverageTooHigh(uint256 leverageBps, uint256 maxBps);
     error InitialMarginShort(uint256 required, uint256 provided);
     error MaintenanceMarginShort(uint256 mmBps, uint256 ratioBps);
