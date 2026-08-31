@@ -73,12 +73,9 @@ library PerpStorage {
         // freeAssets() to defeat same-block flash-deposit OI cap inflation.
         uint256 cappedTvl;
         uint64 cappedTvlUpdatedAt;
-        // ---- APPENDED: Tier-1 funding event stub — FundingEngine v1 wiring ----
-        // Authorized writer for `pushFundingIndex`. Rotated through the standard timelocked
-        // propose/activate/cancel flow (same shape as `pendingPerpEngine` on LPVault). The
-        // funding-math contract has not shipped yet; this address is `0x0` at v0 launch and
-        // populated when FundingEngine v1 deploys. Until then, `pushFundingIndex` reverts on
-        // every call and traders open positions with `entryFundingIndex = 0`.
+        // ---- APPENDED: FundingEngine writer ----
+        // Authorized writer for both the legacy transition selector and quote-index selector.
+        // Rotated through the standard timelocked propose/activate/cancel flow.
         address fundingEngine;
         address pendingFundingEngine;
         uint64 pendingFundingEngineActivatesAt;
@@ -177,11 +174,12 @@ library MarginStorage {
     }
 }
 
+/// @notice Legacy dimensionless funding state. Preserved for storage and log compatibility only.
 library FundingStorage {
     bytes32 internal constant SLOT = keccak256("people.markets.funding.v1");
 
     struct Layout {
-        // cumulative funding index per subject (signed, scaled by 1e18). Frozen during pauses.
+        // Legacy cumulative dimensionless rate per subject (signed, scaled by 1e18).
         mapping(bytes32 subjectId => int256) cumulativeFundingIndex;
         // last accrual timestamp per subject
         mapping(bytes32 subjectId => uint64) lastFundingAt;
@@ -197,6 +195,37 @@ library FundingStorage {
         uint256 minEventOiForSentiment;
         // permissioned writer for funding-rate keeper pushes
         mapping(address => bool) fundingWriters;
+    }
+
+    function load() internal pure returns (Layout storage l) {
+        bytes32 slot = SLOT;
+        assembly ("memory-safe") {
+            l.slot := slot
+        }
+    }
+}
+
+/// @title QuoteFundingStorage — versioned quote-denominated funding state.
+/// @notice Kept separate from `FundingStorage` because the legacy cumulative index is a
+///         dimensionless integrated rate. Reinterpreting that namespace as quote-per-base would
+///         corrupt every open position that snapshotted the old unit domain.
+library QuoteFundingStorage {
+    bytes32 internal constant SLOT = keccak256("people.markets.funding.quote.v1");
+
+    struct Layout {
+        // Cumulative signed quote funding per one base contract, scaled by 1e18.
+        mapping(bytes32 subjectId => int256) cumulativeQuoteIndex;
+        // Last quote-index accrual timestamp. Independent of the legacy clock.
+        mapping(bytes32 subjectId => uint64) lastQuoteFundingAt;
+        // Canonical quote-index snapshot for each position. Legacy positions read the zero
+        // default, intentionally waiving pre-activation funding rather than mixing dimensions.
+        mapping(bytes32 positionId => int256) entryQuoteIndex;
+        // Global version handshake. The first valid quote-index seed enables v2 and permanently
+        // disables legacy pushes on quote-aware PerpEngine implementations. This makes an old
+        // FundingEngine writer fail closed after cutover; proxy downgrade policy remains a separate
+        // governance and deployment control.
+        bool enabled;
+        uint64 activatedAt;
     }
 
     function load() internal pure returns (Layout storage l) {

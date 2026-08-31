@@ -2,8 +2,8 @@
 pragma solidity 0.8.24;
 
 /// @notice Position lifecycle for People Markets perps. Single entry point for open / close /
-///         modify. v0 supports one position per (trader, subject) pair, USDC settlement, no
-///         funding accrual, no liquidation, no event-impulse feedback.
+///         modify. Supports one position per (trader, subject) pair, USDC settlement,
+///         quote-denominated funding accrual, liquidation, and event-impulse feedback.
 interface IPerpEngine {
     // ------------------------------------------------------------------------------------------
     // Types
@@ -14,8 +14,9 @@ interface IPerpEngine {
         SHORT
     }
 
-    /// @dev Mirrors `PerpStorage.Position`. `entryFundingIndex` is reserved for FundingEngine
-    ///      (week 8-9) — set to 0 in v0 but kept in the struct so the storage layout stays stable.
+    /// @dev Mirrors `PerpStorage.Position`. `entryFundingIndex` is the legacy dimensionless-index
+    ///      snapshot and remains in place for ABI/storage compatibility. Quote-denominated funding
+    ///      uses the versioned `positionFundingQuoteIndex(positionId)` namespace.
     struct Position {
         int256 size;
         uint256 collateral;
@@ -167,7 +168,7 @@ interface IPerpEngine {
     /// @param  bountyToPay        6-decimal USDC to send to the liquidator (msg.sender on the
     ///                            engine side, but the LiquidationEngine address forwards the
     ///                            target via parameter).
-    /// @param  signedPnl          Signed pnl applied to the slice. Negative on losses.
+    /// @param  signedPnl          Price PnL minus funding debt for the slice. Negative on losses.
     /// @param  liquidator         EOA that receives the bounty.
     /// @param  tierCode           Enum-coded liquidation tier reached. Echoed in the event so
     ///                            indexers can categorise without a second lookup.
@@ -182,10 +183,8 @@ interface IPerpEngine {
     )
         external;
 
-    /// @notice Tier-1 funding event stub: timelocked rotation of the FundingEngine writer.
-    /// @dev    Until FundingEngine v1 ships, `fundingEngine` is `address(0)` and any
-    ///         `pushFundingIndex` call reverts. Rotation follows the standard propose/activate/
-    ///         cancel pattern, gated by the existing `timelockDelay`.
+    /// @notice Timelocked rotation of the FundingEngine writer.
+    /// @dev    Uses the standard propose/activate/cancel pattern, gated by `timelockDelay`.
     function proposeSetFundingEngine(address newEngine) external;
     function activateSetFundingEngine() external;
     function cancelSetFundingEngine() external;
@@ -202,13 +201,21 @@ interface IPerpEngine {
     ///         by `(10_000 + impulseBps) / 10_000` and updates `markUpdatedAt`.
     function applyImpulse(bytes32 subjectId, int256 impulseBps) external;
 
-    /// @notice FundingEngine-only writer for the per-subject cumulative funding index. Caller MUST
-    ///         be the configured `fundingEngine`; the subject MUST be tradeable (pauses freeze
-    ///         funding per spec §2 line 66).
-    /// @dev    v0 SHIM: this is event-only — no PnL math, no position settle. Positions opened
-    ///         after this call inherit the new index via `entryFundingIndex` so FundingEngine v1
-    ///         can ship without a storage migration.
+    /// @notice Legacy dimensionless-index writer retained only for an upgrade transition.
+    /// @dev Reverts permanently after the first valid quote-index seed. It is never consumed by
+    ///      position settlement in the quote-denominated model.
     function pushFundingIndex(bytes32 subjectId, int256 newIndex, int256 fundingRate1e18) external;
+
+    /// @notice FundingEngine-only writer for cumulative quote funding per base contract.
+    /// @dev The first call MUST seed `newQuoteIndex1e18 == 0`. Later calls are verified against
+    ///      the canonical fresh mark, elapsed quote clock, and `FundingMath` before storage changes.
+    function pushFundingQuoteIndex(
+        bytes32 subjectId,
+        int256 newQuoteIndex1e18,
+        int256 fundingRate1e18,
+        uint256 markPrice1e18
+    )
+        external;
 
     /// @notice Permissionless poke that snapshots the live `vault.totalAssets()` into the
     ///         `cappedTvl` field used by the per-subject OI cap. Cooldown-gated so a same-block
@@ -250,7 +257,7 @@ interface IPerpEngine {
     function isForceSettled(bytes32 subjectId) external view returns (bool);
     function settlementMarkOf(bytes32 subjectId) external view returns (uint256);
 
-    /// @notice Configured FundingEngine writer. `address(0)` until FundingEngine v1 ships.
+    /// @notice Configured FundingEngine writer. `address(0)` when no writer has been activated.
     function fundingEngine() external view returns (address);
 
     /// @notice Configured FeedbackController writer. `address(0)` until Wave 3B is wired in.
@@ -267,6 +274,22 @@ interface IPerpEngine {
 
     /// @notice Timestamp (seconds) of the last `pushFundingIndex` for `subjectId`.
     function lastFundingAt(bytes32 subjectId) external view returns (uint64);
+
+    /// @notice Canonical cumulative quote funding per base contract, signed 1e18.
+    function cumulativeFundingQuoteIndex(bytes32 subjectId) external view returns (int256);
+
+    /// @notice Timestamp of the last quote-index push for `subjectId`.
+    function lastQuoteFundingAt(bytes32 subjectId) external view returns (uint64);
+
+    /// @notice Canonical quote-index snapshot for `positionId`; legacy positions return zero.
+    function positionFundingQuoteIndex(bytes32 positionId) external view returns (int256);
+
+    /// @notice Current signed USDC funding debt for the whole open position.
+    /// @dev Positive means the trader owes the vault; negative means the vault owes the trader.
+    function fundingDebtOf(bytes32 positionId) external view returns (int256);
+
+    /// @notice Whether quote-denominated funding has completed its version handshake.
+    function quoteFundingEnabled() external view returns (bool);
 
     /// @notice Configured MarginEngine (Wave 4). `address(0)` until rotated in.
     function marginEngine() external view returns (address);
@@ -347,15 +370,24 @@ interface IPerpEngine {
     event GovernanceTransferActivated(address indexed oldGovernance, address indexed newGovernance);
     event GovernanceTransferCancelled(address indexed pendingGovernance);
 
-    // --- Tier-1 funding event stub ---
-    /// @notice FundingEngine wrote a new cumulative index for `subjectId`. Indexers subscribe
-    ///         to this event today; the math lands in FundingEngine v1.
+    // --- Funding ---
+    /// @notice Legacy dimensionless funding update retained for historical log compatibility.
     event FundingPushed(
         bytes32 indexed subjectId, int256 oldIndex, int256 newIndex, int256 fundingRate1e18, uint64 timestamp
     );
-    /// @notice Funding-debt settlement on a position close. `fundingDelta1e6` is denominated in
-    ///         USDC (6-dec) and signed (positive = paid to trader, negative = paid by trader).
-    ///         Stubbed to 0 in v0 — FundingEngine v1 computes the actual delta.
+    /// @notice Quote-denominated index advanced using the canonical mark for that interval.
+    event FundingQuotePushed(
+        bytes32 indexed subjectId,
+        int256 oldQuoteIndex1e18,
+        int256 newQuoteIndex1e18,
+        int256 fundingRate1e18,
+        uint256 markPrice1e18,
+        uint64 timestamp
+    );
+    /// @notice The first valid zero quote-index seed completed the v2 funding handshake.
+    event QuoteFundingActivated(uint64 timestamp);
+    /// @notice Funding debt settled on a position close. `fundingDelta1e6` is signed USDC debt:
+    ///         positive = paid by trader to vault; negative = paid by vault to trader.
     event FundingSettled(bytes32 indexed positionId, address indexed trader, int256 fundingDelta1e6);
 
     /// @notice Timelocked rotation of the FundingEngine writer.
@@ -437,10 +469,15 @@ interface IPerpEngine {
     error SubjectAlreadyForceSettled(bytes32 subjectId);
     error SubjectNotForceSettled(bytes32 subjectId);
     error SubjectIsForceSettled(bytes32 subjectId);
-    // --- Tier-1 funding event stub ---
+    // --- Funding ---
     error OnlyFundingEngine(address caller);
     error PendingFundingEngineExists();
     error NoPendingFundingEngine();
+    error LegacyFundingIndexDisabled();
+    error QuoteFundingMustSeedAtZero(int256 attemptedIndex);
+    error QuoteFundingSeedRateNotZero(int256 attemptedRate);
+    error FundingMarkMismatch(uint256 expectedMark, uint256 providedMark);
+    error InvalidFundingQuoteIndex(int256 expectedIndex, int256 providedIndex);
     // --- Tier-1 net-category OI cap ---
     error CategoryOiCapExceeded(bytes32 categoryId, uint256 proposedAbs, uint256 cap);
     error CategoryOiCapBpsOutOfRange();

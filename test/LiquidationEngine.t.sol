@@ -38,6 +38,7 @@ contract LiquidationEngineTest is Test {
     address internal regGuardian = makeAddr("regGuardian");
     address internal kycWriter = makeAddr("kycWriter");
     address internal markWriter = makeAddr("markWriter");
+    address internal fundingWriter = makeAddr("fundingWriter");
     address internal liquidator = makeAddr("liquidator");
     address internal liquidator2 = makeAddr("liquidator2");
     address internal newGov = makeAddr("newGov");
@@ -131,11 +132,14 @@ contract LiquidationEngineTest is Test {
         vm.warp(block.timestamp + TIMELOCK_DELAY);
         vault.activateSetPerpEngine();
 
-        // Wire MarginEngine on PerpEngine.
-        vm.prank(governance);
+        // Wire MarginEngine and the quote-funding writer on PerpEngine in one timelock window.
+        vm.startPrank(governance);
         engine.proposeSetMarginEngine(address(marginEngine));
+        engine.proposeSetFundingEngine(fundingWriter);
+        vm.stopPrank();
         vm.warp(block.timestamp + TIMELOCK_DELAY);
         engine.activateSetMarginEngine();
+        engine.activateSetFundingEngine();
 
         // Wire LiquidationEngine on PerpEngine.
         vm.prank(governance);
@@ -234,6 +238,24 @@ contract LiquidationEngineTest is Test {
     function _pushMark(uint256 newMark) internal {
         vm.prank(markWriter);
         engine.pushMark(SUBJECT_ID, newMark);
+    }
+
+    function _seedQuoteFunding() internal {
+        if (engine.lastQuoteFundingAt(SUBJECT_ID) != 0) return;
+        (uint256 mark,) = engine.markOf(SUBJECT_ID);
+        vm.prank(fundingWriter);
+        engine.pushFundingQuoteIndex(SUBJECT_ID, 0, 0, mark);
+    }
+
+    function _accrueQuoteFunding(int256 rate1e18, uint64 elapsed) internal returns (int256 newIndex) {
+        _seedQuoteFunding();
+        (uint256 mark,) = engine.markOf(SUBJECT_ID);
+        vm.warp(block.timestamp + elapsed);
+        _pushMark(mark);
+        int256 delta = (rate1e18 * int256(mark) * int256(uint256(elapsed))) / int256(ONE_18 * 3600);
+        newIndex = engine.cumulativeFundingQuoteIndex(SUBJECT_ID) + delta;
+        vm.prank(fundingWriter);
+        engine.pushFundingQuoteIndex(SUBJECT_ID, newIndex, rate1e18, mark);
     }
 
     function _seedInsurance(uint256 amount) internal {
@@ -532,6 +554,37 @@ contract LiquidationEngineTest is Test {
         assertEq(usdc.balanceOf(trader), traderBalBefore + r.collateralReturned);
     }
 
+    function test_Liquidate_FundingDebtAloneCrossesBufferAndSettlesSlice() public {
+        bytes32 positionId = _openLong(trader);
+        // 14%/h at $100 is $14/base. On 500 bases that is $7K debt, reducing equity from $10K
+        // to $3K without any mark move and crossing the 7.5% liquidation buffer ($3.75K).
+        _accrueQuoteFunding(0.14e18, 1 hours);
+        assertEq(engine.fundingDebtOf(positionId), 7_000e6);
+
+        vm.expectEmit(true, true, false, true, address(engine));
+        emit IPerpEngine.FundingSettled(positionId, trader, int256(1_750e6));
+        vm.prank(liquidator);
+        ILiquidationEngine.LiquidationResult memory r = liqEngine.liquidate(positionId);
+
+        assertEq(uint8(r.tier), uint8(ILiquidationEngine.Tier.PARTIAL));
+        assertEq(r.collateralReturned, 625e6);
+        assertEq(r.bountyPaid, 125e6);
+        assertEq(engine.fundingDebtOf(positionId), 5_250e6);
+        assertTrue(marginEngine.isMarginOk(positionId));
+    }
+
+    function test_Liquidate_NegativeFundingCreditKeepsPositionAboveBuffer() public {
+        bytes32 positionId = _openLong(trader);
+        // A -4% hour at $100 credits $4/base, or $2K on this 500-base position.
+        _accrueQuoteFunding(-0.04e18, 1 hours);
+        assertEq(engine.fundingDebtOf(positionId), -int256(2_000e6));
+
+        _pushMark(84 * ONE_18); // price-only equity would be $2K and liquidatable
+        vm.expectRevert(abi.encodeWithSelector(ILiquidationEngine.NotUnderBuffer.selector, positionId));
+        vm.prank(liquidator);
+        liqEngine.liquidate(positionId);
+    }
+
     function test_Liquidate_LongFullTier2_AfterPartialBudget() public {
         bytes32 positionId = _openLong(trader);
         // Position is just under buffer at $84 — partial path can succeed (collateralFreed > 0).
@@ -708,7 +761,9 @@ contract LiquidationEngineTest is Test {
     function test_Liquidate_ShortPartialTier1() public {
         bytes32 positionId = _openShort(trader);
         // Push mark UP — short loses. Equity drops when mark > entry.
-        _pushMark(116 * ONE_18); // +16% — mirrors the long test
+        // $114 leaves enough slice equity to restore the residual to MM + restore buffer. At
+        // $116 the higher short notional makes a 25% slice insufficient, so escalation is correct.
+        _pushMark(114 * ONE_18);
 
         vm.prank(liquidator);
         ILiquidationEngine.LiquidationResult memory r = liqEngine.liquidate(positionId);

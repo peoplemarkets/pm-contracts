@@ -41,6 +41,18 @@ contract Harness {
         return FundingMath.computeIndexDelta(fundingRate_e18, elapsedSeconds);
     }
 
+    function quoteDelta(
+        int256 fundingRate_e18,
+        uint256 markPrice_e18,
+        uint64 elapsedSeconds
+    )
+        external
+        pure
+        returns (int256)
+    {
+        return FundingMath.computeQuoteIndexDelta(fundingRate_e18, markPrice_e18, elapsedSeconds);
+    }
+
     function debt(int256 size_1e6, int256 currentIndex_e18, int256 entryIndex_e18) external pure returns (int256) {
         return FundingMath.computeFundingDebt(size_1e6, currentIndex_e18, entryIndex_e18);
     }
@@ -365,6 +377,26 @@ contract FundingMathTest is Test {
     }
 
     // ------------------------------------------------------------------------------------------
+    // computeQuoteIndexDelta
+    // ------------------------------------------------------------------------------------------
+
+    /// @dev 0.1%/h at a $100 mark accrues $0.10 quote per base contract in one hour.
+    function test_QuoteDelta_OneHourIncludesMarkDimension() public view {
+        assertEq(h.quoteDelta(1e15, 100e18, 3600), 0.1e18);
+    }
+
+    /// @dev A negative 0.1%/h rate at a $200 mark for half an hour accrues -$0.10/base.
+    function test_QuoteDelta_NegativeHalfHour() public view {
+        assertEq(h.quoteDelta(-1e15, 200e18, 1800), -0.1e18);
+    }
+
+    function test_QuoteDelta_ZeroInputsReturnZero() public view {
+        assertEq(h.quoteDelta(0, 100e18, 3600), 0);
+        assertEq(h.quoteDelta(1e15, 0, 3600), 0);
+        assertEq(h.quoteDelta(1e15, 100e18, 0), 0);
+    }
+
+    // ------------------------------------------------------------------------------------------
     // computeFundingDebt — sign-quadrant table
     // ------------------------------------------------------------------------------------------
 
@@ -415,16 +447,14 @@ contract FundingMathTest is Test {
         assertEq(h.debt(int256(5) * ONE_E6, 3e15, 1e15), 10_000);
     }
 
-    /// @dev Realistic perp scale: 1 contract = 1e6, position $10K notional at $100 mark ⇒
-    ///      size = $10K * 1e18 / $100 = 1e20, but in 1e6 units that's 100e6. Index moves
-    ///      0.001e18 = 1e15 over the holding window. debt6 = 100e6 × 1e15 / 1e18 = 100_000
-    ///      = $0.10 per the funding rate. Sanity check the order of magnitude.
+    /// @dev Realistic perp scale: 100 contracts at a $100 mark is $10K notional. A 0.1% hourly
+    ///      rate accrues a quote-index delta of $0.10/base, so the position owes $10.
     function test_Debt_RealisticScale() public view {
         int256 size = int256(100) * ONE_E6;
-        int256 currentIdx = 1e15;
+        int256 currentIdx = 0.1e18;
         int256 entryIdx = 0;
-        // 100e6 × 1e15 / 1e18 = 100_000 (6-dec USDC = $0.10).
-        assertEq(h.debt(size, currentIdx, entryIdx), 100_000);
+        // 100e6 × 0.1e18 / 1e18 = 10e6 (6-dec USDC = $10).
+        assertEq(h.debt(size, currentIdx, entryIdx), 10e6);
     }
 
     // ------------------------------------------------------------------------------------------
@@ -443,11 +473,10 @@ contract FundingMathTest is Test {
             h.rate(1.05e18, 1.0e18, 0.5e18, 6_000_000, 4_000_000, K_PREMIUM, K_SENTIMENT, K_SKEW, 1e16);
         assertGt(terms.totalRate_e18, 0);
 
-        // Step B: integrate over 1 hour to get the index delta.
-        int256 indexDelta = h.delta(terms.totalRate_e18, 3600);
+        // Step B: integrate rate and mark over 1 hour to get quote funding per base.
+        int256 indexDelta = h.quoteDelta(terms.totalRate_e18, 1.05e18, 3600);
         assertGt(indexDelta, 0);
-        // Sanity: delta == rate over exactly one hour.
-        assertEq(indexDelta, terms.totalRate_e18);
+        assertEq(indexDelta, (terms.totalRate_e18 * int256(1.05e18)) / ONE_E18);
 
         // Step C: a long that opened with `entryFundingIndex = 0` and held through the hour
         // pays funding (positive debt).

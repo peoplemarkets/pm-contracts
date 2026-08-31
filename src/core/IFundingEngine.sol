@@ -1,21 +1,19 @@
 // SPDX-License-Identifier: BUSL-1.1
 pragma solidity 0.8.24;
 
-/// @title  IFundingEngine — cumulative funding-index driver for People Markets perps.
+/// @title  IFundingEngine — quote-denominated funding-index driver for People Markets perps.
 /// @notice The FundingEngine sits between the OracleRouter (premium index source), the
 ///         PerpEngine (cumulative funding index sink), and the off-chain keeper that pokes
 ///         the rate forward. Two main external entry points:
 ///
 ///           - `pokeFunding(subjectId)` — permissionless. Reads the latest premium index +
 ///             OI + sentiment, computes the rate, integrates over elapsed time, and pushes
-///             the new cumulative index to PerpEngine.
+///             the new cumulative quote-per-base index to PerpEngine.
 ///           - `setSentimentScore(subjectId, score)` — sentiment writer only. Off-chain
 ///             aggregator pushes the [-1e18, 1e18] sentiment per subject.
 ///
-/// @dev    v0 ships ONLY the index driver. Per-position settle (multiplying the index delta
-///         by signed size and accruing it to collateral at close) is deferred to a later
-///         wave. PerpEngine already snapshots `entryFundingIndex` on open so the position
-///         struct is forward-compatible without a storage migration.
+/// @dev    The quote index has its own versioned namespace. The legacy dimensionless index is
+///         retained only for upgrade compatibility and is never reinterpreted as quote value.
 interface IFundingEngine {
     // ------------------------------------------------------------------------------------------
     // External — keeper
@@ -79,8 +77,14 @@ interface IFundingEngine {
     // Views
     // ------------------------------------------------------------------------------------------
 
+    /// @notice Deprecated legacy dimensionless index. Frozen after quote-funding cutover.
     function cumulativeFundingIndex(bytes32 subjectId) external view returns (int256);
+    /// @notice Deprecated legacy clock paired with `cumulativeFundingIndex`.
     function lastFundingAt(bytes32 subjectId) external view returns (uint64);
+    /// @notice Canonical cumulative quote funding per base contract, signed 1e18.
+    function cumulativeFundingQuoteIndex(bytes32 subjectId) external view returns (int256);
+    /// @notice Timestamp of the latest canonical quote-index push.
+    function lastQuoteFundingAt(bytes32 subjectId) external view returns (uint64);
 
     function sentimentScoreOf(bytes32 subjectId) external view returns (int256);
     function metricForSubject(bytes32 subjectId) external view returns (bytes32);
@@ -105,7 +109,16 @@ interface IFundingEngine {
     // ------------------------------------------------------------------------------------------
 
     event Initialized(address governance, address perpEngine, address oracleRouter);
+    /// @notice Legacy dimensionless-index telemetry retained for historical log decoding.
     event FundingPoked(bytes32 indexed subjectId, int256 oldIndex, int256 newIndex, int256 rate, uint64 elapsed);
+    event FundingQuotePoked(
+        bytes32 indexed subjectId,
+        int256 oldQuoteIndex1e18,
+        int256 newQuoteIndex1e18,
+        int256 rate1e18,
+        uint256 markPrice1e18,
+        uint64 elapsed
+    );
     event SubjectRegistered(bytes32 indexed subjectId, bytes32 indexed metricId);
     event SubjectDeregistered(bytes32 indexed subjectId, bytes32 indexed metricId);
     event SentimentScoreSet(bytes32 indexed subjectId, int256 oldScore, int256 newScore, address indexed writer);

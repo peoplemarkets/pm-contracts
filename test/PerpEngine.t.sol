@@ -1917,11 +1917,11 @@ contract PerpEngineTest is Test {
     }
 
     // ------------------------------------------------------------------------------------------
-    // Tier-1: funding event stub + entryFundingIndex snapshot (Wave 2)
+    // Funding writer, legacy transition, and quote-index handshake
     // ------------------------------------------------------------------------------------------
 
     function test_Tier1_PushFundingIndex_RevertWhenWriterUnset() public {
-        // fundingEngine is `address(0)` at v0 — any caller (including stranger) reverts.
+        // With no configured funding writer, every caller reverts.
         vm.prank(stranger);
         vm.expectRevert(abi.encodeWithSelector(IPerpEngine.OnlyFundingEngine.selector, stranger));
         engine.pushFundingIndex(SUBJECT_ID, int256(1e18), int256(1e15));
@@ -1949,6 +1949,25 @@ contract PerpEngineTest is Test {
 
         assertEq(engine.cumulativeFundingIndex(SUBJECT_ID), int256(1e18));
         assertEq(engine.lastFundingAt(SUBJECT_ID), uint64(block.timestamp));
+    }
+
+    function test_Funding_QuoteSeedIsIndependentPerSubject() public {
+        address fundingWriter = makeAddr("quoteFundingWriter");
+        _wireFundingEngine(fundingWriter);
+
+        vm.prank(fundingWriter);
+        engine.pushFundingQuoteIndex(SUBJECT_ID, 0, 0, INITIAL_MARK);
+        assertTrue(engine.quoteFundingEnabled());
+
+        // Global activation does not let a newly encountered subject skip its own zero seed.
+        vm.expectRevert(abi.encodeWithSelector(IPerpEngine.QuoteFundingMustSeedAtZero.selector, int256(1)));
+        vm.prank(fundingWriter);
+        engine.pushFundingQuoteIndex(SUBJECT_ID2, 1, 0, INITIAL_MARK);
+
+        vm.prank(fundingWriter);
+        engine.pushFundingQuoteIndex(SUBJECT_ID2, 0, 0, INITIAL_MARK);
+        assertEq(engine.cumulativeFundingQuoteIndex(SUBJECT_ID2), 0);
+        assertEq(engine.lastQuoteFundingAt(SUBJECT_ID2), uint64(block.timestamp));
     }
 
     function test_Tier1_PushFundingIndex_RevertOnPaused() public {

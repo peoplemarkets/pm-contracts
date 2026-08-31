@@ -36,6 +36,7 @@ contract LiquidationADLTest is Test {
     address internal regGuardian = makeAddr("regGuardian");
     address internal kycWriter = makeAddr("kycWriter");
     address internal markWriter = makeAddr("markWriter");
+    address internal fundingWriter = makeAddr("fundingWriter");
     address internal liquidator = makeAddr("liquidator");
 
     address internal alice = makeAddr("alice"); // LP
@@ -116,6 +117,11 @@ contract LiquidationADLTest is Test {
             address(engine),
             abi.encodeCall(PerpEngine.proposeSetMarginEngine, (address(marginEngine))),
             abi.encodeCall(PerpEngine.activateSetMarginEngine, ())
+        );
+        _activate(
+            address(engine),
+            abi.encodeCall(PerpEngine.proposeSetFundingEngine, (fundingWriter)),
+            abi.encodeCall(PerpEngine.activateSetFundingEngine, ())
         );
         _activate(
             address(engine),
@@ -200,6 +206,16 @@ contract LiquidationADLTest is Test {
         engine.pushMark(SUBJECT_ID, newMark);
     }
 
+    function _accrueQuoteFunding(int256 rate1e18, uint64 elapsed) internal {
+        vm.prank(fundingWriter);
+        engine.pushFundingQuoteIndex(SUBJECT_ID, 0, 0, INITIAL_MARK);
+        vm.warp(block.timestamp + elapsed);
+        _pushMark(INITIAL_MARK);
+        int256 delta = (rate1e18 * int256(INITIAL_MARK) * int256(uint256(elapsed))) / int256(ONE_18 * 3600);
+        vm.prank(fundingWriter);
+        engine.pushFundingQuoteIndex(SUBJECT_ID, delta, rate1e18, INITIAL_MARK);
+    }
+
     /// @dev Crash the mark to $20 in ≤50%-per-push steps.
     function _crashTo20() internal {
         _pushMark(50 * ONE_18);
@@ -238,6 +254,33 @@ contract LiquidationADLTest is Test {
         // pnl = $100K + $100K = $200K (vs the $400K it would have received at the $20 mark — it
         // gives up exactly the bad long's $220K-ish shortfall via the price gap).
         assertEq(usdc.balanceOf(cpTrader) - cpBalBefore, 200_000 * ONE_USDC);
+    }
+
+    function test_Adl_FundingAdjustsBankruptcyPriceAndCounterpartyPayout() public {
+        bytes32 badId = _open(badTrader, IPerpEngine.Side.LONG, 100_000 * ONE_USDC, 400_000 * ONE_USDC);
+        bytes32 cpId = _open(cpTrader, IPerpEngine.Side.SHORT, 100_000 * ONE_USDC, 400_000 * ONE_USDC);
+
+        // +5 bps/h at $100 is $0.05/base: the long owes $200 and the short receives $200.
+        // Effective bad-position collateral becomes $99,800, moving P_b from $75 to $75.05.
+        _accrueQuoteFunding(5e14, 1 hours);
+        assertEq(engine.fundingDebtOf(badId), int256(200 * ONE_USDC));
+        assertEq(engine.fundingDebtOf(cpId), -int256(200 * ONE_USDC));
+        _crashTo20();
+
+        uint256 cpBalBefore = usdc.balanceOf(cpTrader);
+        bytes32[] memory cps = new bytes32[](1);
+        cps[0] = cpId;
+
+        vm.expectEmit(true, true, true, true, address(liqEngine));
+        emit ILiquidationEngine.AutoDeleveraged(badId, cpId, cpTrader, -int256(4000e6), 75.05e18, 200_000 * ONE_USDC);
+        vm.prank(liquidator);
+        liqEngine.adl(badId, cps);
+
+        // The shifted bankruptcy price reduces price PnL by $200 while the funding credit restores
+        // the same $200K total payout. Both positions are fully closed and their quote snapshots clear.
+        assertEq(usdc.balanceOf(cpTrader) - cpBalBefore, 200_000 * ONE_USDC);
+        assertEq(engine.positionFundingQuoteIndex(badId), 0);
+        assertEq(engine.positionFundingQuoteIndex(cpId), 0);
     }
 
     /// @dev Partial counterparty: short larger than the bad long is closed only up to the matched

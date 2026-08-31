@@ -12,21 +12,20 @@ import {IOracleRouter} from "../oracle/IOracleRouter.sol";
 import {IFundingEngine} from "./IFundingEngine.sol";
 import {IPerpEngine} from "./IPerpEngine.sol";
 
-/// @title  FundingEngine — cumulative-funding-index driver for People Markets perps.
+/// @title  FundingEngine — quote-denominated funding-index driver for People Markets perps.
 /// @notice Pulls premium index + OI + sentiment from the upstream oracles + PerpEngine, computes
 ///         the per-hour funding rate via `FundingMath`, integrates over elapsed time, and pushes
-///         the new cumulative index to PerpEngine.
+///         the new cumulative quote-per-base index to PerpEngine.
 ///
-/// @dev    v0 ships ONLY the index driver. Per-position settle (multiplying the index delta by
-///         signed size at close and applying it to collateral) is deferred to a later wave. This
-///         contract is the single source of truth for the cumulative index; PerpEngine snapshots
-///         it on open via `entryFundingIndex` so the position struct stays forward-compatible.
+/// @dev    PerpEngine is the source of truth for the cumulative quote index and each position's
+///         entry snapshot. The legacy dimensionless index remains readable only for upgrade
+///         compatibility and is never reinterpreted as quote value.
 ///
 /// @dev    Namespaced storage at `keccak256("people.markets.fundingengine.v1")`. The legacy
 ///         `FundingStorage` namespace (in `StorageLib.sol`) is RESERVED — this contract does NOT
-///         use it. The cumulative index lives in the existing `FundingStorage` slot on PerpEngine
-///         (written via `pushFundingIndex`); this engine's own slot stores governance, dependency
-///         addresses, subject<>metric bindings, sentiment scores, and the rate coefficients.
+///         use it. The quote index lives in `QuoteFundingStorage` on PerpEngine (written via
+///         `pushFundingQuoteIndex`); this engine's own slot stores governance, dependency addresses,
+///         subject<>metric bindings, sentiment scores, and the rate coefficients.
 ///
 /// @dev    Roles:
 ///           - `governance` — slow lever, timelocked. Subject registry, sentiment-writer adds,
@@ -115,8 +114,8 @@ contract FundingEngine is Initializable, UUPSUpgradeable, ReentrancyGuard, IFund
 
     /// @notice Initialize the engine. One-time, called via the proxy.
     /// @param  governance_     Multi-sig that proposes/activates config changes; timelocked.
-    /// @param  perpEngine_     PerpEngine address. The engine writes the cumulative index via
-    ///                         `pushFundingIndex` and reads mark + OI + last-funding timestamp.
+    /// @param  perpEngine_     PerpEngine address. The engine writes the quote index via
+    ///                         `pushFundingQuoteIndex` and reads mark, OI, and the quote clock.
     /// @param  oracleRouter_   OracleRouter address. Source for the per-subject reference index.
     /// @param  timelockDelay_  Seconds. Must lie in [MIN_TIMELOCK_DELAY, MAX_TIMELOCK_DELAY].
     function initialize(
@@ -170,12 +169,12 @@ contract FundingEngine is Initializable, UUPSUpgradeable, ReentrancyGuard, IFund
     ///       3. Read mark + longOI + shortOI from PerpEngine.
     ///       4. Read sentiment from local storage.
     ///       5. Compute `FundingTerms` via the pure library (no state writes here yet).
-    ///       6. If this is the first poke (`lastFundingAt == 0`): seed the clock with a rate=0
+    ///       6. If this is the first poke (`lastQuoteFundingAt == 0`): seed the clock with a rate=0
     ///          push so subsequent pokes can compute an honest `elapsed`. Skip the math entirely
     ///          to avoid an artificial first-hour rate.
     ///       7. Same-block re-poke (`elapsed == 0`): no-op return — saves gas + avoids a 0-delta
     ///          push that would only emit telemetry noise.
-    ///       8. `delta = computeIndexDelta(rate, elapsed)`; `newIndex = oldIndex + delta`.
+    ///       8. `delta = computeQuoteIndexDelta(rate, mark, elapsed)`; add it to the quote index.
     ///       9. Push to PerpEngine (which routes through `requireTradeable`, so a paused
     ///          subject's poke reverts here — the lever for spec §2 line 66 "pauses freeze
     ///          funding").
@@ -213,13 +212,13 @@ contract FundingEngine is Initializable, UUPSUpgradeable, ReentrancyGuard, IFund
             s.fMaxPerHour_e18
         );
 
-        int256 currentIndex = perp.cumulativeFundingIndex(subjectId);
-        uint64 last = perp.lastFundingAt(subjectId);
+        int256 currentIndex = perp.cumulativeFundingQuoteIndex(subjectId);
+        uint64 last = perp.lastQuoteFundingAt(subjectId);
 
         // Step 6 — first poke seeds the clock with rate=0.
         if (last == 0) {
-            perp.pushFundingIndex(subjectId, currentIndex, 0);
-            emit FundingPoked(subjectId, currentIndex, currentIndex, 0, 0);
+            perp.pushFundingQuoteIndex(subjectId, currentIndex, 0, mark1e18);
+            emit FundingQuotePoked(subjectId, currentIndex, currentIndex, 0, mark1e18, 0);
             return;
         }
 
@@ -229,13 +228,13 @@ contract FundingEngine is Initializable, UUPSUpgradeable, ReentrancyGuard, IFund
         }
         uint64 elapsed = uint64(block.timestamp) - last;
 
-        // Step 8 — integrate rate over elapsed into a cumulative-index delta.
-        int256 delta = FundingMath.computeIndexDelta(terms.totalRate_e18, elapsed);
+        // Step 8 — integrate rate and mark over elapsed into quote funding per base contract.
+        int256 delta = FundingMath.computeQuoteIndexDelta(terms.totalRate_e18, mark1e18, elapsed);
         int256 newIndex = currentIndex + delta;
 
         // Step 9 — push. Pause-aware via `requireTradeable` inside PerpEngine.
-        perp.pushFundingIndex(subjectId, newIndex, terms.totalRate_e18);
-        emit FundingPoked(subjectId, currentIndex, newIndex, terms.totalRate_e18, elapsed);
+        perp.pushFundingQuoteIndex(subjectId, newIndex, terms.totalRate_e18, mark1e18);
+        emit FundingQuotePoked(subjectId, currentIndex, newIndex, terms.totalRate_e18, mark1e18, elapsed);
     }
 
     // ------------------------------------------------------------------------------------------
@@ -413,6 +412,16 @@ contract FundingEngine is Initializable, UUPSUpgradeable, ReentrancyGuard, IFund
     /// @inheritdoc IFundingEngine
     function lastFundingAt(bytes32 subjectId) external view returns (uint64) {
         return IPerpEngine(_s().perpEngine).lastFundingAt(subjectId);
+    }
+
+    /// @inheritdoc IFundingEngine
+    function cumulativeFundingQuoteIndex(bytes32 subjectId) external view returns (int256) {
+        return IPerpEngine(_s().perpEngine).cumulativeFundingQuoteIndex(subjectId);
+    }
+
+    /// @inheritdoc IFundingEngine
+    function lastQuoteFundingAt(bytes32 subjectId) external view returns (uint64) {
+        return IPerpEngine(_s().perpEngine).lastQuoteFundingAt(subjectId);
     }
 
     /// @inheritdoc IFundingEngine

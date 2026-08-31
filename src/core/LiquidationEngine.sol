@@ -8,6 +8,7 @@ import {UUPSUpgradeable} from "@openzeppelin/contracts-upgradeable/proxy/utils/U
 
 import {ReentrancyGuard} from "solady/utils/ReentrancyGuard.sol";
 
+import {FundingMath} from "../libraries/FundingMath.sol";
 import {LiquidationMath} from "../libraries/LiquidationMath.sol";
 
 import {IInsuranceFund} from "./IInsuranceFund.sol";
@@ -207,8 +208,10 @@ contract LiquidationEngine is Initializable, UUPSUpgradeable, ReentrancyGuard, I
         // dependency on MarginEngine narrow — just for the bps parameters.
         IMarginEngine me = IMarginEngine(s.marginEngine);
         (, uint16 mmBps, uint16 bufBps,,) = me.marginParams();
-        bool underBuffer =
-            LiquidationMath.isUnderLiquidationBuffer(pos.size, pos.collateral, mark, pos.entryPrice, mmBps, bufBps);
+        int256 fundingDebt6 = pe.fundingDebtOf(positionId);
+        bool underBuffer = LiquidationMath.isUnderLiquidationBuffer(
+            pos.size, pos.collateral, mark, pos.entryPrice, mmBps, bufBps, fundingDebt6
+        );
         if (!underBuffer) revert NotUnderBuffer(positionId);
 
         result.positionId = positionId;
@@ -218,6 +221,8 @@ contract LiquidationEngine is Initializable, UUPSUpgradeable, ReentrancyGuard, I
         uint8 attempts = s.partialAttempts[positionId];
         // Branch 1: partial path. The attempts counter has not yet exhausted the budget.
         if (attempts < s.minPartialsBeforeFull) {
+            int256 reducedSize = LiquidationMath.partialSize(pos.size, s.partialIncrementBps);
+            int256 fundingDebtOnSlice6 = _fundingDebtForSize(pe, positionId, pos.subjectId, reducedSize);
             LiquidationMath.PartialResult memory pr = LiquidationMath.computePartialIncrement(
                 pos.size,
                 pos.collateral,
@@ -226,25 +231,20 @@ contract LiquidationEngine is Initializable, UUPSUpgradeable, ReentrancyGuard, I
                 s.partialIncrementBps,
                 s.fullBountyBps,
                 mmBps,
-                s.mmRestoreBufferBps
+                s.mmRestoreBufferBps,
+                fundingDebt6,
+                fundingDebtOnSlice6
             );
 
             if (pr.collateralFreed > 0) {
                 // Partial succeeded. Apply it via PerpEngine.liquidateClose.
                 //
-                // The slice closed is `pr.reducedSize`; the slice's collateral share is
-                // `pos.collateral × partialIncrementBps / 10_000`. The vault's payout-conservation
-                // invariant requires `traderPayout + bounty = sliceCollateral + slicePnl`, so we
-                // back out `slicePnl` from `(collateralFreed, bountyTarget, sliceCollateral)`.
-                uint256 sliceCollateral = (pos.collateral * uint256(s.partialIncrementBps)) / BPS_DENOMINATOR;
-                int256 slicePnl = int256(pr.collateralFreed) + int256(pr.bountyToLiquidator) - int256(sliceCollateral);
-
                 pe.liquidateClose(
                     positionId,
                     pr.reducedSize,
                     pr.collateralFreed,
                     pr.bountyToLiquidator,
-                    slicePnl,
+                    pr.signedPnl,
                     msg.sender,
                     uint8(Tier.PARTIAL)
                 );
@@ -268,7 +268,7 @@ contract LiquidationEngine is Initializable, UUPSUpgradeable, ReentrancyGuard, I
 
         // Branch 2: full path. Either the attempts counter exhausted the partial budget OR the
         // last partial flagged `PartialInsufficient` and we hit `>= minPartialsBeforeFull`.
-        return _runFullWaterfall(s, pe, pos, positionId, mark);
+        return _runFullWaterfall(s, pe, pos, positionId, mark, fundingDebt6);
     }
 
     /// @dev Tier 2 — full close. If equity covers the bounty, the trader gets the residue and the
@@ -279,7 +279,8 @@ contract LiquidationEngine is Initializable, UUPSUpgradeable, ReentrancyGuard, I
         IPerpEngine pe,
         IPerpEngine.Position memory pos,
         bytes32 positionId,
-        uint256 mark
+        uint256 mark,
+        int256 fundingDebt6
     )
         internal
         returns (LiquidationResult memory result)
@@ -288,8 +289,9 @@ contract LiquidationEngine is Initializable, UUPSUpgradeable, ReentrancyGuard, I
         result.trader = pos.owner;
         result.markPrice = mark;
 
-        LiquidationMath.FullResult memory fr =
-            LiquidationMath.computeFullLiquidation(pos.size, pos.collateral, mark, pos.entryPrice, s.fullBountyBps);
+        LiquidationMath.FullResult memory fr = LiquidationMath.computeFullLiquidation(
+            pos.size, pos.collateral, mark, pos.entryPrice, s.fullBountyBps, fundingDebt6
+        );
 
         if (fr.shortfall <= 0) {
             // Tier 2 only — equity covers the bounty.
@@ -415,16 +417,19 @@ contract LiquidationEngine is Initializable, UUPSUpgradeable, ReentrancyGuard, I
 
         // Gate 1 — the bad position must be under the liquidation buffer.
         (, uint16 mmBps, uint16 bufBps,,) = IMarginEngine(s.marginEngine).marginParams();
-        if (!LiquidationMath.isUnderLiquidationBuffer(bad.size, bad.collateral, mark, bad.entryPrice, mmBps, bufBps)) {
+        int256 badFundingDebt6 = pe.fundingDebtOf(badPositionId);
+        if (!LiquidationMath.isUnderLiquidationBuffer(
+                bad.size, bad.collateral, mark, bad.entryPrice, mmBps, bufBps, badFundingDebt6
+            )) {
             revert NotUnderBuffer(badPositionId);
         }
 
         // Gate 2 — ADL is only justified when the normal waterfall (insurance + socialization to
         // the cap) cannot absorb the shortfall.
-        _requireAdlJustified(s, bad, mark, badPositionId);
+        _requireAdlJustified(s, bad, mark, badPositionId, badFundingDebt6);
 
         // The price every ADL leg executes at.
-        uint256 pBank = LiquidationMath.bankruptcyPrice(bad.size, bad.collateral, bad.entryPrice);
+        uint256 pBank = LiquidationMath.bankruptcyPrice(bad.size, bad.collateral, bad.entryPrice, badFundingDebt6);
 
         // 1. Wipe the bad position at zero equity. collateralReleased = collateral, payout = 0,
         //    bounty = 0, signedPnl = -collateral ⇒ the vault keeps the full collateral and books no
@@ -456,13 +461,15 @@ contract LiquidationEngine is Initializable, UUPSUpgradeable, ReentrancyGuard, I
         Layout storage s,
         IPerpEngine.Position memory bad,
         uint256 mark,
-        bytes32 badPositionId
+        bytes32 badPositionId,
+        int256 fundingDebt6
     )
         internal
         view
     {
-        LiquidationMath.FullResult memory fr =
-            LiquidationMath.computeFullLiquidation(bad.size, bad.collateral, mark, bad.entryPrice, s.fullBountyBps);
+        LiquidationMath.FullResult memory fr = LiquidationMath.computeFullLiquidation(
+            bad.size, bad.collateral, mark, bad.entryPrice, s.fullBountyBps, fundingDebt6
+        );
         if (fr.shortfall <= 0) revert ADLNotRequired(badPositionId);
 
         uint256 shortfall = uint256(fr.shortfall);
@@ -504,8 +511,11 @@ contract LiquidationEngine is Initializable, UUPSUpgradeable, ReentrancyGuard, I
 
         bool cpIsLong = cp.size > 0;
         if (cpIsLong == badIsLong) revert ADLCounterpartyNotEligible(cpId); // must be opposite side
-        // Only PROFITABLE counterparties are eligible for ADL (spec §3 line 153).
-        if (LiquidationMath.signedPnlAt(cp.size, cp.entryPrice, mark) <= 0) revert ADLCounterpartyNotEligible(cpId);
+        // Only funding-adjusted PROFITABLE counterparties are eligible for ADL.
+        int256 cpFundingDebt6 = pe.fundingDebtOf(cpId);
+        if (LiquidationMath.signedPnlAt(cp.size, cp.entryPrice, mark) - cpFundingDebt6 <= 0) {
+            revert ADLCounterpartyNotEligible(cpId);
+        }
 
         uint256 cpAbs = cpIsLong ? uint256(cp.size) : uint256(-cp.size);
         uint256 closeAbs = cpAbs <= remaining ? cpAbs : remaining;
@@ -515,7 +525,8 @@ contract LiquidationEngine is Initializable, UUPSUpgradeable, ReentrancyGuard, I
         // means the counterparty is insolvent at the bankruptcy price — closing it would create
         // fresh bad debt, so it is not an eligible ADL target.
         uint256 collateralReleased = closeAbs == cpAbs ? cp.collateral : (cp.collateral * closeAbs) / cpAbs;
-        int256 signedPnl = LiquidationMath.signedPnlAt(closeSize, cp.entryPrice, pBank);
+        int256 sliceFundingDebt6 = _fundingDebtForSize(pe, cpId, cp.subjectId, closeSize);
+        int256 signedPnl = LiquidationMath.signedPnlAt(closeSize, cp.entryPrice, pBank) - sliceFundingDebt6;
         int256 payoutSigned = int256(collateralReleased) + signedPnl;
         if (payoutSigned < 0) revert ADLCounterpartyNotEligible(cpId);
         uint256 payout = uint256(payoutSigned);
@@ -548,8 +559,10 @@ contract LiquidationEngine is Initializable, UUPSUpgradeable, ReentrancyGuard, I
         // reset so the next mark push can put the partial budget back in play.
         if (mark != 0) {
             (, uint16 mmBps, uint16 bufBps,,) = IMarginEngine(s.marginEngine).marginParams();
-            bool underBuffer =
-                LiquidationMath.isUnderLiquidationBuffer(pos.size, pos.collateral, mark, pos.entryPrice, mmBps, bufBps);
+            int256 fundingDebt6 = pe.fundingDebtOf(positionId);
+            bool underBuffer = LiquidationMath.isUnderLiquidationBuffer(
+                pos.size, pos.collateral, mark, pos.entryPrice, mmBps, bufBps, fundingDebt6
+            );
             if (underBuffer) revert StillUnderBuffer(positionId);
         }
 
@@ -564,6 +577,21 @@ contract LiquidationEngine is Initializable, UUPSUpgradeable, ReentrancyGuard, I
         uint256 absSize = size > 0 ? uint256(size) : uint256(-size);
         uint256 notional6 = (absSize * mark) / ONE;
         return (notional6 * uint256(bps)) / BPS_DENOMINATOR;
+    }
+
+    function _fundingDebtForSize(
+        IPerpEngine pe,
+        bytes32 positionId,
+        bytes32 subjectId,
+        int256 size
+    )
+        internal
+        view
+        returns (int256)
+    {
+        return FundingMath.computeFundingDebt(
+            size, pe.cumulativeFundingQuoteIndex(subjectId), pe.positionFundingQuoteIndex(positionId)
+        );
     }
 
     // ------------------------------------------------------------------------------------------
