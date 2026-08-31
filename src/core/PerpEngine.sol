@@ -7,6 +7,7 @@ import {UUPSUpgradeable} from "@openzeppelin/contracts-upgradeable/proxy/utils/U
 import {ReentrancyGuard} from "solady/utils/ReentrancyGuard.sol";
 
 import {FundingMath} from "../libraries/FundingMath.sol";
+import {PerpFeeMath} from "../libraries/PerpFeeMath.sol";
 import {PerpInternals} from "../libraries/PerpInternals.sol";
 import {PositionMath} from "../libraries/PositionMath.sol";
 import {FundingStorage, PerpStorage, QuoteFundingStorage} from "../libraries/StorageLib.sol";
@@ -39,17 +40,10 @@ contract PerpEngine is Initializable, UUPSUpgradeable, ReentrancyGuard, IPerpEng
     uint256 internal constant ONE = 1e18;
     uint256 internal constant BPS_DENOMINATOR = 10_000;
 
-    /// @dev Fee precision: 1e6, so taker = 0.075% = 750. Bps (1e4) is too coarse for the spec's
-    ///      0.075% / 0.025% values; ppm gives clean integers without fractional rounding.
-    uint256 internal constant FEE_RATE_DENOM = 1_000_000;
-    uint16 internal constant TAKER_FEE_RATE = 750; // 0.075% per spec §3
-    uint16 internal constant MAKER_FEE_RATE = 250; // 0.025%
-
     /// @dev Spec §3 fee split: 40% LP rebate (default; tunable via `setLpRebatePct` in [25, 50]),
     ///      50% insurance (pinned), residual = 100 - lpRebatePct - 50 to treasury (`accruedFees`).
     ///      `lpRebatePct` lives in storage; the spec's 40 → 30% LP-rebate decay over 6 months is
     ///      executed by governance ratcheting this value down.
-    uint8 internal constant INSURANCE_PCT = 50;
     uint8 internal constant MIN_LP_REBATE_PCT = 25;
     uint8 internal constant MAX_LP_REBATE_PCT = 50;
 
@@ -141,8 +135,12 @@ contract PerpEngine is Initializable, UUPSUpgradeable, ReentrancyGuard, IPerpEng
     ///      removes are immediate (same shape as `markWriters`). Until governance registers a
     ///      router, every call lands here and reverts.
     modifier onlyRouter() {
-        if (!PerpStorage.load().routers[msg.sender]) revert OnlyRouter(msg.sender);
+        _requireRouter();
         _;
+    }
+
+    function _requireRouter() private view {
+        if (!PerpStorage.load().routers[msg.sender]) revert OnlyRouter(msg.sender);
     }
 
     // ------------------------------------------------------------------------------------------
@@ -150,8 +148,12 @@ contract PerpEngine is Initializable, UUPSUpgradeable, ReentrancyGuard, IPerpEng
     // ------------------------------------------------------------------------------------------
 
     modifier onlyGovernance() {
-        if (msg.sender != PerpStorage.load().governance) revert Unauthorized(msg.sender);
+        _requireGovernance();
         _;
+    }
+
+    function _requireGovernance() private view {
+        if (msg.sender != PerpStorage.load().governance) revert Unauthorized(msg.sender);
     }
 
     // ------------------------------------------------------------------------------------------
@@ -179,6 +181,23 @@ contract PerpEngine is Initializable, UUPSUpgradeable, ReentrancyGuard, IPerpEng
     {
         if (trader == address(0)) revert InvalidConfig();
         return _openPositionFor(trader, p);
+    }
+
+    /// @inheritdoc IPerpEngine
+    /// @dev The trusted matched-fill router is the authorization and atomicity boundary. This
+    ///      wrapper preserves PerpEngine's reentrancy and timelocked-router gates; the extracted
+    ///      implementation keeps the additional execution-price path outside the EIP-170-constrained
+    ///      engine bytecode.
+    function openPositionForMatched(
+        address trader,
+        MatchedOpenParams calldata p
+    )
+        external
+        nonReentrant
+        onlyRouter
+        returns (bytes32 positionId)
+    {
+        return PerpInternals.openPositionForMatched(trader, p);
     }
 
     /// @dev Shared open-path implementation. Both `openPosition` (where `trader == msg.sender`)
@@ -638,12 +657,7 @@ contract PerpEngine is Initializable, UUPSUpgradeable, ReentrancyGuard, IPerpEng
         view
         returns (uint256 fee, uint256 lpRebate, uint256 insuranceShare)
     {
-        uint256 rate = isMaker ? MAKER_FEE_RATE : TAKER_FEE_RATE;
-        fee = (notional * rate) / FEE_RATE_DENOM;
-        // lpRebatePct lives in storage so governance can ratchet 40% → 30% per spec §3 line 139.
-        lpRebate = (fee * uint256(PerpStorage.load().lpRebatePct)) / 100;
-        insuranceShare = (fee * INSURANCE_PCT) / 100;
-        // residual = fee − lpRebate − insuranceShare flows to vault.accruedFees in the vault
+        return PerpFeeMath.compute(notional, isMaker, PerpStorage.load().lpRebatePct);
     }
 
     // ------------------------------------------------------------------------------------------

@@ -50,6 +50,22 @@ interface IPerpEngine {
         bool isMaker;
     }
 
+    /// @notice Router-only open parameters for a cryptographically authorized matched fill.
+    /// @dev `executionPrice` is the signed maker limit and becomes the accounting entry price;
+    ///      the fresh mark remains the risk/slippage reference. `maxFee` and maker/taker role are
+    ///      derived from the signed orders by the trusted matched-fill router.
+    struct MatchedOpenParams {
+        bytes32 subjectId;
+        Side side;
+        uint256 collateralAmount;
+        uint256 sizeNotional;
+        uint256 executionPrice;
+        uint256 maxMarkDivergenceBps;
+        uint256 maxFee;
+        uint64 deadline;
+        bool isMaker;
+    }
+
     // ------------------------------------------------------------------------------------------
     // Trader actions
     // ------------------------------------------------------------------------------------------
@@ -66,6 +82,12 @@ interface IPerpEngine {
     ///         everywhere. Both entry points delegate to the same internal helper so future
     ///         changes to the open path apply uniformly.
     function openPositionFor(address trader, OpenParams calldata p) external returns (bytes32 positionId);
+
+    /// @notice Open one side of a signed matched fill at its deterministic execution price.
+    /// @dev Caller MUST be a timelocked trusted router. The router verifies EIP-712/ERC-1271
+    ///      authority, nonce/deadline, limits, role, and atomic counterparty compatibility before
+    ///      calling this method twice in one transaction. A revert on either side unwinds both.
+    function openPositionForMatched(address trader, MatchedOpenParams calldata p) external returns (bytes32 positionId);
 
     /// @notice Close (or partially close) the caller's position on `subjectId`. Returns signed
     ///         realized PnL on the closed slice.
@@ -451,6 +473,8 @@ interface IPerpEngine {
     error KycTierMissing(address trader);
     error KycTierInvalid(uint8 tier);
     error SlippageExceeded(uint256 expected, uint256 actual, uint256 maxBps);
+    error MarkDivergenceBpsOutOfRange(uint256 bps);
+    error FeeLimitExceeded(uint256 fee, uint256 maxFee);
     error DeadlineExpired(uint64 deadline);
     error InvalidSizeFraction(uint256 bps);
     error UnderwaterClose(int256 equity);

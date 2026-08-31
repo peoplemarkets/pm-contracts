@@ -7,8 +7,9 @@ import {IPerpEngine} from "../core/IPerpEngine.sol";
 import {ISubjectRegistry} from "../registry/ISubjectRegistry.sol";
 
 import {FundingMath} from "./FundingMath.sol";
+import {PerpFeeMath} from "./PerpFeeMath.sol";
 import {PositionMath} from "./PositionMath.sol";
-import {PerpStorage, QuoteFundingStorage} from "./StorageLib.sol";
+import {FundingStorage, PerpStorage, QuoteFundingStorage} from "./StorageLib.sol";
 
 /// @title  PerpInternals — bytecode-extraction library for PerpEngine.
 /// @notice Hosts the heavy-weight close paths (`liquidateClose`) as a `public` library function so
@@ -21,6 +22,9 @@ import {PerpStorage, QuoteFundingStorage} from "./StorageLib.sol";
 ///         engine-facing interface so indexers remain selector-compatible.
 library PerpInternals {
     uint256 internal constant ONE = 1e18;
+    uint256 internal constant BPS_DENOMINATOR = 10_000;
+    uint256 internal constant MIN_MARK = 1;
+    uint256 internal constant MAX_MARK = 1e36;
 
     // ------------------------------------------------------------------------------------------
     // Mirrored events (signatures must match IPerpEngine)
@@ -35,6 +39,17 @@ library PerpInternals {
         uint256 bountyPaid,
         int256 signedPnl,
         uint8 tierCode
+    );
+
+    event PositionOpened(
+        bytes32 indexed positionId,
+        address indexed trader,
+        bytes32 indexed subjectId,
+        IPerpEngine.Side side,
+        int256 size,
+        uint256 entryPrice,
+        uint256 collateral,
+        uint256 fee
     );
 
     // BREAKING: `size` + `isLong` appended (see IPerpEngine) — signature MUST match the interface
@@ -67,7 +82,14 @@ library PerpInternals {
     // ------------------------------------------------------------------------------------------
 
     error InvalidConfig();
+    error PositionAlreadyOpen(address trader, bytes32 subjectId);
     error PositionNotOpen(bytes32 subjectId);
+    error KycTierMissing(address trader);
+    error DeadlineExpired(uint64 deadline);
+    error SlippageExceeded(uint256 expected, uint256 actual, uint256 maxBps);
+    error MarkDivergenceBpsOutOfRange(uint256 bps);
+    error FeeLimitExceeded(uint256 fee, uint256 maxFee);
+    error MarkValueOutOfRange(uint256 value);
     error LiquidationSizeMismatch(int256 positionSize, int256 sizeToClose);
     error LiquidationSizeZero();
     error SubjectNotForceSettled(bytes32 subjectId);
@@ -82,6 +104,88 @@ library PerpInternals {
     error SubjectIsForceSettled(bytes32 subjectId);
     error MaintenanceMarginShort(uint256 mmBps, uint256 ratioBps);
     error MarginEngineUnset();
+
+    /// @notice Apply one side of an EIP-712-authorized matched open at its execution price.
+    /// @dev The PerpEngine wrapper enforces the trusted-router role and reentrancy guard. The
+    ///      matched-fill router invokes this twice in one EVM transaction; a failure on either
+    ///      side unwinds both position and vault transitions. Full-order compatibility,
+    ///      signatures, nonces, maker/taker derivation, and price limits live in that router.
+    function openPositionForMatched(
+        address trader,
+        IPerpEngine.MatchedOpenParams memory p
+    )
+        public
+        returns (bytes32 positionId)
+    {
+        PerpStorage.Layout storage perpS = PerpStorage.load();
+
+        if (trader == address(0)) revert InvalidConfig();
+        if (perpS.globalHalt) revert GlobalHaltedError();
+        if (block.timestamp > p.deadline) revert DeadlineExpired(p.deadline);
+        if (p.collateralAmount == 0 || p.sizeNotional == 0) revert AmountZero();
+        if (p.executionPrice < MIN_MARK || p.executionPrice > MAX_MARK) {
+            revert MarkValueOutOfRange(p.executionPrice);
+        }
+        if (p.maxMarkDivergenceBps > BPS_DENOMINATOR) {
+            revert MarkDivergenceBpsOutOfRange(p.maxMarkDivergenceBps);
+        }
+
+        ISubjectRegistry(perpS.subjectRegistry).requireTradeable(p.subjectId);
+        uint8 tier = ISubjectRegistry(perpS.subjectRegistry).kycTierOf(trader);
+        if (tier == 0) revert KycTierMissing(trader);
+
+        uint256 markNow = _readFreshMark(perpS, p.subjectId);
+        _checkSlippage(markNow, p.executionPrice, p.maxMarkDivergenceBps);
+
+        if (perpS.openPositionId[trader][p.subjectId] != bytes32(0)) {
+            revert PositionAlreadyOpen(trader, p.subjectId);
+        }
+
+        IMarginEngine me = IMarginEngine(perpS.marginEngine);
+        if (address(me) == address(0)) revert MarginEngineUnset();
+        me.checkInitialMargin(p.sizeNotional, p.collateralAmount);
+        bytes32 categoryId = _categoryOf(perpS, p.subjectId);
+        _enforceOpenCaps(me, perpS, trader, p, categoryId, tier);
+
+        (uint256 fee, uint256 lpRebate, uint256 insuranceShare) =
+            PerpFeeMath.compute(p.sizeNotional, p.isMaker, perpS.lpRebatePct);
+        if (fee > p.maxFee) revert FeeLimitExceeded(fee, p.maxFee);
+
+        int256 absSize = int256((p.sizeNotional * ONE) / p.executionPrice);
+        if (absSize == 0) revert AmountZero();
+        int256 signedSize = p.side == IPerpEngine.Side.LONG ? absSize : -absSize;
+
+        unchecked {
+            positionId = keccak256(abi.encode(trader, p.subjectId, perpS.nextPositionNonce++));
+        }
+
+        int256 entryFundingIndex = FundingStorage.load().cumulativeFundingIndex[p.subjectId];
+        QuoteFundingStorage.Layout storage quoteS = QuoteFundingStorage.load();
+        perpS.positions[positionId] = IPerpEngine.Position({
+            size: signedSize,
+            collateral: p.collateralAmount,
+            entryPrice: p.executionPrice,
+            entryFundingIndex: entryFundingIndex,
+            openedAt: uint64(block.timestamp),
+            lastInteractionAt: uint64(block.timestamp),
+            owner: trader,
+            subjectId: p.subjectId
+        });
+        quoteS.entryQuoteIndex[positionId] = quoteS.cumulativeQuoteIndex[p.subjectId];
+        perpS.openPositionId[trader][p.subjectId] = positionId;
+
+        if (p.side == IPerpEngine.Side.LONG) {
+            perpS.totalLongOI[p.subjectId] += p.sizeNotional;
+        } else {
+            perpS.totalShortOI[p.subjectId] += p.sizeNotional;
+        }
+        me.recordOpenDelta(trader, categoryId, IMarginEngine.Side(uint8(p.side)), p.sizeNotional, tier);
+
+        ILPVault(perpS.lpVault).openPositionFlow(trader, p.collateralAmount, fee, lpRebate, insuranceShare);
+        emit PositionOpened(
+            positionId, trader, p.subjectId, p.side, signedSize, p.executionPrice, p.collateralAmount, fee
+        );
+    }
 
     /// @notice Validate and store one cumulative quote-funding update for PerpEngine.
     /// @dev    Extracted as a public library function so PerpEngine remains deployable under
@@ -347,6 +451,43 @@ library PerpInternals {
         // Forced settlement always fully closes the position, so the closed size is the full signed
         // `orig.size` and `isLong` its side. BREAKING event-signature change — see IPerpEngine.
         emit PositionClosedAtForcedSettlement(positionId, claimant, subjectId, cappedPnl, returned, orig.size, isLong);
+    }
+
+    function _checkSlippage(uint256 markNow, uint256 executionPrice, uint256 maxBps) private pure {
+        uint256 diff = markNow > executionPrice ? markNow - executionPrice : executionPrice - markNow;
+        if (diff * BPS_DENOMINATOR > maxBps * executionPrice) {
+            revert SlippageExceeded(executionPrice, markNow, maxBps);
+        }
+    }
+
+    function _categoryOf(PerpStorage.Layout storage perpS, bytes32 subjectId) private view returns (bytes32) {
+        return ISubjectRegistry(perpS.subjectRegistry).subjectOf(subjectId).categoryId;
+    }
+
+    function _enforceOpenCaps(
+        IMarginEngine me,
+        PerpStorage.Layout storage perpS,
+        address trader,
+        IPerpEngine.MatchedOpenParams memory p,
+        bytes32 categoryId,
+        uint8 tier
+    )
+        private
+        view
+    {
+        uint256 liveTvl = ILPVault(perpS.lpVault).capTvl();
+        uint256 vaultTvl = perpS.cappedTvl < liveTvl ? perpS.cappedTvl : liveTvl;
+        me.enforceOpenCaps(
+            trader,
+            p.subjectId,
+            categoryId,
+            IMarginEngine.Side(uint8(p.side)),
+            p.sizeNotional,
+            tier,
+            perpS.totalLongOI[p.subjectId],
+            perpS.totalShortOI[p.subjectId],
+            vaultTvl
+        );
     }
 
     function _readFreshMark(PerpStorage.Layout storage perpS, bytes32 subjectId)
