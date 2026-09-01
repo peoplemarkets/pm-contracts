@@ -3,6 +3,7 @@ pragma solidity 0.8.24;
 
 import {Initializable} from "@openzeppelin/contracts-upgradeable/proxy/utils/Initializable.sol";
 import {UUPSUpgradeable} from "@openzeppelin/contracts-upgradeable/proxy/utils/UUPSUpgradeable.sol";
+import {Math} from "@openzeppelin/contracts/utils/math/Math.sol";
 
 import {EIP712} from "solady/utils/EIP712.sol";
 import {ReentrancyGuard} from "solady/utils/ReentrancyGuard.sol";
@@ -22,6 +23,12 @@ contract MatchedFillRouter is Initializable, UUPSUpgradeable, EIP712, Reentrancy
     bytes32 public constant ORDER_TYPEHASH = keccak256(
         "Order(address trader,address executor,bytes32 subaccount,bytes32 subjectId,bytes32 positionId,uint8 side,uint8 intent,uint256 quantity,uint256 collateralAmount,uint256 limitPrice,uint256 maxFee,uint16 maxMarkDivergenceBps,uint256 nonce,uint64 deadline,bool reduceOnly,bool postOnly)"
     );
+    bytes32 public constant PAIR_LEG_TYPEHASH = keccak256(
+        "PairLeg(bytes32 subjectId,uint8 side,uint256 quantity,uint256 collateralAmount,uint256 limitPrice,uint256 maxFee,uint16 maxMarkDivergenceBps)"
+    );
+    bytes32 public constant PAIR_ORDER_TYPEHASH = keccak256(
+        "PairOrder(address trader,address executor,bytes32 subaccount,PairLeg legA,PairLeg legB,uint16 maxNotionalImbalanceBps,uint256 nonce,uint64 deadline,bool postOnly)PairLeg(bytes32 subjectId,uint8 side,uint256 quantity,uint256 collateralAmount,uint256 limitPrice,uint256 maxFee,uint16 maxMarkDivergenceBps)"
+    );
 
     bytes32 internal constant MATCHED_FILL_ROUTER_SLOT =
         0x8d07586d1978584bbfd5d7b39268b56d9debb43a3da63d03c80e1cd8bdb58400;
@@ -40,6 +47,7 @@ contract MatchedFillRouter is Initializable, UUPSUpgradeable, EIP712, Reentrancy
         mapping(bytes32 orderHash => bool cancelled) cancelled;
         mapping(bytes32 fillId => bool used) fillUsed;
         mapping(address trader => uint256 minimum) minimumValidNonce;
+        mapping(bytes32 pairOrderHash => bool filled) pairFilled;
     }
 
     function _s() internal pure returns (Layout storage l) {
@@ -131,6 +139,76 @@ contract MatchedFillRouter is Initializable, UUPSUpgradeable, EIP712, Reentrancy
         );
     }
 
+    /// @inheritdoc IMatchedFillRouter
+    function settlePair(
+        bytes32 fillId,
+        Order calldata makerA,
+        bytes calldata makerSignatureA,
+        Order calldata makerB,
+        bytes calldata makerSignatureB,
+        PairOrder calldata pair,
+        bytes calldata pairSignature
+    )
+        external
+        nonReentrant
+        returns (PairMatchResult memory result)
+    {
+        Layout storage s = _s();
+        if (fillId == bytes32(0)) revert InvalidConfig();
+        if (s.fillUsed[fillId]) revert FillAlreadyUsed(fillId);
+
+        _validatePairShape(makerA, makerB, pair);
+        bytes32 makerHashA = _validateOrder(s, makerA, makerSignatureA);
+        bytes32 makerHashB = _validateOrder(s, makerB, makerSignatureB);
+        bytes32 pairHash = _validatePairOrder(s, pair, pairSignature);
+
+        uint256 executionPriceA = makerA.limitPrice;
+        uint256 executionPriceB = makerB.limitPrice;
+        _checkLimit(pair.legA.side, pair.legA.limitPrice, executionPriceA);
+        _checkLimit(pair.legB.side, pair.legB.limitPrice, executionPriceB);
+        _checkPairNotionalBalance(pair, executionPriceA, executionPriceB);
+
+        // CEI. Any of the four PerpEngine calls reverting unwinds every replay marker and leg.
+        s.fillUsed[fillId] = true;
+        s.filledQuantity[makerHashA] = makerA.quantity;
+        s.filledQuantity[makerHashB] = makerB.quantity;
+        s.pairFilled[pairHash] = true;
+
+        IPerpEngine engine = IPerpEngine(s.perpEngine);
+        result.makerPositionA = _apply(engine, makerA, executionPriceA, true);
+        result.traderPositionA = _applyPairLeg(engine, pair, pair.legA, executionPriceA);
+        result.makerPositionB = _apply(engine, makerB, executionPriceB, true);
+        result.traderPositionB = _applyPairLeg(engine, pair, pair.legB, executionPriceB);
+
+        emit PairFillSettled(fillId, pairHash, pair.trader, makerHashA, makerHashB);
+        emit PairLegSettled(
+            fillId,
+            0,
+            makerHashA,
+            pairHash,
+            makerA.trader,
+            pair.trader,
+            pair.legA.subjectId,
+            executionPriceA,
+            pair.legA.quantity,
+            result.makerPositionA,
+            result.traderPositionA
+        );
+        emit PairLegSettled(
+            fillId,
+            1,
+            makerHashB,
+            pairHash,
+            makerB.trader,
+            pair.trader,
+            pair.legB.subjectId,
+            executionPriceB,
+            pair.legB.quantity,
+            result.makerPositionB,
+            result.traderPositionB
+        );
+    }
+
     function _validatePair(Order calldata maker, Order calldata taker) private view {
         if (maker.trader == address(0) || taker.trader == address(0) || maker.trader == taker.trader) {
             revert InvalidCounterparties(maker.trader, taker.trader);
@@ -151,6 +229,106 @@ contract MatchedFillRouter is Initializable, UUPSUpgradeable, EIP712, Reentrancy
             revert InvalidLiquidityRole(maker.postOnly, taker.postOnly);
         }
         if (maker.limitPrice == 0) revert InvalidConfig();
+    }
+
+    function _validatePairShape(Order calldata makerA, Order calldata makerB, PairOrder calldata pair) private view {
+        if (pair.trader == address(0)) revert InvalidConfig();
+        if (pair.executor == address(0) || msg.sender != pair.executor) {
+            revert UnauthorizedExecutor(pair.executor, msg.sender);
+        }
+        if (pair.subaccount != bytes32(0)) revert UnsupportedSubaccount(pair.subaccount);
+        if (pair.postOnly) revert PairMustBeImmediate();
+        if (
+            pair.legA.subjectId == bytes32(0) || pair.legB.subjectId == bytes32(0)
+                || pair.legA.subjectId == pair.legB.subjectId
+        ) {
+            revert InvalidPairSubjects(pair.legA.subjectId, pair.legB.subjectId);
+        }
+        if (pair.legA.side == pair.legB.side) {
+            revert InvalidPairSides(pair.legA.side, pair.legB.side);
+        }
+        if (
+            pair.legA.quantity == 0 || pair.legB.quantity == 0 || pair.legA.collateralAmount == 0
+                || pair.legB.collateralAmount == 0 || pair.legA.limitPrice == 0 || pair.legB.limitPrice == 0
+        ) {
+            revert InvalidConfig();
+        }
+        if (pair.legA.maxMarkDivergenceBps > BPS_DENOMINATOR) {
+            revert MarkDivergenceBpsOutOfRange(pair.legA.maxMarkDivergenceBps);
+        }
+        if (pair.legB.maxMarkDivergenceBps > BPS_DENOMINATOR) {
+            revert MarkDivergenceBpsOutOfRange(pair.legB.maxMarkDivergenceBps);
+        }
+        if (pair.maxNotionalImbalanceBps > BPS_DENOMINATOR) {
+            revert NotionalImbalanceBpsOutOfRange(pair.maxNotionalImbalanceBps);
+        }
+        _validatePairMaker(makerA, pair, pair.legA, 0);
+        _validatePairMaker(makerB, pair, pair.legB, 1);
+    }
+
+    function _validatePairMaker(
+        Order calldata maker,
+        PairOrder calldata pair,
+        PairLeg calldata leg,
+        uint8 legIndex
+    )
+        private
+        pure
+    {
+        if (maker.trader == address(0) || maker.trader == pair.trader) {
+            revert PairSelfTrade(legIndex, maker.trader);
+        }
+        if (maker.executor != pair.executor) {
+            revert UnauthorizedExecutor(pair.executor, maker.executor);
+        }
+        if (maker.subjectId != leg.subjectId) {
+            revert SubjectMismatch(maker.subjectId, leg.subjectId);
+        }
+        if (maker.side == leg.side) revert SideMismatch(maker.side, leg.side);
+        if (maker.quantity != leg.quantity) {
+            revert FullFillRequired(maker.quantity, leg.quantity);
+        }
+        if (maker.intent != OrderIntent.OPEN || !maker.postOnly || maker.reduceOnly || maker.positionId != bytes32(0)) {
+            revert InvalidPairMaker(legIndex);
+        }
+    }
+
+    function _validatePairOrder(
+        Layout storage s,
+        PairOrder calldata pair,
+        bytes calldata signature
+    )
+        private
+        view
+        returns (bytes32 digest)
+    {
+        if (block.timestamp > pair.deadline) revert DeadlineExpired(pair.deadline);
+        uint256 minimum = s.minimumValidNonce[pair.trader];
+        if (pair.nonce < minimum) revert NonceInvalid(pair.trader, pair.nonce, minimum);
+        digest = _hashPairOrder(pair);
+        if (s.cancelled[digest] || s.pairFilled[digest]) revert OrderUnavailable(digest);
+        if (!SignatureCheckerLib.isValidSignatureNowCalldata(pair.trader, digest, signature)) {
+            revert InvalidSignature(pair.trader, digest);
+        }
+    }
+
+    function _checkPairNotionalBalance(
+        PairOrder calldata pair,
+        uint256 executionPriceA,
+        uint256 executionPriceB
+    )
+        private
+        pure
+    {
+        uint256 notionalA = Math.mulDiv(pair.legA.quantity, executionPriceA, 1e18);
+        uint256 notionalB = Math.mulDiv(pair.legB.quantity, executionPriceB, 1e18);
+        if (notionalA == 0 || notionalB == 0) revert InvalidConfig();
+        uint256 larger = notionalA > notionalB ? notionalA : notionalB;
+        uint256 difference = notionalA > notionalB ? notionalA - notionalB : notionalB - notionalA;
+        uint256 actualBps = Math.mulDiv(difference, BPS_DENOMINATOR, larger);
+        if (actualBps > pair.maxNotionalImbalanceBps) {
+            revert NotionalImbalanceExceeded(notionalA, notionalB, pair.maxNotionalImbalanceBps);
+        }
     }
 
     function _validateOrder(
@@ -208,6 +386,31 @@ contract MatchedFillRouter is Initializable, UUPSUpgradeable, EIP712, Reentrancy
         }
         engine.closePositionForMatched(order.trader, _matchedCloseParams(order, executionPrice, isMaker));
         return order.positionId;
+    }
+
+    function _applyPairLeg(
+        IPerpEngine engine,
+        PairOrder calldata pair,
+        PairLeg calldata leg,
+        uint256 executionPrice
+    )
+        private
+        returns (bytes32 positionId)
+    {
+        return engine.openPositionForMatched(
+            pair.trader,
+            IPerpEngine.MatchedOpenParams({
+                subjectId: leg.subjectId,
+                side: leg.side,
+                collateralAmount: leg.collateralAmount,
+                quantity: leg.quantity,
+                executionPrice: executionPrice,
+                maxMarkDivergenceBps: leg.maxMarkDivergenceBps,
+                maxFee: leg.maxFee,
+                deadline: pair.deadline,
+                isMaker: false
+            })
+        );
     }
 
     function _matchedOpenParams(
@@ -268,6 +471,14 @@ contract MatchedFillRouter is Initializable, UUPSUpgradeable, EIP712, Reentrancy
     }
 
     /// @inheritdoc IMatchedFillRouter
+    function cancelPairOrder(PairOrder calldata order) external {
+        if (msg.sender != order.trader) revert Unauthorized(msg.sender);
+        bytes32 digest = _hashPairOrder(order);
+        _s().cancelled[digest] = true;
+        emit OrderCancelled(msg.sender, digest, order.nonce);
+    }
+
+    /// @inheritdoc IMatchedFillRouter
     function invalidateNoncesBelow(uint256 newMinimum) external {
         Layout storage s = _s();
         uint256 oldMinimum = s.minimumValidNonce[msg.sender];
@@ -279,6 +490,11 @@ contract MatchedFillRouter is Initializable, UUPSUpgradeable, EIP712, Reentrancy
     /// @inheritdoc IMatchedFillRouter
     function hashOrder(Order calldata order) external view returns (bytes32 digest) {
         return _hashOrder(order);
+    }
+
+    /// @inheritdoc IMatchedFillRouter
+    function hashPairOrder(PairOrder calldata order) external view returns (bytes32 digest) {
+        return _hashPairOrder(order);
     }
 
     function _hashOrder(Order calldata order) private view returns (bytes32 digest) {
@@ -306,6 +522,39 @@ contract MatchedFillRouter is Initializable, UUPSUpgradeable, EIP712, Reentrancy
         return _hashTypedData(structHash);
     }
 
+    function _hashPairOrder(PairOrder calldata order) private view returns (bytes32 digest) {
+        bytes32 structHash = keccak256(
+            abi.encode(
+                PAIR_ORDER_TYPEHASH,
+                order.trader,
+                order.executor,
+                order.subaccount,
+                _hashPairLeg(order.legA),
+                _hashPairLeg(order.legB),
+                order.maxNotionalImbalanceBps,
+                order.nonce,
+                order.deadline,
+                order.postOnly
+            )
+        );
+        return _hashTypedData(structHash);
+    }
+
+    function _hashPairLeg(PairLeg calldata leg) private pure returns (bytes32 digest) {
+        return keccak256(
+            abi.encode(
+                PAIR_LEG_TYPEHASH,
+                leg.subjectId,
+                leg.side,
+                leg.quantity,
+                leg.collateralAmount,
+                leg.limitPrice,
+                leg.maxFee,
+                leg.maxMarkDivergenceBps
+            )
+        );
+    }
+
     function _domainNameAndVersion() internal pure override returns (string memory name, string memory version) {
         return ("PeopleMarketsMatchedOrders", "2");
     }
@@ -318,6 +567,11 @@ contract MatchedFillRouter is Initializable, UUPSUpgradeable, EIP712, Reentrancy
     /// @inheritdoc IMatchedFillRouter
     function filledQuantity(bytes32 orderHash) external view returns (uint256) {
         return _s().filledQuantity[orderHash];
+    }
+
+    /// @inheritdoc IMatchedFillRouter
+    function isPairOrderFilled(bytes32 orderHash) external view returns (bool) {
+        return _s().pairFilled[orderHash];
     }
 
     /// @inheritdoc IMatchedFillRouter

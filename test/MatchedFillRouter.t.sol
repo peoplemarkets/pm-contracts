@@ -29,9 +29,14 @@ contract MockMatchedPerpEngine {
 
     RecordedCall[] private _calls;
     bool public revertOnSecond;
+    uint256 public revertOnCall;
 
     function setRevertOnSecond(bool enabled) external {
         revertOnSecond = enabled;
+    }
+
+    function setRevertOnCall(uint256 callNumber) external {
+        revertOnCall = callNumber;
     }
 
     function openPositionForMatched(
@@ -41,7 +46,9 @@ contract MockMatchedPerpEngine {
         external
         returns (bytes32 positionId)
     {
-        if (revertOnSecond && _calls.length == 1) revert SecondLegFailed();
+        if ((revertOnSecond && _calls.length == 1) || revertOnCall == _calls.length + 1) {
+            revert SecondLegFailed();
+        }
         positionId = keccak256(abi.encode(trader, p.subjectId, p.side, p.quantity, p.executionPrice, _calls.length));
         _calls.push(
             RecordedCall({
@@ -68,7 +75,9 @@ contract MockMatchedPerpEngine {
         external
         returns (int256 realizedPnl)
     {
-        if (revertOnSecond && _calls.length == 1) revert SecondLegFailed();
+        if ((revertOnSecond && _calls.length == 1) || revertOnCall == _calls.length + 1) {
+            revert SecondLegFailed();
+        }
         _calls.push(
             RecordedCall({
                 trader: trader,
@@ -116,21 +125,27 @@ contract MatchedFillRouterTest is Test {
     MockMatchedPerpEngine internal engine;
 
     uint256 internal constant MAKER_KEY = 0xA11CE;
+    uint256 internal constant MAKER_B_KEY = 0xCAFE;
     uint256 internal constant TAKER_KEY = 0xB0B;
     uint32 internal constant TIMELOCK_DELAY = 1 hours;
     bytes32 internal constant SUBJECT_ID = keccak256("drake");
+    bytes32 internal constant SUBJECT_B = keccak256("kendrick");
     uint256 internal constant QUANTITY = 100e6;
+    uint256 internal constant QUANTITY_B = 200e6;
     uint256 internal constant MAKER_LIMIT = 100e18;
+    uint256 internal constant MAKER_LIMIT_B = 50e18;
 
     address internal governance = makeAddr("governance");
     address internal executor = makeAddr("executor");
     address internal stranger = makeAddr("stranger");
     address internal makerTrader;
+    address internal makerTraderB;
     address internal takerTrader;
 
     function setUp() public {
         vm.warp(2_000_000_000);
         makerTrader = vm.addr(MAKER_KEY);
+        makerTraderB = vm.addr(MAKER_B_KEY);
         takerTrader = vm.addr(TAKER_KEY);
         engine = new MockMatchedPerpEngine();
         router = _deployRouter(address(engine), TIMELOCK_DELAY);
@@ -197,6 +212,79 @@ contract MatchedFillRouterTest is Test {
         return abi.encodePacked(r, s, v);
     }
 
+    function _pairMakerA() internal view returns (IMatchedFillRouter.Order memory order) {
+        order = _makerOrder();
+        order.side = IPerpEngine.Side.SHORT;
+    }
+
+    function _pairMakerB() internal view returns (IMatchedFillRouter.Order memory order) {
+        order = _makerOrder();
+        order.trader = makerTraderB;
+        order.subjectId = SUBJECT_B;
+        order.side = IPerpEngine.Side.LONG;
+        order.quantity = QUANTITY_B;
+        order.limitPrice = MAKER_LIMIT_B;
+        order.nonce = 2;
+    }
+
+    function _pairOrder() internal view returns (IMatchedFillRouter.PairOrder memory order) {
+        order = IMatchedFillRouter.PairOrder({
+            trader: takerTrader,
+            executor: executor,
+            subaccount: bytes32(0),
+            legA: IMatchedFillRouter.PairLeg({
+                subjectId: SUBJECT_ID,
+                side: IPerpEngine.Side.LONG,
+                quantity: QUANTITY,
+                collateralAmount: 2_000e6,
+                limitPrice: 101e18,
+                maxFee: 20e6,
+                maxMarkDivergenceBps: 200
+            }),
+            legB: IMatchedFillRouter.PairLeg({
+                subjectId: SUBJECT_B,
+                side: IPerpEngine.Side.SHORT,
+                quantity: QUANTITY_B,
+                collateralAmount: 2_000e6,
+                limitPrice: 49e18,
+                maxFee: 20e6,
+                maxMarkDivergenceBps: 200
+            }),
+            maxNotionalImbalanceBps: 10,
+            nonce: 3,
+            deadline: uint64(block.timestamp + 1 hours),
+            postOnly: false
+        });
+    }
+
+    function _signPair(
+        uint256 privateKey,
+        IMatchedFillRouter.PairOrder memory order
+    )
+        internal
+        view
+        returns (bytes memory)
+    {
+        (uint8 v, bytes32 r, bytes32 s) = vm.sign(privateKey, router.hashPairOrder(order));
+        return abi.encodePacked(r, s, v);
+    }
+
+    function _settlePair(
+        bytes32 fillId,
+        IMatchedFillRouter.Order memory makerA,
+        bytes memory makerSignatureA,
+        IMatchedFillRouter.Order memory makerB,
+        bytes memory makerSignatureB,
+        IMatchedFillRouter.PairOrder memory pair,
+        bytes memory pairSignature
+    )
+        internal
+        returns (IMatchedFillRouter.PairMatchResult memory result)
+    {
+        vm.prank(executor);
+        return router.settlePair(fillId, makerA, makerSignatureA, makerB, makerSignatureB, pair, pairSignature);
+    }
+
     function _settle(
         bytes32 fillId,
         IMatchedFillRouter.Order memory maker,
@@ -216,6 +304,59 @@ contract MatchedFillRouterTest is Test {
         assertEq(router.perpEngine(), address(engine));
         assertEq(router.timelockDelay(), TIMELOCK_DELAY);
         assertNotEq(router.domainSeparator(), bytes32(0));
+    }
+
+    function test_HashPairOrder_MatchesCanonicalNestedEIP712Encoding() public view {
+        IMatchedFillRouter.PairOrder memory pair = _pairOrder();
+        bytes32 legTypeHash = keccak256(
+            "PairLeg(bytes32 subjectId,uint8 side,uint256 quantity,uint256 collateralAmount,uint256 limitPrice,uint256 maxFee,uint16 maxMarkDivergenceBps)"
+        );
+        bytes32 orderTypeHash = keccak256(
+            "PairOrder(address trader,address executor,bytes32 subaccount,PairLeg legA,PairLeg legB,uint16 maxNotionalImbalanceBps,uint256 nonce,uint64 deadline,bool postOnly)PairLeg(bytes32 subjectId,uint8 side,uint256 quantity,uint256 collateralAmount,uint256 limitPrice,uint256 maxFee,uint16 maxMarkDivergenceBps)"
+        );
+        bytes32 legHashA = keccak256(
+            abi.encode(
+                legTypeHash,
+                pair.legA.subjectId,
+                pair.legA.side,
+                pair.legA.quantity,
+                pair.legA.collateralAmount,
+                pair.legA.limitPrice,
+                pair.legA.maxFee,
+                pair.legA.maxMarkDivergenceBps
+            )
+        );
+        bytes32 legHashB = keccak256(
+            abi.encode(
+                legTypeHash,
+                pair.legB.subjectId,
+                pair.legB.side,
+                pair.legB.quantity,
+                pair.legB.collateralAmount,
+                pair.legB.limitPrice,
+                pair.legB.maxFee,
+                pair.legB.maxMarkDivergenceBps
+            )
+        );
+        bytes32 structHash = keccak256(
+            abi.encode(
+                orderTypeHash,
+                pair.trader,
+                pair.executor,
+                pair.subaccount,
+                legHashA,
+                legHashB,
+                pair.maxNotionalImbalanceBps,
+                pair.nonce,
+                pair.deadline,
+                pair.postOnly
+            )
+        );
+        bytes32 expected = keccak256(abi.encodePacked("\x19\x01", router.domainSeparator(), structHash));
+
+        assertEq(router.PAIR_LEG_TYPEHASH(), legTypeHash);
+        assertEq(router.PAIR_ORDER_TYPEHASH(), orderTypeHash);
+        assertEq(router.hashPairOrder(pair), expected);
     }
 
     function test_Initialize_RevertsOnZeroEngine() public {
@@ -568,6 +709,291 @@ contract MatchedFillRouterTest is Test {
             abi.encodeWithSelector(IMatchedFillRouter.MarkDivergenceBpsOutOfRange.selector, maker.maxMarkDivergenceBps)
         );
         router.settle(keccak256("bad-bps"), maker, makerSignature, taker, takerSignature);
+    }
+
+    function test_SettlePair_HappyPath_UsesOneSignedParentAndTwoMakerPrices() public {
+        IMatchedFillRouter.Order memory makerA = _pairMakerA();
+        IMatchedFillRouter.Order memory makerB = _pairMakerB();
+        IMatchedFillRouter.PairOrder memory pair = _pairOrder();
+        bytes32 makerHashA = router.hashOrder(makerA);
+        bytes32 makerHashB = router.hashOrder(makerB);
+        bytes32 pairHash = router.hashPairOrder(pair);
+        bytes32 fillId = keccak256("pair-fill");
+
+        IMatchedFillRouter.PairMatchResult memory result = _settlePair(
+            fillId,
+            makerA,
+            _sign(MAKER_KEY, makerA),
+            makerB,
+            _sign(MAKER_B_KEY, makerB),
+            pair,
+            _signPair(TAKER_KEY, pair)
+        );
+
+        assertTrue(router.isFillUsed(fillId));
+        assertTrue(router.isPairOrderFilled(pairHash));
+        assertEq(router.filledQuantity(makerHashA), QUANTITY);
+        assertEq(router.filledQuantity(makerHashB), QUANTITY_B);
+        assertNotEq(result.makerPositionA, bytes32(0));
+        assertNotEq(result.makerPositionB, bytes32(0));
+        assertNotEq(result.traderPositionA, bytes32(0));
+        assertNotEq(result.traderPositionB, bytes32(0));
+        assertEq(engine.callCount(), 4);
+
+        MockMatchedPerpEngine.RecordedCall memory makerCallA = engine.callAt(0);
+        MockMatchedPerpEngine.RecordedCall memory traderCallA = engine.callAt(1);
+        MockMatchedPerpEngine.RecordedCall memory makerCallB = engine.callAt(2);
+        MockMatchedPerpEngine.RecordedCall memory traderCallB = engine.callAt(3);
+        assertEq(makerCallA.trader, makerTrader);
+        assertEq(uint8(makerCallA.side), uint8(IPerpEngine.Side.SHORT));
+        assertEq(makerCallA.executionPrice, MAKER_LIMIT);
+        assertEq(makerCallA.quantity, QUANTITY);
+        assertTrue(makerCallA.isMaker);
+        assertEq(traderCallA.trader, takerTrader);
+        assertEq(uint8(traderCallA.side), uint8(IPerpEngine.Side.LONG));
+        assertEq(traderCallA.executionPrice, MAKER_LIMIT);
+        assertFalse(traderCallA.isMaker);
+        assertEq(makerCallB.trader, makerTraderB);
+        assertEq(uint8(makerCallB.side), uint8(IPerpEngine.Side.LONG));
+        assertEq(makerCallB.executionPrice, MAKER_LIMIT_B);
+        assertEq(makerCallB.quantity, QUANTITY_B);
+        assertTrue(makerCallB.isMaker);
+        assertEq(traderCallB.trader, takerTrader);
+        assertEq(uint8(traderCallB.side), uint8(IPerpEngine.Side.SHORT));
+        assertEq(traderCallB.executionPrice, MAKER_LIMIT_B);
+        assertFalse(traderCallB.isMaker);
+    }
+
+    function test_SettlePair_IsAtomicWhenFourthPositionFails() public {
+        IMatchedFillRouter.Order memory makerA = _pairMakerA();
+        IMatchedFillRouter.Order memory makerB = _pairMakerB();
+        IMatchedFillRouter.PairOrder memory pair = _pairOrder();
+        bytes32 makerHashA = router.hashOrder(makerA);
+        bytes32 makerHashB = router.hashOrder(makerB);
+        bytes32 pairHash = router.hashPairOrder(pair);
+        bytes32 fillId = keccak256("pair-revert");
+        bytes memory makerSignatureA = _sign(MAKER_KEY, makerA);
+        bytes memory makerSignatureB = _sign(MAKER_B_KEY, makerB);
+        bytes memory pairSignature = _signPair(TAKER_KEY, pair);
+        engine.setRevertOnCall(4);
+
+        vm.prank(executor);
+        vm.expectRevert(MockMatchedPerpEngine.SecondLegFailed.selector);
+        router.settlePair(fillId, makerA, makerSignatureA, makerB, makerSignatureB, pair, pairSignature);
+
+        assertFalse(router.isFillUsed(fillId));
+        assertFalse(router.isPairOrderFilled(pairHash));
+        assertEq(router.filledQuantity(makerHashA), 0);
+        assertEq(router.filledQuantity(makerHashB), 0);
+        assertEq(engine.callCount(), 0);
+    }
+
+    function test_SettlePair_ParentSignatureBindsEveryLegField() public {
+        IMatchedFillRouter.Order memory makerA = _pairMakerA();
+        IMatchedFillRouter.Order memory makerB = _pairMakerB();
+        IMatchedFillRouter.PairOrder memory pair = _pairOrder();
+        bytes memory staleSignature = _signPair(TAKER_KEY, pair);
+        pair.legB.maxFee += 1;
+        bytes32 changedHash = router.hashPairOrder(pair);
+        bytes memory makerSignatureA = _sign(MAKER_KEY, makerA);
+        bytes memory makerSignatureB = _sign(MAKER_B_KEY, makerB);
+
+        vm.prank(executor);
+        vm.expectRevert(abi.encodeWithSelector(IMatchedFillRouter.InvalidSignature.selector, takerTrader, changedHash));
+        router.settlePair(
+            keccak256("mutated-pair"), makerA, makerSignatureA, makerB, makerSignatureB, pair, staleSignature
+        );
+    }
+
+    function test_SettlePair_RejectsPairReplayWithFreshMakers() public {
+        IMatchedFillRouter.Order memory makerA = _pairMakerA();
+        IMatchedFillRouter.Order memory makerB = _pairMakerB();
+        IMatchedFillRouter.PairOrder memory pair = _pairOrder();
+        bytes memory pairSignature = _signPair(TAKER_KEY, pair);
+        _settlePair(
+            keccak256("pair-once"),
+            makerA,
+            _sign(MAKER_KEY, makerA),
+            makerB,
+            _sign(MAKER_B_KEY, makerB),
+            pair,
+            pairSignature
+        );
+
+        makerA.nonce = 101;
+        makerB.nonce = 102;
+        bytes32 pairHash = router.hashPairOrder(pair);
+        bytes memory makerSignatureA = _sign(MAKER_KEY, makerA);
+        bytes memory makerSignatureB = _sign(MAKER_B_KEY, makerB);
+        vm.prank(executor);
+        vm.expectRevert(abi.encodeWithSelector(IMatchedFillRouter.OrderUnavailable.selector, pairHash));
+        router.settlePair(
+            keccak256("pair-twice"), makerA, makerSignatureA, makerB, makerSignatureB, pair, pairSignature
+        );
+    }
+
+    function test_SettlePair_RejectsInvalidPairShapeBeforeSignatures() public {
+        IMatchedFillRouter.Order memory makerA = _pairMakerA();
+        IMatchedFillRouter.Order memory makerB = _pairMakerB();
+        IMatchedFillRouter.PairOrder memory pair = _pairOrder();
+
+        pair.postOnly = true;
+        vm.prank(executor);
+        vm.expectRevert(IMatchedFillRouter.PairMustBeImmediate.selector);
+        router.settlePair(keccak256("resting-pair"), makerA, "", makerB, "", pair, "");
+
+        pair = _pairOrder();
+        pair.legB.subjectId = pair.legA.subjectId;
+        vm.prank(executor);
+        vm.expectRevert(
+            abi.encodeWithSelector(
+                IMatchedFillRouter.InvalidPairSubjects.selector, pair.legA.subjectId, pair.legB.subjectId
+            )
+        );
+        router.settlePair(keccak256("same-subject-pair"), makerA, "", makerB, "", pair, "");
+
+        pair = _pairOrder();
+        pair.legB.side = pair.legA.side;
+        vm.prank(executor);
+        vm.expectRevert(
+            abi.encodeWithSelector(IMatchedFillRouter.InvalidPairSides.selector, pair.legA.side, pair.legB.side)
+        );
+        router.settlePair(keccak256("same-side-pair"), makerA, "", makerB, "", pair, "");
+    }
+
+    function test_SettlePair_RejectsMakerMismatchAndSelfTrade() public {
+        IMatchedFillRouter.Order memory makerA = _pairMakerA();
+        IMatchedFillRouter.Order memory makerB = _pairMakerB();
+        IMatchedFillRouter.PairOrder memory pair = _pairOrder();
+
+        makerB.quantity -= 1;
+        vm.prank(executor);
+        vm.expectRevert(
+            abi.encodeWithSelector(IMatchedFillRouter.FullFillRequired.selector, makerB.quantity, pair.legB.quantity)
+        );
+        router.settlePair(keccak256("pair-size-mismatch"), makerA, "", makerB, "", pair, "");
+
+        makerB = _pairMakerB();
+        makerB.trader = takerTrader;
+        vm.prank(executor);
+        vm.expectRevert(abi.encodeWithSelector(IMatchedFillRouter.PairSelfTrade.selector, 1, takerTrader));
+        router.settlePair(keccak256("pair-self-trade"), makerA, "", makerB, "", pair, "");
+
+        makerB = _pairMakerB();
+        makerB.intent = IMatchedFillRouter.OrderIntent.CLOSE;
+        makerB.positionId = keccak256("maker-position");
+        makerB.collateralAmount = 0;
+        makerB.reduceOnly = true;
+        vm.prank(executor);
+        vm.expectRevert(abi.encodeWithSelector(IMatchedFillRouter.InvalidPairMaker.selector, 1));
+        router.settlePair(keccak256("pair-close-maker"), makerA, "", makerB, "", pair, "");
+    }
+
+    function test_SettlePair_RejectsLegLimitViolation() public {
+        IMatchedFillRouter.Order memory makerA = _pairMakerA();
+        IMatchedFillRouter.Order memory makerB = _pairMakerB();
+        IMatchedFillRouter.PairOrder memory pair = _pairOrder();
+        pair.legA.limitPrice = 99e18;
+        bytes memory makerSignatureA = _sign(MAKER_KEY, makerA);
+        bytes memory makerSignatureB = _sign(MAKER_B_KEY, makerB);
+        bytes memory pairSignature = _signPair(TAKER_KEY, pair);
+
+        vm.prank(executor);
+        vm.expectRevert(
+            abi.encodeWithSelector(
+                IMatchedFillRouter.LimitPriceExceeded.selector, pair.legA.side, pair.legA.limitPrice, makerA.limitPrice
+            )
+        );
+        router.settlePair(
+            keccak256("pair-limit"), makerA, makerSignatureA, makerB, makerSignatureB, pair, pairSignature
+        );
+    }
+
+    function test_SettlePair_RejectsNotionalImbalanceBeyondSignedBound() public {
+        IMatchedFillRouter.Order memory makerA = _pairMakerA();
+        IMatchedFillRouter.Order memory makerB = _pairMakerB();
+        IMatchedFillRouter.PairOrder memory pair = _pairOrder();
+        makerB.quantity = QUANTITY;
+        pair.legB.quantity = QUANTITY;
+        bytes memory makerSignatureA = _sign(MAKER_KEY, makerA);
+        bytes memory makerSignatureB = _sign(MAKER_B_KEY, makerB);
+        bytes memory pairSignature = _signPair(TAKER_KEY, pair);
+
+        vm.prank(executor);
+        vm.expectRevert(
+            abi.encodeWithSelector(
+                IMatchedFillRouter.NotionalImbalanceExceeded.selector,
+                uint256(10_000e6),
+                uint256(5_000e6),
+                pair.maxNotionalImbalanceBps
+            )
+        );
+        router.settlePair(
+            keccak256("pair-imbalance"), makerA, makerSignatureA, makerB, makerSignatureB, pair, pairSignature
+        );
+    }
+
+    function test_CancelPairOrder_PreventsSettlement() public {
+        IMatchedFillRouter.Order memory makerA = _pairMakerA();
+        IMatchedFillRouter.Order memory makerB = _pairMakerB();
+        IMatchedFillRouter.PairOrder memory pair = _pairOrder();
+        bytes32 pairHash = router.hashPairOrder(pair);
+        vm.prank(takerTrader);
+        router.cancelPairOrder(pair);
+        assertTrue(router.isOrderCancelled(pairHash));
+        bytes memory makerSignatureA = _sign(MAKER_KEY, makerA);
+        bytes memory makerSignatureB = _sign(MAKER_B_KEY, makerB);
+        bytes memory pairSignature = _signPair(TAKER_KEY, pair);
+
+        vm.prank(executor);
+        vm.expectRevert(abi.encodeWithSelector(IMatchedFillRouter.OrderUnavailable.selector, pairHash));
+        router.settlePair(
+            keccak256("cancelled-pair"), makerA, makerSignatureA, makerB, makerSignatureB, pair, pairSignature
+        );
+    }
+
+    function test_SettlePair_SupportsERC1271Trader() public {
+        MockERC1271Signer wallet = new MockERC1271Signer();
+        IMatchedFillRouter.Order memory makerA = _pairMakerA();
+        IMatchedFillRouter.Order memory makerB = _pairMakerB();
+        IMatchedFillRouter.PairOrder memory pair = _pairOrder();
+        pair.trader = address(wallet);
+        bytes32 pairHash = router.hashPairOrder(pair);
+        wallet.setApproved(pairHash, true);
+
+        _settlePair(
+            keccak256("pair-erc1271"),
+            makerA,
+            _sign(MAKER_KEY, makerA),
+            makerB,
+            _sign(MAKER_B_KEY, makerB),
+            pair,
+            bytes("wallet-signature")
+        );
+
+        assertEq(engine.callAt(1).trader, address(wallet));
+        assertEq(engine.callAt(3).trader, address(wallet));
+        assertTrue(router.isPairOrderFilled(pairHash));
+    }
+
+    function test_SettlePair_SharesMakerReplayStateWithSingleFill() public {
+        IMatchedFillRouter.Order memory makerA = _pairMakerA();
+        IMatchedFillRouter.Order memory singleTaker = _takerOrder();
+        singleTaker.side = IPerpEngine.Side.LONG;
+        singleTaker.limitPrice = 101e18;
+        _settle(keccak256("single-first"), makerA, _sign(MAKER_KEY, makerA), singleTaker, _sign(TAKER_KEY, singleTaker));
+
+        IMatchedFillRouter.Order memory makerB = _pairMakerB();
+        IMatchedFillRouter.PairOrder memory pair = _pairOrder();
+        bytes32 makerHashA = router.hashOrder(makerA);
+        bytes memory makerSignatureA = _sign(MAKER_KEY, makerA);
+        bytes memory makerSignatureB = _sign(MAKER_B_KEY, makerB);
+        bytes memory pairSignature = _signPair(TAKER_KEY, pair);
+        vm.prank(executor);
+        vm.expectRevert(abi.encodeWithSelector(IMatchedFillRouter.OrderUnavailable.selector, makerHashA));
+        router.settlePair(
+            keccak256("pair-after-single"), makerA, makerSignatureA, makerB, makerSignatureB, pair, pairSignature
+        );
     }
 
     function test_CancelOrder_PreventsSettlement() public {
