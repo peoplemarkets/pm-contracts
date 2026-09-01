@@ -367,6 +367,19 @@ interface IPerpEngine {
         uint256 collateral,
         uint256 fee
     );
+    event PositionIncreased(
+        bytes32 indexed positionId,
+        address indexed trader,
+        bytes32 indexed subjectId,
+        Side side,
+        int256 sizeDelta,
+        int256 newSize,
+        uint256 executionPrice,
+        uint256 newEntryPrice,
+        uint256 collateralDelta,
+        uint256 newCollateral,
+        uint256 fee
+    );
     /// @dev BREAKING (event signature / topic0 change): `size` and `isLong` were appended in
     ///      feat/position-closed-size. Adding fields changes the keccak event signature, so every
     ///      off-chain decoder (engine + indexer) MUST resync to the new ABI before reading closes.
@@ -492,6 +505,7 @@ interface IPerpEngine {
     error PositionAlreadyOpen(address trader, bytes32 subjectId);
     error PositionNotOpen(bytes32 subjectId);
     error PositionIdMismatch(bytes32 expected, bytes32 actual);
+    error PositionSideMismatch(Side requestedSide, int256 currentSize);
     error ReduceOnlySideMismatch(Side orderSide, int256 positionSize);
     error ReduceOnlySizeExceeded(uint256 quantity, uint256 positionQuantity);
     error LeverageTooHigh(uint256 leverageBps, uint256 maxBps);

@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: BUSL-1.1
 pragma solidity 0.8.24;
 
+import {Math} from "@openzeppelin/contracts/utils/math/Math.sol";
+
 import {ILPVault} from "../core/ILPVault.sol";
 import {IMarginEngine} from "../core/IMarginEngine.sol";
 import {IPerpEngine} from "../core/IPerpEngine.sol";
@@ -52,6 +54,20 @@ library PerpInternals {
         uint256 fee
     );
 
+    event PositionIncreased(
+        bytes32 indexed positionId,
+        address indexed trader,
+        bytes32 indexed subjectId,
+        IPerpEngine.Side side,
+        int256 sizeDelta,
+        int256 newSize,
+        uint256 executionPrice,
+        uint256 newEntryPrice,
+        uint256 collateralDelta,
+        uint256 newCollateral,
+        uint256 fee
+    );
+
     event PositionClosed(
         bytes32 indexed positionId,
         address indexed trader,
@@ -97,6 +113,7 @@ library PerpInternals {
     error PositionAlreadyOpen(address trader, bytes32 subjectId);
     error PositionNotOpen(bytes32 subjectId);
     error PositionIdMismatch(bytes32 expected, bytes32 actual);
+    error PositionSideMismatch(IPerpEngine.Side requestedSide, int256 currentSize);
     error ReduceOnlySideMismatch(IPerpEngine.Side orderSide, int256 positionSize);
     error ReduceOnlySizeExceeded(uint256 quantity, uint256 positionQuantity);
     error KycTierMissing(address trader);
@@ -136,6 +153,12 @@ library PerpInternals {
         PerpStorage.Layout storage perpS = PerpStorage.load();
 
         if (trader == address(0)) revert InvalidConfig();
+        positionId = perpS.openPositionId[trader][p.subjectId];
+        if (positionId != bytes32(0)) {
+            if (!p.isMaker) revert PositionAlreadyOpen(trader, p.subjectId);
+            _increasePositionForMatched(trader, positionId, p);
+            return positionId;
+        }
         if (perpS.globalHalt) revert GlobalHaltedError();
         if (block.timestamp > p.deadline) revert DeadlineExpired(p.deadline);
         if (p.collateralAmount == 0 || p.quantity == 0) revert AmountZero();
@@ -153,10 +176,6 @@ library PerpInternals {
 
         uint256 markNow = _readFreshMark(perpS, p.subjectId);
         _checkSlippage(markNow, p.executionPrice, p.maxMarkDivergenceBps);
-
-        if (perpS.openPositionId[trader][p.subjectId] != bytes32(0)) {
-            revert PositionAlreadyOpen(trader, p.subjectId);
-        }
 
         uint256 sizeNotional = (p.quantity * p.executionPrice) / ONE;
         if (sizeNotional == 0) revert AmountZero();
@@ -203,6 +222,109 @@ library PerpInternals {
         ILPVault(perpS.lpVault).openPositionFlow(trader, p.collateralAmount, fee, lpRebate, insuranceShare);
         emit PositionOpened(
             positionId, trader, p.subjectId, p.side, signedSize, p.executionPrice, p.collateralAmount, fee
+        );
+    }
+
+    /// @notice Increase the live same-side position created by an earlier slice of one signed
+    ///         resting maker. Weighted entry values preserve the pre-increase trading PnL and
+    ///         quote-funding debt while the new slice starts at the current execution/index state.
+    function _increasePositionForMatched(
+        address trader,
+        bytes32 positionId,
+        IPerpEngine.MatchedOpenParams memory p
+    )
+        private
+    {
+        PerpStorage.Layout storage perpS = PerpStorage.load();
+
+        if (trader == address(0)) revert InvalidConfig();
+        if (perpS.globalHalt) revert GlobalHaltedError();
+        if (block.timestamp > p.deadline) revert DeadlineExpired(p.deadline);
+        if (p.collateralAmount == 0 || p.quantity == 0) revert AmountZero();
+        if (p.quantity > uint256(type(int256).max)) revert InvalidConfig();
+        if (p.executionPrice < MIN_MARK || p.executionPrice > MAX_MARK) {
+            revert MarkValueOutOfRange(p.executionPrice);
+        }
+        if (p.maxMarkDivergenceBps > BPS_DENOMINATOR) {
+            revert MarkDivergenceBpsOutOfRange(p.maxMarkDivergenceBps);
+        }
+
+        ISubjectRegistry(perpS.subjectRegistry).requireTradeable(p.subjectId);
+        uint8 tier = ISubjectRegistry(perpS.subjectRegistry).kycTierOf(trader);
+        if (tier == 0) revert KycTierMissing(trader);
+
+        bytes32 currentPositionId = perpS.openPositionId[trader][p.subjectId];
+        if (currentPositionId != positionId) revert PositionIdMismatch(positionId, currentPositionId);
+        IPerpEngine.Position storage position = perpS.positions[positionId];
+        if (position.size == 0 || position.owner != trader || position.subjectId != p.subjectId) {
+            revert PositionIdMismatch(positionId, currentPositionId);
+        }
+        bool isLong = position.size > 0;
+        if ((p.side == IPerpEngine.Side.LONG) != isLong) {
+            revert PositionSideMismatch(p.side, position.size);
+        }
+
+        uint256 oldQuantity = isLong ? uint256(position.size) : uint256(-position.size);
+        if (p.quantity > uint256(type(int256).max) - oldQuantity) revert InvalidConfig();
+        uint256 newQuantity = oldQuantity + p.quantity;
+        int256 sizeDelta = p.side == IPerpEngine.Side.LONG ? int256(p.quantity) : -int256(p.quantity);
+        int256 newSize = position.size + sizeDelta;
+
+        uint256 markNow = _readFreshMark(perpS, p.subjectId);
+        _checkSlippage(markNow, p.executionPrice, p.maxMarkDivergenceBps);
+        uint256 sizeNotional = (p.quantity * p.executionPrice) / ONE;
+        if (sizeNotional == 0) revert AmountZero();
+
+        IMarginEngine me = IMarginEngine(perpS.marginEngine);
+        if (address(me) == address(0)) revert MarginEngineUnset();
+        bytes32 categoryId = _categoryOf(perpS, p.subjectId);
+        _enforceOpenCaps(me, perpS, trader, p, sizeNotional, categoryId, tier);
+
+        (uint256 fee, uint256 lpRebate, uint256 insuranceShare) =
+            PerpFeeMath.compute(sizeNotional, p.isMaker, perpS.lpRebatePct);
+        if (fee > p.maxFee) revert FeeLimitExceeded(fee, p.maxFee);
+
+        uint256 newEntryPrice = _weightedUint(position.entryPrice, p.executionPrice, p.quantity, newQuantity);
+        int256 currentLegacyIndex = FundingStorage.load().cumulativeFundingIndex[p.subjectId];
+        int256 newLegacyEntry = _weightedInt(position.entryFundingIndex, currentLegacyIndex, p.quantity, newQuantity);
+        QuoteFundingStorage.Layout storage quoteS = QuoteFundingStorage.load();
+        int256 currentQuoteIndex = quoteS.cumulativeQuoteIndex[p.subjectId];
+        int256 newQuoteEntry =
+            _weightedInt(quoteS.entryQuoteIndex[positionId], currentQuoteIndex, p.quantity, newQuantity);
+        uint256 newCollateral = position.collateral + p.collateralAmount;
+        uint256 currentNotional = (newQuantity * markNow) / ONE;
+        if (currentNotional == 0) revert AmountZero();
+        int256 unrealizedPnl = PositionMath.unrealizedPnl(newSize, newEntryPrice, markNow);
+        int256 fundingDebt = FundingMath.computeFundingDebt(newSize, currentQuoteIndex, newQuoteEntry);
+        me.checkInitialMarginResidual(newCollateral, currentNotional, unrealizedPnl - fundingDebt);
+
+        position.size = newSize;
+        position.collateral = newCollateral;
+        position.entryPrice = newEntryPrice;
+        position.entryFundingIndex = newLegacyEntry;
+        position.lastInteractionAt = uint64(block.timestamp);
+        quoteS.entryQuoteIndex[positionId] = newQuoteEntry;
+
+        if (isLong) {
+            perpS.totalLongOI[p.subjectId] += sizeNotional;
+        } else {
+            perpS.totalShortOI[p.subjectId] += sizeNotional;
+        }
+        me.recordOpenDelta(trader, categoryId, IMarginEngine.Side(uint8(p.side)), sizeNotional, tier);
+        ILPVault(perpS.lpVault).openPositionFlow(trader, p.collateralAmount, fee, lpRebate, insuranceShare);
+
+        emit PositionIncreased(
+            positionId,
+            trader,
+            p.subjectId,
+            p.side,
+            sizeDelta,
+            newSize,
+            p.executionPrice,
+            newEntryPrice,
+            p.collateralAmount,
+            newCollateral,
+            fee
         );
     }
 
@@ -609,6 +731,40 @@ library PerpInternals {
         if (diff * BPS_DENOMINATOR > maxBps * executionPrice) {
             revert SlippageExceeded(executionPrice, markNow, maxBps);
         }
+    }
+
+    function _weightedUint(
+        uint256 oldValue,
+        uint256 addedValue,
+        uint256 addedWeight,
+        uint256 totalWeight
+    )
+        private
+        pure
+        returns (uint256)
+    {
+        if (addedValue >= oldValue) {
+            return oldValue + Math.mulDiv(addedValue - oldValue, addedWeight, totalWeight);
+        }
+        return oldValue - Math.mulDiv(oldValue - addedValue, addedWeight, totalWeight);
+    }
+
+    function _weightedInt(
+        int256 oldValue,
+        int256 addedValue,
+        uint256 addedWeight,
+        uint256 totalWeight
+    )
+        private
+        pure
+        returns (int256)
+    {
+        if (addedValue >= oldValue) {
+            uint256 upAdjustment = Math.mulDiv(uint256(addedValue - oldValue), addedWeight, totalWeight);
+            return oldValue + int256(upAdjustment);
+        }
+        uint256 downAdjustment = Math.mulDiv(uint256(oldValue - addedValue), addedWeight, totalWeight);
+        return oldValue - int256(downAdjustment);
     }
 
     function _categoryOf(PerpStorage.Layout storage perpS, bytes32 subjectId) private view returns (bytes32) {

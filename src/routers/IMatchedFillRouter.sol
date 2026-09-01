@@ -13,8 +13,10 @@ interface IMatchedFillRouter {
     }
 
     /// @notice One trader-authorized order. Every execution-sensitive field is signed.
-    /// @dev V2 supports the zero subaccount and full-fill OPEN or immediate reduce-only CLOSE
-    ///      orders. `quantity` is absolute base quantity in the same units as `Position.size`.
+    /// @dev V2 supports the zero subaccount and resting OPEN or immediate reduce-only CLOSE
+    ///      orders. `quantity` is the signed maximum absolute base quantity in the same units as
+    ///      `Position.size`. An OPEN maker may be consumed in deterministic slices while the
+    ///      incoming taker still fills its signed quantity completely or not at all.
     ///      A close binds the exact position id so an old resting signature cannot unwind a later
     ///      position. Unsupported shapes fail closed instead of being reinterpreted. `executor`
     ///      binds the order to the matching operator; the EIP-712 domain binds chain and router.
@@ -107,6 +109,7 @@ interface IMatchedFillRouter {
     function hashOrder(Order calldata order) external view returns (bytes32 digest);
     function hashPairOrder(PairOrder calldata order) external view returns (bytes32 digest);
     function filledQuantity(bytes32 orderHash) external view returns (uint256);
+    function makerPositionId(bytes32 orderHash) external view returns (bytes32);
     function isPairOrderFilled(bytes32 orderHash) external view returns (bool);
     function isOrderCancelled(bytes32 orderHash) external view returns (bool);
     function isFillUsed(bytes32 fillId) external view returns (bool);
@@ -186,6 +189,9 @@ interface IMatchedFillRouter {
     error SubjectMismatch(bytes32 makerSubject, bytes32 takerSubject);
     error SideMismatch(IPerpEngine.Side makerSide, IPerpEngine.Side takerSide);
     error FullFillRequired(uint256 makerQuantity, uint256 takerQuantity);
+    error InsufficientRemainingQuantity(bytes32 orderHash, uint256 remaining, uint256 requested);
+    error FillAllocationTooSmall(bytes32 orderHash, uint256 fillQuantity);
+    error MakerPositionChanged(bytes32 orderHash, bytes32 expectedPositionId, bytes32 actualPositionId);
     error DeadlineExpired(uint64 deadline);
     error UnauthorizedExecutor(address expected, address actual);
     error LimitPriceExceeded(IPerpEngine.Side side, uint256 limitPrice, uint256 executionPrice);
