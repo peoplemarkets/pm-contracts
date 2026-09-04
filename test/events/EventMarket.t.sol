@@ -38,6 +38,7 @@ contract EventMarketTest is Test {
 
     uint32 internal constant TIMELOCK = 1 days;
     uint256 internal constant LMSR_B = 10_000e6;
+    uint256 internal constant UMA_BOND = 100e6;
     uint64 internal constant DEADLINE = 2_000_000_000;
 
     bytes32 internal constant SUBJECT_ID = keccak256("subject.drake");
@@ -50,6 +51,7 @@ contract EventMarketTest is Test {
         lpVault = new MockLPVault(IERC20(address(usdc)));
         feedback = new MockFeedbackController();
         uma = new MockUMAAdapter();
+        uma.setBondConfig(address(usdc), UMA_BOND);
 
         // Fund the LPVault so it can seed markets.
         usdc.mint(address(lpVault), 10_000_000e6);
@@ -544,6 +546,47 @@ contract EventMarketTest is Test {
         vm.expectRevert("EventMarket: not open");
         vm.prank(operatorKey);
         router.buyOutcomeFor(alice, address(m), true, 100e6, 0);
+    }
+
+    // ------------------------------------------------------------------------------------------
+    // Resolution proposal bond custody
+    // ------------------------------------------------------------------------------------------
+
+    function test_proposeResolution_usesExternalProposerBondAndPreservesMarketCollateral() public {
+        EventMarket m = _defaultMarket();
+        uint256 marketBalanceBefore = usdc.balanceOf(address(m));
+        uint256 proposerBalanceBefore = usdc.balanceOf(alice);
+
+        vm.startPrank(alice);
+        usdc.approve(address(m), UMA_BOND);
+        m.proposeResolution(IEventMarket.Outcome.YES);
+        vm.stopPrank();
+
+        assertEq(usdc.balanceOf(alice), proposerBalanceBefore - UMA_BOND, "proposer funds bond");
+        assertEq(usdc.balanceOf(address(m)), marketBalanceBefore, "payout collateral unchanged");
+        assertEq(usdc.balanceOf(address(uma)), UMA_BOND, "adapter mock holds forwarded bond");
+        assertEq(uma.lastBondPayer(), address(m), "market is immediate adapter payer");
+        assertEq(uma.lastAsserter(), alice, "proposer remains economic asserter");
+        assertEq(uma.lastMetricId(), EVENT_ID, "event id binds assertion metric");
+        assertTrue(uma.lastAssertionId() != bytes32(0), "assertion id recorded");
+        assertEq(usdc.allowance(address(m), address(uma)), 0, "transient adapter approval cleared");
+        assertEq(uint256(m.status()), uint256(IEventMarket.Status.PENDING_RESOLUTION), "pending resolution");
+    }
+
+    function test_proposeResolution_withoutProposerBondApprovalRevertsAtomically() public {
+        EventMarket m = _defaultMarket();
+        uint256 marketBalanceBefore = usdc.balanceOf(address(m));
+        uint256 proposerBalanceBefore = usdc.balanceOf(alice);
+
+        vm.startPrank(alice);
+        vm.expectRevert();
+        m.proposeResolution(IEventMarket.Outcome.YES);
+        vm.stopPrank();
+
+        assertEq(usdc.balanceOf(alice), proposerBalanceBefore, "proposer balance unchanged");
+        assertEq(usdc.balanceOf(address(m)), marketBalanceBefore, "market collateral unchanged");
+        assertEq(usdc.balanceOf(address(uma)), 0, "no bond forwarded");
+        assertEq(uint256(m.status()), uint256(IEventMarket.Status.OPEN), "market remains open");
     }
 
     // ------------------------------------------------------------------------------------------

@@ -107,8 +107,11 @@ interface IEventMarket {
     /// @notice Redeem winnings after resolution
     function redeemWinnings() external returns (uint256 usdcOut);
 
-    /// @notice Initiate resolution process by asserting truth to UMA
-    /// @param proposedOutcome The outcome being proposed (YES, NO, or VOID)
+    /// @notice Initiate resolution by posting the registered metric's UMA bond.
+    /// @dev The caller must approve this market for the configured bond currency and amount. The
+    ///      market forwards only that caller-funded bond through UMAAdapter while preserving the
+    ///      caller as UMA's economic asserter and refund recipient; payout collateral is not used.
+    /// @param proposedOutcome The outcome being proposed (YES, NO, or VOID).
     function proposeResolution(Outcome proposedOutcome) external;
 
     /// @notice Settle UMA assertion and finalize market

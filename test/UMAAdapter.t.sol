@@ -414,6 +414,41 @@ contract UMAAdapterTest is Test {
         assertEq(rec.claimedValue, 12345);
         assertEq(rec.asserter, asserter);
         assertFalse(rec.settled);
+        assertEq(adapter.assertionBondPayerOf(assertionId), asserter);
+    }
+
+    function test_proposeAssertionFor_separatesBondPayerFromEconomicAsserter() public {
+        _register(METRIC_ID);
+        address sponsor = makeAddr("sponsor");
+        usdc.mint(sponsor, BOND);
+        vm.prank(sponsor);
+        usdc.approve(address(adapter), BOND);
+
+        uint256 sponsorPre = usdc.balanceOf(sponsor);
+        uint256 ooPre = usdc.balanceOf(address(oo));
+
+        vm.prank(sponsor);
+        bytes32 assertionId = adapter.proposeAssertionFor(METRIC_ID, 54321, bytes("sponsored assertion"), asserter);
+
+        assertEq(usdc.balanceOf(sponsor), sponsorPre - BOND, "immediate caller funds bond");
+        assertEq(usdc.balanceOf(address(oo)), ooPre + BOND, "bond reaches OOv3");
+        assertEq(adapter.assertionBondPayerOf(assertionId), sponsor, "payer recorded");
+
+        UMAAdapter.AssertionRecord memory rec = adapter.assertionOf(assertionId);
+        assertEq(rec.asserter, asserter, "economic asserter recorded");
+        MockOptimisticOracleV3.Assertion memory ooAssertion = oo.getAssertion(assertionId);
+        assertEq(ooAssertion.asserter, asserter, "OOv3 refund recipient preserved");
+    }
+
+    function test_proposeAssertionFor_revertsOnZeroAsserterBeforeTakingBond() public {
+        _register(METRIC_ID);
+        uint256 balanceBefore = usdc.balanceOf(asserter);
+
+        vm.prank(asserter);
+        vm.expectRevert(UMAAdapter.InvalidConfig.selector);
+        adapter.proposeAssertionFor(METRIC_ID, 1, bytes(""), address(0));
+
+        assertEq(usdc.balanceOf(asserter), balanceBefore);
     }
 
     function test_proposeAssertion_revertsIfNotRegistered() public {

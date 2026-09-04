@@ -6,6 +6,7 @@ import {IFeedbackController} from "../../../src/feedback/IFeedbackController.sol
 import {IOracleRouter} from "../../../src/oracle/IOracleRouter.sol";
 import {UMAAdapter} from "../../../src/oracle/UMAAdapter.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 
 /// @notice Minimal LPVault stand-in for EventMarketFactory tests. The factory calls
 ///         `fundEventMarket` (expects to receive `amount` USDC) and `settleEventMarket` (the factory
@@ -61,12 +62,20 @@ contract MockFeedbackController {
     }
 }
 
-/// @notice Mock of the concrete UMAAdapter type the market/factory hold. We only need
-///         `proposeAssertion` (no-op) and `latestValue` (settable) for resolution tests, so we cast
-///         this address to `UMAAdapter` when wiring the factory. The runtime call dispatches here.
+/// @notice Mock of the concrete UMAAdapter type the market/factory hold. It preserves the bond
+///         payer / economic asserter split used by EventMarket, while resolving immediately for
+///         test convenience. We cast this address to `UMAAdapter`; runtime calls dispatch here.
 contract MockUMAAdapter {
+    using SafeERC20 for IERC20;
+
     uint256 internal _value;
     uint64 internal _ts;
+    address public bondCurrency;
+    uint256 public bondAmount;
+    address public lastBondPayer;
+    address public lastAsserter;
+    bytes32 public lastMetricId;
+    bytes32 public lastAssertionId;
     // Fix D readiness gate: metrics are registered BY DEFAULT so pre-existing tests (which never
     // registered a UMA metric) keep passing. A test can call `setRegistered(id, false)` to exercise
     // the `MetricNotReady` revert path.
@@ -75,6 +84,11 @@ contract MockUMAAdapter {
     function setLatestValue(uint256 value_, uint64 ts_) external {
         _value = value_;
         _ts = ts_;
+    }
+
+    function setBondConfig(address currency, uint256 amount) external {
+        bondCurrency = currency;
+        bondAmount = amount;
     }
 
     /// @dev Test helper for the factory's Fix D readiness gate
@@ -87,14 +101,45 @@ contract MockUMAAdapter {
     /// @dev Mirrors `UMAAdapter.metricOf` shape: the factory only reads `.registered`. ABI-compatible
     ///      with the real `UMAAdapter.UMAMetric`. Registered unless explicitly un-set.
     function metricOf(bytes32 metricId) external view returns (UMAAdapter.UMAMetric memory m) {
+        m.bond = bondAmount;
+        m.currency = bondCurrency;
         m.registered = !_unregistered[metricId];
     }
 
-    function proposeAssertion(bytes32, uint256 claimedValue, bytes calldata) external returns (bytes32) {
-        // Simulate an immediately-settled truthful assertion for test convenience.
+    function proposeAssertion(bytes32 metricId, uint256 claimedValue, bytes calldata) external returns (bytes32) {
+        return _proposeAssertion(metricId, claimedValue, msg.sender);
+    }
+
+    function proposeAssertionFor(
+        bytes32 metricId,
+        uint256 claimedValue,
+        bytes calldata,
+        address asserter
+    )
+        external
+        returns (bytes32)
+    {
+        return _proposeAssertion(metricId, claimedValue, asserter);
+    }
+
+    function _proposeAssertion(
+        bytes32 metricId,
+        uint256 claimedValue,
+        address asserter
+    )
+        private
+        returns (bytes32 assertionId)
+    {
+        if (bondAmount != 0) {
+            IERC20(bondCurrency).safeTransferFrom(msg.sender, address(this), bondAmount);
+        }
+        lastBondPayer = msg.sender;
+        lastAsserter = asserter;
+        lastMetricId = metricId;
         _value = claimedValue;
         _ts = uint64(block.timestamp);
-        return keccak256(abi.encode(claimedValue, block.timestamp));
+        assertionId = keccak256(abi.encode(metricId, claimedValue, msg.sender, asserter, block.timestamp));
+        lastAssertionId = assertionId;
     }
 
     function latestValue(bytes32) external view returns (uint256 value, uint64 valueTimestamp) {

@@ -67,6 +67,7 @@ contract EventNavVestingTest is Test {
 
         feedback = new MockFeedbackController();
         uma = new MockUMAAdapter();
+        uma.setBondConfig(address(usdc), ONE_USDC);
         marketImpl = new EventMarket();
 
         EventMarketFactory factoryImpl = new EventMarketFactory();
@@ -163,8 +164,10 @@ contract EventNavVestingTest is Test {
         uint256 navBeforePropose = vault.totalAssets();
 
         // Propose + finalize the MINORITY (vault-favourable) outcome → σ = |q1 − q2| escrowed.
-        vm.prank(trader);
+        vm.startPrank(trader);
+        usdc.approve(address(m), ONE_USDC);
         m.proposeResolution(minority);
+        vm.stopPrank();
         m.settleResolution();
 
         // Mark ignores UMA and settle Δ == 0 → NAV identical to the wei across the whole window.

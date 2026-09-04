@@ -43,6 +43,8 @@ interface IOptimisticOracleV3 {
 /// @dev    Lifecycle (per assertion):
 ///         1. `proposeAssertion(metricId, claimedValue, claim)` — caller posts `bond` of `currency`,
 ///            adapter forwards it to OOv3 with `assertTruth`, OOv3 returns an `assertionId`.
+///            Contract integrations that first collect the bond from a user call
+///            `proposeAssertionFor(..., asserter)` so UMA returns a successful bond to that user.
 ///         2. Liveness window elapses. If nobody disputed via OOv3, the claim is automatically
 ///            considered truthful by UMA.
 ///         3. `settleAssertion(assertionId)` — anyone may call. Adapter asks OOv3 for the final
@@ -58,10 +60,11 @@ interface IOptimisticOracleV3 {
 ///         `keccak256("people.markets.umaadapter.v1")`.
 ///
 /// @dev    Trust model: governance can register / update / pause metrics. Anyone may propose an
-///         assertion against a registered metric — they post the bond, they take the dispute risk.
-///         Settlement is permissionless. The asserter does NOT get the bond refunded by this
-///         adapter — UMA handles bond economics on its side (refund on truthful, slash on dispute
-///         loss). This adapter only forwards bonds to OOv3 and records resolved values.
+///         assertion against a registered metric. The immediate caller always posts the bond;
+///         `proposeAssertionFor` may name a distinct economic asserter, matching OOv3's native
+///         payer/recipient split. Settlement is permissionless. This adapter does not refund or
+///         slash bonds itself — UMA handles those economics and pays the configured asserter or
+///         successful disputer.
 contract UMAAdapter is Initializable, UUPSUpgradeable, IOracleAdapter {
     using SafeERC20 for IERC20;
 
@@ -154,6 +157,9 @@ contract UMAAdapter is Initializable, UUPSUpgradeable, IOracleAdapter {
         mapping(bytes32 metricId => PendingMetric) pendingMetric;
         // assertion index
         mapping(bytes32 assertionId => AssertionRecord) assertions;
+        // Immediate caller whose funds the adapter forwarded for each assertion. Appended so
+        // existing v1 namespaced storage remains layout-compatible.
+        mapping(bytes32 assertionId => address bondPayer) assertionBondPayers;
     }
 
     /// @dev keccak256("people.markets.umaadapter.v1"). Matches the StorageLib convention. Using
@@ -187,6 +193,9 @@ contract UMAAdapter is Initializable, UUPSUpgradeable, IOracleAdapter {
         uint256 claimedValue,
         uint256 bond,
         uint64 expiresAt
+    );
+    event AssertionBondFunded(
+        bytes32 indexed assertionId, address indexed bondPayer, address indexed asserter, address currency, uint256 bond
     );
     event AssertionSettled(bytes32 indexed metricId, bytes32 indexed assertionId, uint256 settledValue, bool disputed);
 
@@ -426,6 +435,40 @@ contract UMAAdapter is Initializable, UUPSUpgradeable, IOracleAdapter {
         external
         returns (bytes32 assertionId)
     {
+        return _proposeAssertion(metricId, claimedValue, claim, msg.sender);
+    }
+
+    /// @notice Submit an assertion funded by the caller but economically owned by `asserter`.
+    /// @dev    Mirrors OOv3's native payer/recipient split: the adapter pulls the configured bond
+    ///         from `msg.sender`, while UMA returns an undisputed bond (or a successful dispute
+    ///         payout) to `asserter`. This lets an EventMarket collect a proposal bond from its
+    ///         external caller without making event payout collateral the bond source or recipient.
+    /// @param  metricId     Registered metric.
+    /// @param  claimedValue The value to record if UMA resolves the assertion truthfully.
+    /// @param  claim        Complete UMA claim payload.
+    /// @param  asserter     Non-zero address that UMA treats as the economic asserter.
+    function proposeAssertionFor(
+        bytes32 metricId,
+        uint256 claimedValue,
+        bytes calldata claim,
+        address asserter
+    )
+        external
+        returns (bytes32 assertionId)
+    {
+        if (asserter == address(0)) revert InvalidConfig();
+        return _proposeAssertion(metricId, claimedValue, claim, asserter);
+    }
+
+    function _proposeAssertion(
+        bytes32 metricId,
+        uint256 claimedValue,
+        bytes calldata claim,
+        address asserter
+    )
+        private
+        returns (bytes32 assertionId)
+    {
         Layout storage l = _layout();
         UMAMetric memory cfg = l.metrics[metricId];
         if (!cfg.registered) revert MetricNotRegistered(metricId);
@@ -439,7 +482,7 @@ contract UMAAdapter is Initializable, UUPSUpgradeable, IOracleAdapter {
         assertionId = l.oo
             .assertTruth(
                 claim,
-                msg.sender, // asserter
+                asserter,
                 address(0), // callbackRecipient — not used
                 address(0), // escalationManager — not used
                 cfg.livenessSeconds,
@@ -460,13 +503,15 @@ contract UMAAdapter is Initializable, UUPSUpgradeable, IOracleAdapter {
         l.assertions[assertionId] = AssertionRecord({
             metricId: metricId,
             claimedValue: claimedValue,
-            asserter: msg.sender,
+            asserter: asserter,
             assertedAt: uint64(block.timestamp),
             settled: false
         });
+        l.assertionBondPayers[assertionId] = msg.sender;
 
         uint64 expiresAt = uint64(block.timestamp) + cfg.livenessSeconds;
-        emit AssertionProposed(metricId, assertionId, msg.sender, claimedValue, cfg.bond, expiresAt);
+        emit AssertionProposed(metricId, assertionId, asserter, claimedValue, cfg.bond, expiresAt);
+        emit AssertionBondFunded(assertionId, msg.sender, asserter, cfg.currency, cfg.bond);
     }
 
     /// @notice Settle a previously-asserted claim. Calls into OOv3 to finalize and reads the
@@ -554,6 +599,11 @@ contract UMAAdapter is Initializable, UUPSUpgradeable, IOracleAdapter {
     /// @notice Read the in-flight assertion record for `assertionId`.
     function assertionOf(bytes32 assertionId) external view returns (AssertionRecord memory) {
         return _layout().assertions[assertionId];
+    }
+
+    /// @notice Immediate caller whose bond was forwarded for `assertionId` (zero for legacy data).
+    function assertionBondPayerOf(bytes32 assertionId) external view returns (address) {
+        return _layout().assertionBondPayers[assertionId];
     }
 
     /// @notice Configured UMA OptimisticOracleV3 address.

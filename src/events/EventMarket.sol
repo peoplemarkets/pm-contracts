@@ -14,6 +14,7 @@ import {IEventMarketFactory} from "./IEventMarketFactory.sol";
 import {LMSRMath} from "./LMSRMath.sol";
 
 import {Initializable} from "@openzeppelin/contracts-upgradeable/proxy/utils/Initializable.sol";
+import {Strings} from "@openzeppelin/contracts/utils/Strings.sol";
 
 /// @title EventMarket — LMSR-based Binary Prediction Market
 contract EventMarket is Initializable, IEventMarket, ReentrancyGuard {
@@ -45,6 +46,13 @@ contract EventMarket is Initializable, IEventMarket, ReentrancyGuard {
     event SharesSold(address indexed seller, bool isYes, uint256 sharesAmount, uint256 usdcReturned);
     event MarketResolved(Outcome finalOutcome);
     event WinningsRedeemed(address indexed user, uint256 usdcPayout);
+    event ResolutionProposed(
+        bytes32 indexed assertionId,
+        address indexed proposer,
+        Outcome proposedOutcome,
+        address bondCurrency,
+        uint256 bond
+    );
 
     error AmountZero();
     error NotOperator(address caller);
@@ -240,14 +248,11 @@ contract EventMarket is Initializable, IEventMarket, ReentrancyGuard {
     }
 
     /// @inheritdoc IEventMarket
-    function proposeResolution(Outcome proposedOutcome) external onlyOpen {
+    function proposeResolution(Outcome proposedOutcome) external nonReentrant onlyOpen {
         // Objective (ORACLE_ROUTER) markets have no bonded proposal step — `settleResolution` reads
         // the feed directly — so a UMA proposal here would be meaningless. Reject it.
         if (_resolution.source != ResolutionSource.UMA) revert WrongResolutionSource();
 
-        // This acts as a wrapper around UMAAdapter's proposeAssertion to conveniently format the claim
-        // The user must still have approved UMAAdapter to spend the bond.
-        // We use the eventId as the metricId for the UMA metric.
         require(
             proposedOutcome == Outcome.YES || proposedOutcome == Outcome.NO || proposedOutcome == Outcome.VOID,
             "EventMarket: invalid outcome"
@@ -255,17 +260,36 @@ contract EventMarket is Initializable, IEventMarket, ReentrancyGuard {
 
         string memory claim = string(
             abi.encodePacked(
-                "Assert that event ",
+                "Assert that People Markets event ",
+                Strings.toHexString(uint256(_params.eventId), 32),
+                " at market ",
+                Strings.toHexString(address(this)),
+                " on chain ",
+                Strings.toString(block.chainid),
+                ": ",
                 _params.question,
                 " resolved to ",
-                proposedOutcome == Outcome.YES ? "YES" : proposedOutcome == Outcome.NO ? "NO" : "VOID"
+                proposedOutcome == Outcome.YES ? "YES" : proposedOutcome == Outcome.NO ? "NO" : "VOID",
+                ". Proposed by ",
+                Strings.toHexString(msg.sender),
+                "."
             )
         );
 
-        // The caller pays the bond directly to the adapter.
-        umaAdapter.proposeAssertion(_params.eventId, uint256(proposedOutcome), bytes(claim));
+        // Pull the configured UMA bond from the external proposer into a transient balance, then
+        // let the adapter forward that exact amount to OOv3. `proposeAssertionFor` keeps the
+        // external proposer as UMA's economic asserter, so an undisputed bond returns directly to
+        // them. The market's payout collateral is never the bond source or recipient.
+        UMAAdapter.UMAMetric memory metric = umaAdapter.metricOf(_params.eventId);
+        IERC20 bondCurrency = IERC20(metric.currency);
+        bondCurrency.safeTransferFrom(msg.sender, address(this), metric.bond);
+        bondCurrency.forceApprove(address(umaAdapter), metric.bond);
+        bytes32 assertionId =
+            umaAdapter.proposeAssertionFor(_params.eventId, uint256(proposedOutcome), bytes(claim), msg.sender);
+        bondCurrency.forceApprove(address(umaAdapter), 0);
 
         _status = Status.PENDING_RESOLUTION;
+        emit ResolutionProposed(assertionId, msg.sender, proposedOutcome, metric.currency, metric.bond);
     }
 
     /// @inheritdoc IEventMarket
