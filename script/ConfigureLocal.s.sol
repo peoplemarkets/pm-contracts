@@ -7,6 +7,12 @@ import {console2} from "forge-std/console2.sol";
 import {LPVault} from "../src/core/LPVault.sol";
 import {MarginEngine} from "../src/core/MarginEngine.sol";
 import {PerpEngine} from "../src/core/PerpEngine.sol";
+import {EventMarket} from "../src/events/EventMarket.sol";
+import {EventMarketFactory} from "../src/events/EventMarketFactory.sol";
+import {EventMarketRouter} from "../src/events/EventMarketRouter.sol";
+import {IEventMarket} from "../src/events/IEventMarket.sol";
+import {IFeedbackController} from "../src/feedback/IFeedbackController.sol";
+import {UMAAdapter} from "../src/oracle/UMAAdapter.sol";
 import {SubjectRegistry} from "../src/registry/SubjectRegistry.sol";
 import {MockUSDC} from "../test/mocks/MockUSDC.sol";
 
@@ -22,20 +28,27 @@ contract ConfigureLocal is Script {
     uint256 internal constant INSURANCE_SEED = 100_000 * ONE_USDC;
     uint256 internal constant ACTOR_BALANCE = 10_000 * ONE_USDC;
     uint256 internal constant INITIAL_MARK = 100e18;
+    uint256 internal constant EVENT_LMSR_B = 1_000 * ONE_USDC;
+    string internal constant EVENT_QUESTION = "Will Drake release a new album this year?";
 
     function run() external {
         require(block.chainid == 31_337, "local configuration requires chain 31337");
 
         address deployer = vm.envAddress("LOCAL_DEPLOYER");
+        address executor = vm.envAddress("LOCAL_EXECUTOR");
         address matchedFillRouter = vm.envAddress("MATCHED_FILL_ROUTER_ADDRESS");
         bytes32 subjectA = vm.envBytes32("LOCAL_SUBJECT_A");
         bytes32 subjectB = vm.envBytes32("LOCAL_SUBJECT_B");
+        bytes32 eventId = vm.envBytes32("LOCAL_EVENT_ID");
 
         MockUSDC usdc = MockUSDC(vm.envAddress("USDC_ADDRESS"));
         SubjectRegistry registry = SubjectRegistry(vm.envAddress("SUBJECT_REGISTRY_ADDRESS"));
         LPVault vault = LPVault(vm.envAddress("LP_VAULT_ADDRESS"));
         PerpEngine engine = PerpEngine(vm.envAddress("PERP_ENGINE_ADDRESS"));
         MarginEngine margin = MarginEngine(vm.envAddress("MARGIN_ENGINE_ADDRESS"));
+        UMAAdapter umaAdapter = UMAAdapter(vm.envAddress("UMA_ADAPTER_ADDRESS"));
+        EventMarketFactory eventFactory = EventMarketFactory(vm.envAddress("EVENT_MARKET_FACTORY_ADDRESS"));
+        EventMarketRouter eventRouter = EventMarketRouter(vm.envAddress("EVENT_MARKET_ROUTER_ADDRESS"));
 
         require(vm.addr(ANVIL_DEPLOYER_KEY) == deployer, "unexpected local deployer");
 
@@ -45,6 +58,10 @@ contract ConfigureLocal is Script {
         if (engine.marginEngine() == address(0)) engine.activateSetMarginEngine();
         if (!engine.isRouter(matchedFillRouter)) engine.activateAddRouter(matchedFillRouter);
         if (!engine.isMarkWriter(deployer)) engine.activateAddMarkWriter(deployer);
+        if (vault.eventMarketFactory() == address(0)) vault.activateSetEventMarketFactory();
+        if (!eventFactory.isOperator(address(eventRouter))) eventFactory.activateAddOperator(address(eventRouter));
+        if (!eventRouter.isOperator(executor)) eventRouter.activateAddOperator(executor);
+        if (!umaAdapter.metricOf(eventId).registered) umaAdapter.activateRegisterMetric(eventId);
 
         if (registry.subjectOf(subjectA).listedAt == 0) registry.listSubject(subjectA, CATEGORY_ID);
         if (registry.subjectOf(subjectB).listedAt == 0) registry.listSubject(subjectB, CATEGORY_ID);
@@ -75,20 +92,44 @@ contract ConfigureLocal is Script {
         engine.pushMark(subjectA, INITIAL_MARK);
         engine.pushMark(subjectB, INITIAL_MARK);
 
+        address eventMarketAddress = eventFactory.markets(eventId);
+        if (eventMarketAddress == address(0)) {
+            eventMarketAddress = eventFactory.createMarket(
+                subjectA,
+                eventId,
+                uint8(IFeedbackController.EventClass.ALBUM_RELEASE),
+                EVENT_QUESTION,
+                // Local Anvil timestamps are many orders of magnitude below uint64's ceiling.
+                // forge-lint: disable-next-line(unsafe-typecast)
+                uint64(block.timestamp + 7 days),
+                0,
+                EVENT_LMSR_B
+            );
+        }
+
         vm.stopBroadcast();
 
         require(vault.perpEngine() == address(engine), "vault/engine link missing");
         require(engine.marginEngine() == address(margin), "margin link missing");
         require(engine.isRouter(matchedFillRouter), "matched router not trusted");
         require(engine.isMarkWriter(deployer), "local mark writer missing");
+        require(vault.eventMarketFactory() == address(eventFactory), "vault/event factory link missing");
+        require(eventFactory.isOperator(address(eventRouter)), "event router not trusted by factory");
+        require(eventRouter.isOperator(executor), "event executor not trusted by router");
+        require(umaAdapter.metricOf(eventId).registered, "local UMA metric not registered");
         require(registry.isTradeable(subjectA) && registry.isTradeable(subjectB), "subjects not tradeable");
         (cappedTvl, cappedTvlUpdatedAt) = engine.cappedTvl();
         require(cappedTvl != 0, "local capped TVL not seeded");
         require(cappedTvlUpdatedAt != 0, "local capped TVL timestamp missing");
+        require(eventFactory.markets(eventId) == eventMarketAddress, "local event market missing");
+        require(eventFactory.isMarket(eventMarketAddress), "local event market not registered");
+        require(EventMarket(eventMarketAddress).status() == IEventMarket.Status.OPEN, "local event market not open");
 
         console2.log("Local protocol configured and seeded.");
         console2.log("Subject A", vm.toString(subjectA));
         console2.log("Subject B", vm.toString(subjectB));
+        console2.log("Event market", eventMarketAddress);
+        console2.log("Event ID", vm.toString(eventId));
     }
 
     function _setKycIfNeeded(SubjectRegistry registry, address actor) private {

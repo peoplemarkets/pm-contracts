@@ -12,10 +12,10 @@ library LMSRMath {
     /// @dev Uses the Log-Sum-Exp trick to prevent overflow.
     ///      C = b * ln(e^(q1/b) + e^(q2/b))
     ///      C = max(q1, q2) + b * ln(1 + e^(-|q1-q2|/b))
-    /// @param q1 Shares of outcome 1 (WAD scale, 1e18)
-    /// @param q2 Shares of outcome 2 (WAD scale, 1e18)
-    /// @param b Liquidity parameter B (WAD scale, 1e18)
-    /// @return cost The cost in WAD scale (1e18)
+    /// @param q1 Shares of outcome 1 (the v1 market uses 6-decimal units)
+    /// @param q2 Shares of outcome 2 (the v1 market uses 6-decimal units)
+    /// @param b Liquidity parameter B in the same unit as q1 and q2
+    /// @return cost Cost in the same unit as q1, q2, and b (6-decimal USDC in v1)
     function cost(uint256 q1, uint256 q2, uint256 b) internal pure returns (uint256) {
         uint256 maxQ = Math.max(q1, q2);
         uint256 minQ = Math.min(q1, q2);

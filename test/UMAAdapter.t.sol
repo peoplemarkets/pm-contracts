@@ -459,6 +459,7 @@ contract UMAAdapterTest is Test {
 
     function test_settleAssertion_happyPath() public {
         _register(METRIC_ID);
+        uint256 asserterBefore = usdc.balanceOf(asserter);
         vm.prank(asserter);
         bytes32 assertionId = adapter.proposeAssertion(METRIC_ID, 9876, bytes(""));
         // Pull `assertedAt` from the contract (rather than `block.timestamp` on the test side) so
@@ -481,6 +482,8 @@ contract UMAAdapterTest is Test {
 
         UMAAdapter.AssertionRecord memory rec = adapter.assertionOf(assertionId);
         assertTrue(rec.settled);
+        assertEq(usdc.balanceOf(asserter), asserterBefore, "truthful bond refunded to asserter");
+        assertEq(usdc.balanceOf(address(oo)), 0, "truthful bond leaves OO custody");
     }
 
     function test_settleAssertion_revertsIfNotFound() public {
@@ -525,6 +528,7 @@ contract UMAAdapterTest is Test {
 
     function test_settleAssertion_disputed_dvmRejects_doesNotRecord() public {
         _register(METRIC_ID);
+        uint256 asserterBefore = usdc.balanceOf(asserter);
         vm.prank(asserter);
         bytes32 assertionId = adapter.proposeAssertion(METRIC_ID, 9999, bytes(""));
 
@@ -536,6 +540,8 @@ contract UMAAdapterTest is Test {
         (uint256 v, uint64 ts) = adapter.latestValue(METRIC_ID);
         assertEq(v, 0);
         assertEq(uint256(ts), 0);
+        assertEq(usdc.balanceOf(asserter), asserterBefore - BOND, "rejected assertion stays slashed");
+        assertEq(usdc.balanceOf(address(oo)), BOND, "slashed bond remains in mock OO custody");
     }
 
     function test_settleAssertion_disputed_revertsIfDvmNotResolved() public {
