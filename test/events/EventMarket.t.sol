@@ -18,10 +18,22 @@ import {UMAAdapter} from "../../src/oracle/UMAAdapter.sol";
 import {MockUSDC} from "../mocks/MockUSDC.sol";
 import {MockFeedbackController, MockLPVault, MockUMAAdapter, ReentrantToken} from "./mocks/MockEventDeps.sol";
 
+contract MockEventERC1271Signer {
+    mapping(bytes32 digest => bool approved) internal approvals;
+
+    function setApproved(bytes32 digest, bool approved) external {
+        approvals[digest] = approved;
+    }
+
+    function isValidSignature(bytes32 digest, bytes calldata) external view returns (bytes4) {
+        return approvals[digest] ? bytes4(0x1626ba7e) : bytes4(0xffffffff);
+    }
+}
+
 /// @title EventMarket + EventMarketRouter test suite (WS-1).
 /// @notice Covers market creation, direct buy/sell, LMSR pricing sanity, resolve/redeem (YES/NO/
-///         VOID), the engine-relayed operator path (credit-the-trader invariant, USDC custody),
-///         two-layer access control, slippage, closed/resolved reverts, and reentrancy.
+///         VOID), wallet-signed engine relay authorization, the credit-the-trader invariant,
+///         transient USDC custody, slippage, closed/resolved reverts, and reentrancy.
 contract EventMarketTest is Test {
     EventMarketFactory internal factory;
     EventMarketRouter internal router;
@@ -32,7 +44,7 @@ contract EventMarketTest is Test {
 
     address internal governance = makeAddr("governance");
     address internal operatorKey = makeAddr("operatorKey"); // engine KMS key
-    address internal alice = makeAddr("alice"); // trader
+    address internal alice; // trader
     address internal bob = makeAddr("bob"); // trader
     address internal stranger = makeAddr("stranger");
 
@@ -40,12 +52,14 @@ contract EventMarketTest is Test {
     uint256 internal constant LMSR_B = 10_000e6;
     uint256 internal constant UMA_BOND = 100e6;
     uint64 internal constant DEADLINE = 2_000_000_000;
+    uint256 internal constant ALICE_KEY = 0xA11CE;
 
     bytes32 internal constant SUBJECT_ID = keccak256("subject.drake");
     bytes32 internal constant EVENT_ID = keccak256("event.drake.grammy");
 
     function setUp() public {
         vm.warp(1_900_000_000);
+        alice = vm.addr(ALICE_KEY);
 
         usdc = new MockUSDC();
         lpVault = new MockLPVault(IERC20(address(usdc)));
@@ -110,6 +124,48 @@ contract EventMarketTest is Test {
 
     function _defaultMarket() internal returns (EventMarket m) {
         return _createMarket(EVENT_ID);
+    }
+
+    function _eventOrder(
+        address trader,
+        address market,
+        bool isYes,
+        IEventMarketRouter.OrderIntent intent,
+        uint256 amountIn,
+        uint256 minAmountOut,
+        uint256 nonce
+    )
+        internal
+        view
+        returns (IEventMarketRouter.EventOrder memory order)
+    {
+        order = IEventMarketRouter.EventOrder({
+            trader: trader,
+            executor: operatorKey,
+            market: market,
+            isYes: isYes,
+            intent: intent,
+            amountIn: amountIn,
+            minAmountOut: minAmountOut,
+            nonce: nonce,
+            deadline: uint64(block.timestamp + 1 days)
+        });
+    }
+
+    function _sign(uint256 key, IEventMarketRouter.EventOrder memory order) internal view returns (bytes memory) {
+        (uint8 v, bytes32 r, bytes32 s) = vm.sign(key, router.hashOrder(order));
+        return abi.encodePacked(r, s, v);
+    }
+
+    function _execute(
+        IEventMarketRouter.EventOrder memory order,
+        bytes memory signature
+    )
+        internal
+        returns (uint256 amountOut)
+    {
+        vm.prank(operatorKey);
+        return router.executeOrder(order, signature);
     }
 
     // ------------------------------------------------------------------------------------------
@@ -304,114 +360,304 @@ contract EventMarketTest is Test {
     }
 
     // ------------------------------------------------------------------------------------------
-    // Operator path — credit-the-trader invariant + USDC custody
+    // Wallet-authorized relay path
     // ------------------------------------------------------------------------------------------
 
-    function test_operatorBuy_creditsTraderNotOperator() public {
+    function test_routerDomainAndHash_matchCanonicalEip712Encoding() public {
+        EventMarket m = _defaultMarket();
+        IEventMarketRouter.EventOrder memory order =
+            _eventOrder(alice, address(m), true, IEventMarketRouter.OrderIntent.BUY, 100e6, 1, 7);
+        bytes32 typeHash = keccak256(
+            "EventOrder(address trader,address executor,address market,bool isYes,uint8 intent,uint256 amountIn,uint256 minAmountOut,uint256 nonce,uint64 deadline)"
+        );
+        bytes32 structHash = keccak256(
+            abi.encode(
+                typeHash,
+                order.trader,
+                order.executor,
+                order.market,
+                order.isYes,
+                order.intent,
+                order.amountIn,
+                order.minAmountOut,
+                order.nonce,
+                order.deadline
+            )
+        );
+        bytes32 expected = keccak256(abi.encodePacked("\x19\x01", router.domainSeparator(), structHash));
+
+        assertEq(router.EVENT_ORDER_TYPEHASH(), typeHash);
+        assertEq(router.hashOrder(order), expected);
+        assertNotEq(router.domainSeparator(), bytes32(0));
+    }
+
+    function test_signedBuy_creditsTraderNotOperator() public {
         EventMarket m = _defaultMarket();
         uint256 spend = 100e6;
+        IEventMarketRouter.EventOrder memory order =
+            _eventOrder(alice, address(m), true, IEventMarketRouter.OrderIntent.BUY, spend, 0, 1);
 
-        // Trader approves the ROUTER once (single approval target).
         vm.prank(alice);
         usdc.approve(address(router), type(uint256).max);
-
         uint256 aliceBefore = usdc.balanceOf(alice);
+        uint256 shares = _execute(order, _sign(ALICE_KEY, order));
 
-        // Engine operator key relays the buy.
-        vm.prank(operatorKey);
-        uint256 shares = router.buyOutcomeFor(alice, address(m), true, spend, 0);
-
-        // Shares credited to the trader, not the operator/router.
+        assertGt(shares, 0, "shares minted");
         assertEq(m.yesBalance(alice), shares, "trader credited");
         assertEq(m.yesBalance(operatorKey), 0, "operator not credited");
         assertEq(m.yesBalance(address(router)), 0, "router not credited");
-        // USDC pulled from the trader.
         assertEq(usdc.balanceOf(alice), aliceBefore - spend, "usdc from trader");
-        // Router holds no funds at rest and no residual allowance.
         assertEq(usdc.balanceOf(address(router)), 0, "router stateless");
         assertEq(usdc.allowance(address(router), address(m)), 0, "allowance cleared");
+        assertTrue(router.isNonceUsed(alice, order.nonce), "nonce consumed");
     }
 
-    function test_operatorBuy_emitsTraderAsBuyer() public {
+    function test_signedBuy_emitsTraderAsBuyer() public {
         EventMarket m = _defaultMarket();
         uint256 spend = 100e6;
         uint256 quote = LMSRMath.sharesForUsdc(0, 0, LMSR_B, spend);
+        IEventMarketRouter.EventOrder memory order =
+            _eventOrder(alice, address(m), true, IEventMarketRouter.OrderIntent.BUY, spend, 0, 2);
+        bytes memory signature = _sign(ALICE_KEY, order);
 
         vm.prank(alice);
         usdc.approve(address(router), type(uint256).max);
-
         vm.expectEmit(true, false, false, true, address(m));
         emit EventMarket.SharesBought(alice, true, spend, quote);
-
-        vm.prank(operatorKey);
-        router.buyOutcomeFor(alice, address(m), true, spend, 0);
+        vm.expectEmit(true, true, true, true, address(router));
+        emit IEventMarketRouter.EventOrderExecuted(
+            router.hashOrder(order),
+            alice,
+            address(m),
+            operatorKey,
+            true,
+            IEventMarketRouter.OrderIntent.BUY,
+            spend,
+            quote,
+            order.nonce
+        );
+        _execute(order, signature);
     }
 
-    function test_operatorSell_proceedsToTrader() public {
+    function test_signedSell_proceedsToTrader() public {
         EventMarket m = _defaultMarket();
-
         vm.prank(alice);
         usdc.approve(address(router), type(uint256).max);
-        vm.prank(operatorKey);
-        uint256 shares = router.buyOutcomeFor(alice, address(m), true, 100e6, 0);
+        IEventMarketRouter.EventOrder memory buy =
+            _eventOrder(alice, address(m), true, IEventMarketRouter.OrderIntent.BUY, 100e6, 0, 3);
+        uint256 shares = _execute(buy, _sign(ALICE_KEY, buy));
 
         uint256 aliceBefore = usdc.balanceOf(alice);
-        vm.prank(operatorKey);
-        uint256 out = router.sellOutcomeFor(alice, address(m), true, shares, 0);
+        IEventMarketRouter.EventOrder memory sell =
+            _eventOrder(alice, address(m), true, IEventMarketRouter.OrderIntent.SELL, shares, 0, 4);
+        uint256 out = _execute(sell, _sign(ALICE_KEY, sell));
 
         assertGt(out, 0, "proceeds");
         assertEq(m.yesBalance(alice), 0, "shares burned");
-        // Proceeds go directly to the trader; router never custodies sell proceeds.
         assertEq(usdc.balanceOf(alice), aliceBefore + out, "trader paid");
         assertEq(usdc.balanceOf(address(router)), 0, "router holds nothing");
     }
 
-    function test_operatorSell_emitsTraderAsSeller() public {
+    function test_signedSell_emitsTraderAsSeller() public {
         EventMarket m = _defaultMarket();
         vm.prank(alice);
         usdc.approve(address(router), type(uint256).max);
-        vm.prank(operatorKey);
-        uint256 shares = router.buyOutcomeFor(alice, address(m), true, 100e6, 0);
+        IEventMarketRouter.EventOrder memory buy =
+            _eventOrder(alice, address(m), true, IEventMarketRouter.OrderIntent.BUY, 100e6, 0, 5);
+        uint256 shares = _execute(buy, _sign(ALICE_KEY, buy));
 
         uint256 quote = LMSRMath.usdcForShares(m.totalYesShares(), m.totalNoShares(), LMSR_B, shares);
+        IEventMarketRouter.EventOrder memory sell =
+            _eventOrder(alice, address(m), true, IEventMarketRouter.OrderIntent.SELL, shares, quote, 6);
+        bytes memory signature = _sign(ALICE_KEY, sell);
         vm.expectEmit(true, false, false, true, address(m));
         emit EventMarket.SharesSold(alice, true, shares, quote);
-        vm.prank(operatorKey);
-        router.sellOutcomeFor(alice, address(m), true, shares, 0);
+        _execute(sell, signature);
     }
 
-    function test_operatorBuy_slippageReverts() public {
+    function test_signedBuy_slippageRevertsAndNonceRollsBack() public {
         EventMarket m = _defaultMarket();
         vm.prank(alice);
         usdc.approve(address(router), type(uint256).max);
         uint256 quote = LMSRMath.sharesForUsdc(0, 0, LMSR_B, 100e6);
+        IEventMarketRouter.EventOrder memory order =
+            _eventOrder(alice, address(m), true, IEventMarketRouter.OrderIntent.BUY, 100e6, quote + 1, 7);
+        bytes memory signature = _sign(ALICE_KEY, order);
+
         vm.expectRevert(abi.encodeWithSelector(EventMarket.SlippageExceeded.selector, quote, quote + 1));
-        vm.prank(operatorKey);
-        router.buyOutcomeFor(alice, address(m), true, 100e6, quote + 1);
+        _execute(order, signature);
+        assertFalse(router.isNonceUsed(alice, order.nonce), "reverted nonce must remain available");
+    }
+
+    function test_signedOrder_supportsERC1271Trader() public {
+        EventMarket m = _defaultMarket();
+        MockEventERC1271Signer wallet = new MockEventERC1271Signer();
+        usdc.mint(address(wallet), 100e6);
+        vm.prank(address(wallet));
+        usdc.approve(address(router), type(uint256).max);
+        IEventMarketRouter.EventOrder memory order =
+            _eventOrder(address(wallet), address(m), false, IEventMarketRouter.OrderIntent.BUY, 100e6, 0, 8);
+        wallet.setApproved(router.hashOrder(order), true);
+
+        uint256 shares = _execute(order, bytes("wallet-signature"));
+        assertEq(m.noBalance(address(wallet)), shares, "contract wallet credited");
+        assertTrue(router.isNonceUsed(address(wallet), order.nonce));
+    }
+
+    function test_signedOrder_rejectsInvalidOrTamperedSignature() public {
+        EventMarket m = _defaultMarket();
+        IEventMarketRouter.EventOrder memory order =
+            _eventOrder(alice, address(m), true, IEventMarketRouter.OrderIntent.BUY, 100e6, 0, 9);
+        bytes memory signature = _sign(ALICE_KEY, order);
+        order.amountIn += 1;
+
+        bytes32 tamperedHash = router.hashOrder(order);
+        vm.expectRevert(abi.encodeWithSelector(IEventMarketRouter.InvalidSignature.selector, alice, tamperedHash));
+        _execute(order, signature);
+        assertFalse(router.isNonceUsed(alice, order.nonce));
+    }
+
+    function test_signedOrder_rejectsNonceReplayAcrossPayloads() public {
+        EventMarket m = _defaultMarket();
+        vm.prank(alice);
+        usdc.approve(address(router), type(uint256).max);
+        IEventMarketRouter.EventOrder memory first =
+            _eventOrder(alice, address(m), true, IEventMarketRouter.OrderIntent.BUY, 100e6, 0, 10);
+        _execute(first, _sign(ALICE_KEY, first));
+
+        IEventMarketRouter.EventOrder memory second =
+            _eventOrder(alice, address(m), false, IEventMarketRouter.OrderIntent.BUY, 50e6, 0, 10);
+        bytes memory secondSignature = _sign(ALICE_KEY, second);
+        vm.expectRevert(abi.encodeWithSelector(IEventMarketRouter.NonceAlreadyUsed.selector, alice, 10));
+        _execute(second, secondSignature);
+    }
+
+    function test_signedOrder_cancelAndNonceFloor() public {
+        EventMarket m = _defaultMarket();
+        IEventMarketRouter.EventOrder memory cancelled =
+            _eventOrder(alice, address(m), true, IEventMarketRouter.OrderIntent.BUY, 100e6, 0, 11);
+        bytes memory cancelledSignature = _sign(ALICE_KEY, cancelled);
+        vm.prank(alice);
+        router.cancelOrder(cancelled);
+        vm.expectRevert(abi.encodeWithSelector(IEventMarketRouter.NonceAlreadyUsed.selector, alice, 11));
+        _execute(cancelled, cancelledSignature);
+
+        vm.prank(alice);
+        router.invalidateNoncesBelow(20);
+        assertEq(router.minimumValidNonce(alice), 20);
+        IEventMarketRouter.EventOrder memory old =
+            _eventOrder(alice, address(m), true, IEventMarketRouter.OrderIntent.BUY, 100e6, 0, 19);
+        bytes memory oldSignature = _sign(ALICE_KEY, old);
+        vm.expectRevert(abi.encodeWithSelector(IEventMarketRouter.NonceInvalid.selector, alice, 19, 20));
+        _execute(old, oldSignature);
+
+        vm.expectRevert(abi.encodeWithSelector(IEventMarketRouter.NonceFloorNotIncreasing.selector, 20, 20));
+        vm.prank(alice);
+        router.invalidateNoncesBelow(20);
+
+        vm.expectRevert(abi.encodeWithSelector(IEventMarketRouter.NonceFloorNotIncreasing.selector, 20, 12));
+        vm.prank(alice);
+        router.invalidateNoncesBelow(12);
+    }
+
+    function test_signedOrder_rejectsUnsetIntentAndZeroAmount() public {
+        EventMarket m = _defaultMarket();
+        IEventMarketRouter.EventOrder memory order =
+            _eventOrder(alice, address(m), true, IEventMarketRouter.OrderIntent.UNSET, 100e6, 0, 12);
+        vm.expectRevert(
+            abi.encodeWithSelector(IEventMarketRouter.InvalidOrderIntent.selector, IEventMarketRouter.OrderIntent.UNSET)
+        );
+        _execute(order, "");
+
+        order.intent = IEventMarketRouter.OrderIntent.BUY;
+        order.amountIn = 0;
+        vm.expectRevert(IEventMarketRouter.AmountZero.selector);
+        _execute(order, "");
+    }
+
+    function test_signedOrder_executesAtExactDeadline() public {
+        EventMarket m = _defaultMarket();
+        IEventMarketRouter.EventOrder memory order =
+            _eventOrder(alice, address(m), false, IEventMarketRouter.OrderIntent.BUY, 1e6, 0, 13);
+        order.deadline = uint64(block.timestamp);
+        bytes memory signature = _sign(ALICE_KEY, order);
+        vm.prank(alice);
+        usdc.approve(address(router), order.amountIn);
+
+        uint256 shares = _execute(order, signature);
+        assertGt(shares, 0, "exact deadline is valid");
+        assertTrue(router.isNonceUsed(alice, order.nonce));
+    }
+
+    function test_cancelOrder_onlyTraderAndCannotCancelConsumedNonce() public {
+        EventMarket m = _defaultMarket();
+        IEventMarketRouter.EventOrder memory order =
+            _eventOrder(alice, address(m), true, IEventMarketRouter.OrderIntent.BUY, 1e6, 0, 14);
+
+        vm.expectRevert(abi.encodeWithSelector(IEventMarketRouter.Unauthorized.selector, stranger));
+        vm.prank(stranger);
+        router.cancelOrder(order);
+
+        vm.prank(alice);
+        usdc.approve(address(router), order.amountIn);
+        _execute(order, _sign(ALICE_KEY, order));
+
+        vm.expectRevert(abi.encodeWithSelector(IEventMarketRouter.NonceAlreadyUsed.selector, alice, order.nonce));
+        vm.prank(alice);
+        router.cancelOrder(order);
+    }
+
+    function test_unsignedLegacySelectorsAlwaysRevert() public {
+        EventMarket m = _defaultMarket();
+        vm.startPrank(operatorKey);
+        vm.expectRevert(IEventMarketRouter.SignedOrderRequired.selector);
+        router.buyOutcomeFor(alice, address(m), true, 100e6, 0);
+        vm.expectRevert(IEventMarketRouter.SignedOrderRequired.selector);
+        router.sellOutcomeFor(alice, address(m), true, 1e18, 0);
+        vm.stopPrank();
     }
 
     // ------------------------------------------------------------------------------------------
-    // Access control — two layers
+    // Access control — operator, signed executor, and factory market
     // ------------------------------------------------------------------------------------------
 
     function test_router_nonOperatorReverts() public {
         EventMarket m = _defaultMarket();
-        vm.prank(alice);
-        usdc.approve(address(router), type(uint256).max);
+        IEventMarketRouter.EventOrder memory order =
+            _eventOrder(alice, address(m), true, IEventMarketRouter.OrderIntent.BUY, 100e6, 0, 21);
+        bytes memory signature = _sign(ALICE_KEY, order);
         vm.expectRevert(abi.encodeWithSelector(IEventMarketRouter.NotOperator.selector, stranger));
         vm.prank(stranger);
-        router.buyOutcomeFor(alice, address(m), true, 100e6, 0);
+        router.executeOrder(order, signature);
     }
 
     function test_router_removedOperatorReverts() public {
         EventMarket m = _defaultMarket();
+        IEventMarketRouter.EventOrder memory order =
+            _eventOrder(alice, address(m), true, IEventMarketRouter.OrderIntent.BUY, 100e6, 0, 22);
+        bytes memory signature = _sign(ALICE_KEY, order);
         vm.prank(governance);
         router.removeOperator(operatorKey);
-        vm.prank(alice);
-        usdc.approve(address(router), type(uint256).max);
         vm.expectRevert(abi.encodeWithSelector(IEventMarketRouter.NotOperator.selector, operatorKey));
-        vm.prank(operatorKey);
-        router.buyOutcomeFor(alice, address(m), true, 100e6, 0);
+        _execute(order, signature);
+    }
+
+    function test_router_rejectsExecutorMismatch() public {
+        EventMarket m = _defaultMarket();
+        IEventMarketRouter.EventOrder memory order =
+            _eventOrder(alice, address(m), true, IEventMarketRouter.OrderIntent.BUY, 100e6, 0, 23);
+        order.executor = stranger;
+        vm.expectRevert(abi.encodeWithSelector(IEventMarketRouter.UnauthorizedExecutor.selector, stranger, operatorKey));
+        _execute(order, "");
+    }
+
+    function test_router_rejectsExpiredOrder() public {
+        EventMarket m = _defaultMarket();
+        IEventMarketRouter.EventOrder memory order =
+            _eventOrder(alice, address(m), true, IEventMarketRouter.OrderIntent.BUY, 100e6, 0, 24);
+        order.deadline = uint64(block.timestamp - 1);
+        vm.expectRevert(abi.encodeWithSelector(IEventMarketRouter.DeadlineExpired.selector, order.deadline));
+        _execute(order, "");
     }
 
     function test_market_directOperatorEntrypoint_nonOperatorReverts() public {
@@ -441,28 +687,30 @@ contract EventMarketTest is Test {
         EventMarket m = _defaultMarket();
         vm.prank(governance);
         factory.removeOperator(address(router));
+        IEventMarketRouter.EventOrder memory order =
+            _eventOrder(alice, address(m), true, IEventMarketRouter.OrderIntent.BUY, 100e6, 0, 25);
+        bytes memory signature = _sign(ALICE_KEY, order);
         vm.prank(alice);
         usdc.approve(address(router), type(uint256).max);
         vm.expectRevert(abi.encodeWithSelector(EventMarket.NotOperator.selector, address(router)));
-        vm.prank(operatorKey);
-        router.buyOutcomeFor(alice, address(m), true, 100e6, 0);
+        _execute(order, signature);
     }
 
     function test_router_rejectsNonFactoryMarket() public {
-        // Router must refuse to pull trader USDC into a non-factory address.
         address fakeMarket = makeAddr("fakeMarket");
-        vm.prank(alice);
-        usdc.approve(address(router), type(uint256).max);
+        IEventMarketRouter.EventOrder memory order =
+            _eventOrder(alice, fakeMarket, true, IEventMarketRouter.OrderIntent.BUY, 100e6, 0, 26);
+        bytes memory signature = _sign(ALICE_KEY, order);
         vm.expectRevert(abi.encodeWithSelector(IEventMarketRouter.NotAMarket.selector, fakeMarket));
-        vm.prank(operatorKey);
-        router.buyOutcomeFor(alice, fakeMarket, true, 100e6, 0);
+        _execute(order, signature);
     }
 
     function test_router_zeroTraderReverts() public {
         EventMarket m = _defaultMarket();
+        IEventMarketRouter.EventOrder memory order =
+            _eventOrder(address(0), address(m), true, IEventMarketRouter.OrderIntent.BUY, 100e6, 0, 27);
         vm.expectRevert(IEventMarketRouter.ZeroTrader.selector);
-        vm.prank(operatorKey);
-        router.buyOutcomeFor(address(0), address(m), true, 100e6, 0);
+        _execute(order, "");
     }
 
     // ------------------------------------------------------------------------------------------
@@ -532,20 +780,23 @@ contract EventMarketTest is Test {
         m.buyOutcome(true, 100e6, 0);
     }
 
-    function test_operatorBuy_afterResolveReverts() public {
+    function test_signedBuy_afterResolveReverts() public {
         EventMarket m = _defaultMarket();
         vm.prank(alice);
         usdc.approve(address(router), type(uint256).max);
-        vm.prank(operatorKey);
-        router.buyOutcomeFor(alice, address(m), true, 100e6, 0);
+        IEventMarketRouter.EventOrder memory first =
+            _eventOrder(alice, address(m), true, IEventMarketRouter.OrderIntent.BUY, 100e6, 0, 28);
+        _execute(first, _sign(ALICE_KEY, first));
 
         // Resolve YES.
         uma.setLatestValue(uint256(IEventMarket.Outcome.YES), uint64(block.timestamp));
         m.settleResolution();
 
+        IEventMarketRouter.EventOrder memory second =
+            _eventOrder(alice, address(m), true, IEventMarketRouter.OrderIntent.BUY, 100e6, 0, 29);
+        bytes memory signature = _sign(ALICE_KEY, second);
         vm.expectRevert("EventMarket: not open");
-        vm.prank(operatorKey);
-        router.buyOutcomeFor(alice, address(m), true, 100e6, 0);
+        _execute(second, signature);
     }
 
     // ------------------------------------------------------------------------------------------

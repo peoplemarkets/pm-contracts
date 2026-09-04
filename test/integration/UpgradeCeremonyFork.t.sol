@@ -10,6 +10,7 @@ import {LPVault} from "../../src/core/LPVault.sol";
 import {EventMarket} from "../../src/events/EventMarket.sol";
 import {EventMarketFactory} from "../../src/events/EventMarketFactory.sol";
 import {EventMarketRouter} from "../../src/events/EventMarketRouter.sol";
+import {IEventMarketRouter} from "../../src/events/IEventMarketRouter.sol";
 import {UMAAdapter} from "../../src/oracle/UMAAdapter.sol";
 
 /// @title  UpgradeCeremonyFork — the real safety proof for the Base Sepolia event-stack upgrade.
@@ -22,11 +23,11 @@ import {UMAAdapter} from "../../src/oracle/UMAAdapter.sol";
 ///               backs live perp positions, so any drift here is a live-funds risk. With no live
 ///               event markets present, NAV accounting is byte-identical.
 ///           (B) MARKET IMPL — the timelocked setMarketImplementation installs the new EventMarket,
-///               and a freshly created market has the operator `buyOutcomeFor` path + is registered.
+///               and a freshly created market has the signed operator path + is registered.
 ///           (C) OPERATOR ALLOWLIST — router->factory and EVENT_OPERATOR->router both go live via
 ///               propose -> warp 1h -> activate.
-///           (D) END-TO-END — a funded, router-approving trader has the operator relay a real
-///               buyOutcomeFor on the forked contracts; YES balance up, USDC out of the trader.
+///           (D) END-TO-END — a funded, router-approving trader signs the exact trade and has the
+///               operator relay it on the forked contracts; YES balance up, USDC out of the trader.
 ///           (E) INVARIANT I1 — vault balance == freeAssets + positionCollateral + insurance +
 ///               fees + unvestedEventSurplus holds post-upgrade.
 ///
@@ -50,6 +51,7 @@ contract UpgradeCeremonyForkTest is Test {
     uint256 internal constant LMSR_B = 5e6; // seed ~= 3.47 USDC
     uint256 internal constant VAULT_TOPUP = 1_000e6; // headroom so createMarket's seed draw succeeds
     uint256 internal constant TRADE_USDC = 10e6; // trader's dealt USDC for the E2E buy
+    uint256 internal constant TRADER_KEY = 0xA11CE;
 
     LPVault internal vault;
     EventMarketFactory internal factory;
@@ -81,14 +83,16 @@ contract UpgradeCeremonyForkTest is Test {
         if (!forked) return;
 
         // ==================================================================================
-        // PHASE 1 — deploy the three new implementations (plain `new`).
+        // PHASE 1 — deploy the four new implementations (plain `new`).
         // ==================================================================================
         LPVault newVaultImpl = new LPVault();
         EventMarketFactory newFactoryImpl = new EventMarketFactory();
         EventMarket newEventMarketImpl = new EventMarket();
+        EventMarketRouter newRouterImpl = new EventMarketRouter();
         console2.log("new LPVault impl :", address(newVaultImpl));
         console2.log("new Factory impl :", address(newFactoryImpl));
         console2.log("new EventMarket  :", address(newEventMarketImpl));
+        console2.log("new Router impl  :", address(newRouterImpl));
 
         // ==================================================================================
         // (A) MONEY SAFETY — snapshot perp-critical reads BEFORE the vault upgrade.
@@ -163,6 +167,16 @@ contract UpgradeCeremonyForkTest is Test {
         vm.prank(GOVERNANCE);
         UUPSUpgradeable(FACTORY).upgradeToAndCall(address(newFactoryImpl), "");
 
+        address routerFactoryBefore = router.factory();
+        address routerUsdcBefore = router.usdc();
+        uint32 routerDelayBefore = router.timelockDelay();
+        vm.prank(GOVERNANCE);
+        UUPSUpgradeable(ROUTER).upgradeToAndCall(address(newRouterImpl), "");
+        assertEq(router.governance(), GOVERNANCE, "router governance changed across upgrade");
+        assertEq(router.factory(), routerFactoryBefore, "router factory changed across upgrade");
+        assertEq(router.usdc(), routerUsdcBefore, "router USDC changed across upgrade");
+        assertEq(router.timelockDelay(), routerDelayBefore, "router timelock changed across upgrade");
+
         uint32 fDelay = factory.timelockDelay();
         vm.prank(GOVERNANCE);
         factory.proposeSetMarketImplementation(address(newEventMarketImpl));
@@ -196,7 +210,7 @@ contract UpgradeCeremonyForkTest is Test {
         assertTrue(router.isOperator(EVENT_OPERATOR), "router.isOperator(operator) != true");
 
         // ==================================================================================
-        // (B) MARKET IMPL — create a market on the NEW impl; assert operator path + registration.
+        // (B) MARKET IMPL — create a market on the NEW impl; assert relay path + registration.
         // ==================================================================================
         bytes32 subjectId = keccak256("fork.subject.upgrade.ceremony");
         bytes32 eventId = keccak256(abi.encodePacked("fork.event.upgrade.ceremony", block.timestamp));
@@ -233,9 +247,9 @@ contract UpgradeCeremonyForkTest is Test {
         assertTrue(_hasBuyOutcomeFor(market), "new market missing buyOutcomeFor (operator path)");
 
         // ==================================================================================
-        // (D) END-TO-END — operator relays a real buyOutcomeFor for a router-approving trader.
+        // (D) END-TO-END — operator relays one exact wallet-signed event order.
         // ==================================================================================
-        address trader = makeAddr("forkTrader");
+        address trader = vm.addr(TRADER_KEY);
         deal(USDC, trader, TRADE_USDC);
         vm.prank(trader);
         IERC20(USDC).approve(ROUTER, type(uint256).max);
@@ -243,8 +257,21 @@ contract UpgradeCeremonyForkTest is Test {
         uint256 traderUsdcBefore = IERC20(USDC).balanceOf(trader);
         uint256 traderYesBefore = EventMarket(market).yesBalance(trader);
 
+        IEventMarketRouter.EventOrder memory order = IEventMarketRouter.EventOrder({
+            trader: trader,
+            executor: EVENT_OPERATOR,
+            market: market,
+            isYes: true,
+            intent: IEventMarketRouter.OrderIntent.BUY,
+            amountIn: TRADE_USDC,
+            minAmountOut: 0,
+            nonce: 1,
+            deadline: uint64(block.timestamp + 5 minutes)
+        });
+        (uint8 v, bytes32 r, bytes32 s) = vm.sign(TRADER_KEY, router.hashOrder(order));
+        bytes memory signature = abi.encodePacked(r, s, v);
         vm.prank(EVENT_OPERATOR);
-        uint256 shares = router.buyOutcomeFor(trader, market, true, TRADE_USDC, 0);
+        uint256 shares = router.executeOrder(order, signature);
 
         uint256 traderUsdcAfter = IERC20(USDC).balanceOf(trader);
         uint256 traderYesAfter = EventMarket(market).yesBalance(trader);
@@ -262,7 +289,7 @@ contract UpgradeCeremonyForkTest is Test {
 
         // (E) Invariant I1 still holds after the full ceremony + a live market + a trade.
         _assertI1();
-        console2.log("=== FORK CEREMONY PASSED: money-safe, operator path live, I1 holds ===");
+        console2.log("=== FORK CEREMONY PASSED: money-safe, signed relay live, I1 holds ===");
     }
 
     /// @dev Vault solvency invariant I1: USDC balance == freeAssets + positionCollateral +
