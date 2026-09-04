@@ -15,7 +15,10 @@ via_ir = true
 bytecode_hash = "none"
 cbor_metadata = false
 
-fs_permissions = [{ access = "read", path = "./" }]
+fs_permissions = [
+    { access = "read", path = "./" },
+    { access = "write", path = "./deployments/local" },
+]
 
 remappings = [
     "@openzeppelin/contracts/=lib/openzeppelin-contracts/contracts/",
