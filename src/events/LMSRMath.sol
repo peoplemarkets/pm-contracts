@@ -55,13 +55,20 @@ library LMSRMath {
         uint256 expTerm = uint256(int256(powerWad).expWad());
 
         require(expTerm > 1e18, "LMSRMath: expTerm <= 1");
-        uint256 lnTerm = uint256(int256(expTerm - 1e18).lnWad());
+        // ln(exp(power) - 1) is negative whenever the purchase is not large
+        // enough to move the bought outcome past the other outcome. Keep that
+        // term signed: casting it to uint256 makes ordinary underdog buys
+        // overflow in mulWad instead of returning shares.
+        require(
+            q1 <= uint256(type(int256).max) && q2 <= uint256(type(int256).max) && b <= uint256(type(int256).max),
+            "LMSRMath: signed range"
+        );
+        int256 lnTerm = int256(expTerm - 1e18).lnWad();
+        int256 term2 = int256(b).sMulWad(lnTerm);
+        int256 newQ1 = int256(q2) + term2;
 
-        uint256 term2 = b.mulWad(lnTerm);
-        uint256 newQ1 = q2 + term2;
-
-        require(newQ1 > q1, "LMSRMath: no shares generated");
-        return newQ1 - q1;
+        require(newQ1 > int256(q1), "LMSRMath: no shares generated");
+        return uint256(newQ1) - q1;
     }
 
     /// @notice Calculates how much USDC a user receives for selling shares.

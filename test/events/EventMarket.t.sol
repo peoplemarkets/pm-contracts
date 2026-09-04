@@ -359,6 +359,44 @@ contract EventMarketTest is Test {
         vm.stopPrank();
     }
 
+    /// @notice Cross-language guard for the browser's one-percent LMSR protection vectors.
+    ///         Each browser floor must stay below the fixed-point Solidity quote.
+    function test_uiLmsrBuyFloor_symmetricSmallLiquidity() public pure {
+        assertGe(LMSRMath.sharesForUsdc(0, 0, 2_000_000, 25_000_000), 26_122_427);
+    }
+
+    function test_uiLmsrBuyFloor_skewedSmallLiquidityYes() public pure {
+        assertGe(LMSRMath.sharesForUsdc(5_000_000, 1_000_000, 2_000_000, 1_000_000), 1_092_724);
+    }
+
+    function test_uiLmsrBuyFloor_skewedSmallLiquidityNo() public pure {
+        assertGe(LMSRMath.sharesForUsdc(1_000_000, 5_000_000, 2_000_000, 1_000_000), 3_688_470);
+    }
+
+    function test_uiLmsrBuyFloor_skewedDeepLiquidityYes() public pure {
+        assertGe(LMSRMath.sharesForUsdc(300_000_000, 125_000_000, 100_000_000, 50_000_000), 56_047_715);
+    }
+
+    function test_uiLmsrBuyFloor_skewedDeepLiquidityNo() public pure {
+        assertGe(LMSRMath.sharesForUsdc(125_000_000, 300_000_000, 100_000_000, 50_000_000), 166_620_267);
+    }
+
+    function test_uiLmsrSellFloor_roundTripSmallLiquidity() public pure {
+        assertGe(LMSRMath.usdcForShares(26_386_290, 0, 2_000_000, 26_386_290), 24_749_999);
+    }
+
+    function test_uiLmsrSellFloor_skewedSmallLiquidity() public pure {
+        assertGe(LMSRMath.usdcForShares(5_000_000, 1_000_000, 2_000_000, 2_000_000), 1_611_059);
+    }
+
+    function test_uiLmsrSellFloor_skewedDeepLiquidityYes() public pure {
+        assertGe(LMSRMath.usdcForShares(300_000_000, 125_000_000, 100_000_000, 10_000_000), 8_370_421);
+    }
+
+    function test_uiLmsrSellFloor_skewedDeepLiquidityNo() public pure {
+        assertGe(LMSRMath.usdcForShares(125_000_000, 300_000_000, 100_000_000, 10_000_000), 1_404_685);
+    }
+
     // ------------------------------------------------------------------------------------------
     // Wallet-authorized relay path
     // ------------------------------------------------------------------------------------------
