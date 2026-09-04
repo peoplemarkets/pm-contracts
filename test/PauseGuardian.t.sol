@@ -16,6 +16,39 @@ import {PauseGuardianStorage} from "../src/libraries/StorageLib.sol";
 
 import {MockUSDC} from "./mocks/MockUSDC.sol";
 
+/// @dev Test-only implementation that writes the exact wrapped 128-slot state produced by the
+///      original PauseGuardian. The production implementation must preserve and rotate it when
+///      applying the expanded ring modulus.
+contract LegacyPauseGuardianRingHarness is PauseGuardian {
+    uint64 private constant LEGACY_INTERVAL_SECONDS = 5;
+
+    function seedWrappedLegacyRing(bytes32 subjectId, uint16 head, uint192 mark, uint64 newestTimestamp) external {
+        require(head < PauseGuardianStorage.LEGACY_RING_SIZE, "legacy head");
+        PauseGuardianStorage.Ring storage ring = PauseGuardianStorage.load().rings[subjectId];
+        ring.head = head;
+        ring.length = PauseGuardianStorage.LEGACY_RING_SIZE;
+
+        uint64 oldestTimestamp =
+            newestTimestamp - uint64(PauseGuardianStorage.LEGACY_RING_SIZE - 1) * LEGACY_INTERVAL_SECONDS;
+        uint16 idx = head;
+        for (uint16 i = 0; i < PauseGuardianStorage.LEGACY_RING_SIZE; ++i) {
+            ring.entries[idx] = PauseGuardianStorage.Observation({
+                mark: mark, timestamp: oldestTimestamp + uint64(i) * LEGACY_INTERVAL_SECONDS
+            });
+            unchecked {
+                idx = idx + 1 == PauseGuardianStorage.LEGACY_RING_SIZE ? 0 : idx + 1;
+            }
+        }
+    }
+
+    function seedLegacyWindows(uint32 autoWindow, uint32 cooldownWindow, uint32 frozenWindow) external {
+        PauseGuardianStorage.Layout storage s = PauseGuardianStorage.load();
+        s.auto5WindowSeconds = autoWindow;
+        s.cooldown30WindowSeconds = cooldownWindow;
+        s.frozen60WindowSeconds = frozenWindow;
+    }
+}
+
 /// @title PauseGuardianTest — full unit-coverage of the on-chain breaker detector.
 /// @notice Uses a real PerpEngine instance as the mark source and a real SubjectRegistry as the
 ///         pause-state sink. The guardian is granted both PAUSE_GUARDIAN and SUBJECT_ADMIN roles
@@ -87,7 +120,7 @@ contract PauseGuardianTest is Test {
 
         // 4. PauseGuardian itself.
         {
-            PauseGuardian impl = new PauseGuardian();
+            LegacyPauseGuardianRingHarness impl = new LegacyPauseGuardianRingHarness();
             bytes memory initData = abi.encodeCall(
                 PauseGuardian.initialize, (governance, address(engine), address(registry), TIMELOCK_DELAY)
             );
@@ -457,12 +490,78 @@ contract PauseGuardianTest is Test {
     // Ring buffer
     // ------------------------------------------------------------------------------------------
 
+    function test_Observe_RetainsFullFrozenWindowAtMinimumCadence() public {
+        _observe();
+        (, uint64 anchorTimestamp) = guardian.lastObservation(SUBJECT_ID);
+
+        // Fill every permitted five-second slot. The final 20% move is exactly one hour after the
+        // anchor; a 128-slot ring evicts that anchor after 10m35s and misses this FROZEN breach.
+        for (uint256 i = 1; i < PauseGuardianStorage.RING_SIZE; ++i) {
+            vm.warp(uint256(anchorTimestamp) + i * guardian.MIN_OBSERVATION_INTERVAL_SECONDS());
+            _pushMark(i + 1 == PauseGuardianStorage.RING_SIZE ? 80 * ONE_18 : INITIAL_MARK);
+            uint256 gasBefore = gasleft();
+            _observe();
+            if (i + 1 == PauseGuardianStorage.RING_SIZE) {
+                assertLt(gasBefore - gasleft(), 3_000_000, "full-window observe gas");
+            }
+        }
+
+        assertEq(guardian.observationCount(SUBJECT_ID), PauseGuardianStorage.RING_SIZE);
+        (, uint64 oldestTimestamp) = guardian.observationAt(SUBJECT_ID, PauseGuardianStorage.RING_SIZE - 1);
+        assertEq(oldestTimestamp, anchorTimestamp, "one-hour anchor retained at densest cadence");
+        assertEq(uint8(registry.statusOf(SUBJECT_ID)), uint8(ISubjectRegistry.SubjectStatus.FROZEN));
+    }
+
+    function test_Observe_MigratesWrappedLegacyRingWithoutLosingOrder() public {
+        uint64 currentTimestamp = uint64(block.timestamp);
+        uint64 legacyNewestTimestamp = currentTimestamp - guardian.MIN_OBSERVATION_INTERVAL_SECONDS();
+        LegacyPauseGuardianRingHarness(address(guardian))
+            .seedWrappedLegacyRing(SUBJECT_ID, 37, uint192(INITIAL_MARK), legacyNewestTimestamp);
+
+        PauseGuardian expandedImplementation = new PauseGuardian();
+        vm.prank(governance);
+        guardian.upgradeToAndCall(address(expandedImplementation), "");
+
+        // Views must understand wrapped legacy state even before the first migration write.
+        (, uint64 beforeMigration) = guardian.lastObservation(SUBJECT_ID);
+        assertEq(beforeMigration, legacyNewestTimestamp);
+
+        _observe();
+
+        assertEq(guardian.observationCount(SUBJECT_ID), PauseGuardianStorage.LEGACY_RING_SIZE + 1);
+        (, uint64 newestTimestamp) = guardian.observationAt(SUBJECT_ID, 0);
+        (, uint64 preservedNewestTimestamp) = guardian.observationAt(SUBJECT_ID, 1);
+        (, uint64 preservedOldestTimestamp) = guardian.observationAt(SUBJECT_ID, PauseGuardianStorage.LEGACY_RING_SIZE);
+        assertEq(newestTimestamp, currentTimestamp);
+        assertEq(preservedNewestTimestamp, legacyNewestTimestamp);
+        assertEq(
+            preservedOldestTimestamp,
+            legacyNewestTimestamp
+                - uint64(
+                    uint256(PauseGuardianStorage.LEGACY_RING_SIZE - 1) * guardian.MIN_OBSERVATION_INTERVAL_SECONDS()
+                )
+        );
+    }
+
+    function test_Observe_FreezesUnobservableLegacyWindowAfterUpgrade() public {
+        LegacyPauseGuardianRingHarness(address(guardian)).seedLegacyWindows(30, 30 minutes, 90 minutes);
+        PauseGuardian expandedImplementation = new PauseGuardian();
+        vm.prank(governance);
+        guardian.upgradeToAndCall(address(expandedImplementation), "");
+
+        vm.expectEmit(true, false, false, true, address(guardian));
+        emit PauseGuardian.ObservationCoverageInsufficient(SUBJECT_ID, 90 minutes, 1 hours);
+        _observe();
+
+        assertEq(uint8(registry.statusOf(SUBJECT_ID)), uint8(ISubjectRegistry.SubjectStatus.FROZEN));
+    }
+
     function test_Observe_RingBufferSaturatesAtRingSize() public {
-        // RING_SIZE is 128 in storage. Push more than that with a 30s gap each so we don't trip a
-        // breaker; verify that the length saturates and the oldest entries get overwritten.
+        // Push beyond the expanded capacity with a 30s gap and stable mark; verify that length
+        // saturates and the oldest entries are overwritten.
         _observe();
         uint256 now_ = block.timestamp;
-        for (uint256 i = 0; i < 200; ++i) {
+        for (uint256 i = 0; i < PauseGuardianStorage.RING_SIZE + 10; ++i) {
             now_ += 30;
             vm.warp(now_);
             _pushMark(INITIAL_MARK);
@@ -519,7 +618,7 @@ contract PauseGuardianTest is Test {
 
     function test_Thresholds_ProposeAndActivate() public {
         vm.prank(governance);
-        guardian.proposeSetThresholds(600, 1_200, 2_500, 60, 45 minutes, 90 minutes);
+        guardian.proposeSetThresholds(600, 1_200, 2_500, 60, 45 minutes, 1 hours);
 
         PauseGuardianStorage.PendingThresholds memory p = guardian.pendingThresholds();
         assertTrue(p.exists);
@@ -541,7 +640,7 @@ contract PauseGuardianTest is Test {
         (uint32 w5, uint32 w30, uint32 w60) = guardian.windows();
         assertEq(w5, 60);
         assertEq(w30, 45 minutes);
-        assertEq(w60, 90 minutes);
+        assertEq(w60, 1 hours);
 
         // Pending cleared.
         PauseGuardianStorage.PendingThresholds memory p2 = guardian.pendingThresholds();
@@ -551,52 +650,52 @@ contract PauseGuardianTest is Test {
     function test_Thresholds_Propose_RevertsFromStranger() public {
         vm.prank(stranger);
         vm.expectRevert(abi.encodeWithSelector(PauseGuardian.Unauthorized.selector, stranger));
-        guardian.proposeSetThresholds(600, 1_200, 2_500, 60, 45 minutes, 90 minutes);
+        guardian.proposeSetThresholds(600, 1_200, 2_500, 60, 45 minutes, 1 hours);
     }
 
     function test_Thresholds_Propose_RevertsWhenPendingExists() public {
         vm.startPrank(governance);
-        guardian.proposeSetThresholds(600, 1_200, 2_500, 60, 45 minutes, 90 minutes);
+        guardian.proposeSetThresholds(600, 1_200, 2_500, 60, 45 minutes, 1 hours);
         vm.expectRevert(PauseGuardian.PendingThresholdsExist.selector);
-        guardian.proposeSetThresholds(700, 1_300, 2_700, 60, 45 minutes, 90 minutes);
+        guardian.proposeSetThresholds(700, 1_300, 2_700, 60, 45 minutes, 1 hours);
         vm.stopPrank();
     }
 
     function test_Thresholds_Propose_RevertsOnBpsBelowFloor() public {
         vm.prank(governance);
         vm.expectRevert(abi.encodeWithSelector(PauseGuardian.ThresholdOutOfRange.selector, uint16(5)));
-        guardian.proposeSetThresholds(5, 1_200, 2_500, 60, 45 minutes, 90 minutes);
+        guardian.proposeSetThresholds(5, 1_200, 2_500, 60, 45 minutes, 1 hours);
     }
 
     function test_Thresholds_Propose_RevertsOnBpsAboveCeiling() public {
         vm.prank(governance);
         vm.expectRevert(abi.encodeWithSelector(PauseGuardian.ThresholdOutOfRange.selector, uint16(6_000)));
-        guardian.proposeSetThresholds(500, 1_200, 6_000, 60, 45 minutes, 90 minutes);
+        guardian.proposeSetThresholds(500, 1_200, 6_000, 60, 45 minutes, 1 hours);
     }
 
     function test_Thresholds_Propose_RevertsWhenCooldownLeqAuto() public {
         vm.prank(governance);
         // cd30 == auto5 → revert
         vm.expectRevert(abi.encodeWithSelector(PauseGuardian.ThresholdOutOfRange.selector, uint16(500)));
-        guardian.proposeSetThresholds(500, 500, 2_500, 60, 45 minutes, 90 minutes);
+        guardian.proposeSetThresholds(500, 500, 2_500, 60, 45 minutes, 1 hours);
     }
 
     function test_Thresholds_Propose_RevertsWhenFrozenLeqCooldown() public {
         vm.prank(governance);
         vm.expectRevert(abi.encodeWithSelector(PauseGuardian.ThresholdOutOfRange.selector, uint16(1_000)));
-        guardian.proposeSetThresholds(500, 1_000, 1_000, 60, 45 minutes, 90 minutes);
+        guardian.proposeSetThresholds(500, 1_000, 1_000, 60, 45 minutes, 1 hours);
     }
 
     function test_Thresholds_Propose_RevertsOnWindowBelowFloor() public {
         vm.prank(governance);
         vm.expectRevert(abi.encodeWithSelector(PauseGuardian.WindowOutOfRange.selector, uint32(3)));
-        guardian.proposeSetThresholds(500, 1_000, 2_000, 3, 45 minutes, 90 minutes);
+        guardian.proposeSetThresholds(500, 1_000, 2_000, 3, 45 minutes, 1 hours);
     }
 
     function test_Thresholds_Propose_RevertsOnWindowAboveCeiling() public {
         vm.prank(governance);
-        vm.expectRevert(abi.encodeWithSelector(PauseGuardian.WindowOutOfRange.selector, uint32(2 days)));
-        guardian.proposeSetThresholds(500, 1_000, 2_000, 30, 45 minutes, 2 days);
+        vm.expectRevert(abi.encodeWithSelector(PauseGuardian.WindowOutOfRange.selector, uint32(1 hours + 1)));
+        guardian.proposeSetThresholds(500, 1_000, 2_000, 30, 45 minutes, 1 hours + 1);
     }
 
     function test_Thresholds_Propose_RevertsWhenCdWindowLeqAuto() public {
@@ -618,7 +717,7 @@ contract PauseGuardianTest is Test {
 
     function test_Thresholds_Cancel_Succeeds() public {
         vm.startPrank(governance);
-        guardian.proposeSetThresholds(600, 1_200, 2_500, 60, 45 minutes, 90 minutes);
+        guardian.proposeSetThresholds(600, 1_200, 2_500, 60, 45 minutes, 1 hours);
         guardian.cancelSetThresholds();
         vm.stopPrank();
         PauseGuardianStorage.PendingThresholds memory p = guardian.pendingThresholds();
@@ -633,7 +732,7 @@ contract PauseGuardianTest is Test {
 
     function test_Thresholds_Cancel_RevertsFromStranger() public {
         vm.prank(governance);
-        guardian.proposeSetThresholds(600, 1_200, 2_500, 60, 45 minutes, 90 minutes);
+        guardian.proposeSetThresholds(600, 1_200, 2_500, 60, 45 minutes, 1 hours);
         vm.prank(stranger);
         vm.expectRevert(abi.encodeWithSelector(PauseGuardian.Unauthorized.selector, stranger));
         guardian.cancelSetThresholds();

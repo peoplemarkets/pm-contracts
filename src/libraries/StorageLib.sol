@@ -484,15 +484,22 @@ library RegistryStorage {
 library PauseGuardianStorage {
     bytes32 internal constant SLOT = keccak256("people.markets.pauseguardian.v1");
 
-    /// @dev Number of slots in the per-subject mark-observation ring buffer. Sized so that, in
-    ///      normal operation (mark pushes every ~30s under the spec §1 default `markStaleAfter`),
-    ///      the buffer spans roughly 60 minutes — the longest breaker window. With the 5-second
-    ///      minimum-interval rate-limit, the worst-case buffer span is 128 × 5s = 10.6 minutes,
-    ///      which still covers the 30-second and 30-minute windows. Operators who push marks at
-    ///      a higher cadence may briefly under-cover the 1-hour window during ramp-up; this is an
-    ///      explicit tradeoff against per-subject storage cost (a denser buffer costs more gas on
-    ///      every `observe`).
-    uint16 internal constant RING_SIZE = 128;
+    /// @dev The original deployed ring used 128 entries. Keep the value explicit so
+    ///      `PauseGuardian` can rotate an already-wrapped legacy history before it starts writing
+    ///      with the expanded modulus.
+    uint16 internal constant LEGACY_RING_SIZE = 128;
+
+    /// @dev Number of slots in the per-subject mark-observation ring buffer. At the contract's
+    ///      five-second minimum interval, 721 observations span exactly 3,600 seconds including
+    ///      both endpoints: `(721 - 1) * 5 = 3,600`. `PauseGuardian.MAX_WINDOW_SECONDS` is capped
+    ///      to the same hour, so every permitted breaker window remains represented even at the
+    ///      densest allowed keeper cadence.
+    ///
+    ///      This expands only the trailing fixed array in `Ring`; `head` and `length` retain their
+    ///      original slots, and `rings` is the last field in the namespaced layout. Existing first
+    ///      128 entries therefore remain storage-compatible. A wrapped legacy ring is rotated once
+    ///      in `PauseGuardian.observe` before the new slots are used.
+    uint16 internal constant RING_SIZE = 721;
 
     /// @dev Single observation of a subject's mark. Packed so each entry occupies one storage slot
     ///      (uint192 mark + uint64 timestamp = 256 bits). MAX_MARK in PerpEngine is 1e36 which fits
