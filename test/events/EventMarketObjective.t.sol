@@ -316,13 +316,15 @@ contract EventMarketObjectiveTest is Test {
     }
 
     // ------------------------------------------------------------------------------------------
-    // Storage-layout guard — `_resolution` MUST be appended after `noBalance` (append-only).
+    // Storage-layout guard — resolution state MUST remain appended after `noBalance`.
     // ------------------------------------------------------------------------------------------
 
     /// @dev The appended ResolutionConfig occupies slots 15..18 (source+comparator packed, metricId,
     ///      threshold, settleNotBefore+oracleRouter). Legacy fixed slots 0..14 (usdc..noBalance) are
-    ///      unchanged. We assert the objective config lands in slot 15+ by reading raw storage on a
-    ///      fresh objective clone — a regression that inserted state mid-layout would break this.
+    ///      unchanged. The UMA assertion recovery anchor follows at slot 19. We assert the objective
+    ///      config lands in slot 15+ and that objective clones leave slot 19 empty — a regression
+    ///      that inserted state mid-layout would break this. EventMarket.t.sol separately writes and
+    ///      verifies the assertion id at slot 19 through the UMA proposal path.
     function test_storageLayout_resolutionAppendedAtSlot15() public {
         _registerMetric(1, uint64(block.timestamp), 1 days);
         IEventMarket.ResolutionConfig memory rc = _objectiveConfig(IEventMarket.Comparator.GT, 777, DEADLINE);
@@ -336,6 +338,9 @@ contract EventMarketObjectiveTest is Test {
         // threshold at slot 17.
         uint256 slot17 = uint256(vm.load(address(m), bytes32(uint256(17))));
         assertEq(slot17, 777, "threshold at slot 17");
+
+        // Objective markets never use the appended UMA assertion recovery anchor.
+        assertEq(uint256(vm.load(address(m), bytes32(uint256(19)))), 0, "assertion anchor slot 19 remains empty");
 
         // Legacy slot 0 (usdc) is unchanged.
         address usdcSlot = address(uint160(uint256(vm.load(address(m), bytes32(uint256(0))))));

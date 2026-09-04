@@ -76,6 +76,9 @@ contract MockUMAAdapter {
     address public lastAsserter;
     bytes32 public lastMetricId;
     bytes32 public lastAssertionId;
+    mapping(bytes32 assertionId => bool settled) internal _assertionSettled;
+    mapping(bytes32 assertionId => bool truthful) internal _assertionTruthful;
+    mapping(bytes32 assertionId => uint256 claimedValue) internal _assertionValues;
     // Fix D readiness gate: metrics are registered BY DEFAULT so pre-existing tests (which never
     // registered a UMA metric) keep passing. A test can call `setRegistered(id, false)` to exercise
     // the `MetricNotReady` revert path.
@@ -140,6 +143,26 @@ contract MockUMAAdapter {
         _ts = uint64(block.timestamp);
         assertionId = keccak256(abi.encode(metricId, claimedValue, msg.sender, asserter, block.timestamp));
         lastAssertionId = assertionId;
+        _assertionValues[assertionId] = claimedValue;
+        // This lightweight mock resolves immediately by default. Tests for replacement proposals
+        // can override either result with setAssertionResult.
+        _assertionSettled[assertionId] = true;
+        _assertionTruthful[assertionId] = true;
+    }
+
+    function setAssertionResult(bytes32 assertionId, bool settled, bool truthful) external {
+        _assertionSettled[assertionId] = settled;
+        _assertionTruthful[assertionId] = settled && truthful;
+    }
+
+    function assertionResult(bytes32 assertionId) external view returns (bool settled, bool truthful) {
+        settled = _assertionSettled[assertionId];
+        truthful = settled && _assertionTruthful[assertionId];
+    }
+
+    function assertionOf(bytes32 assertionId) external view returns (UMAAdapter.AssertionRecord memory record) {
+        record.claimedValue = _assertionValues[assertionId];
+        record.settled = _assertionSettled[assertionId];
     }
 
     function latestValue(bytes32) external view returns (uint256 value, uint64 valueTimestamp) {

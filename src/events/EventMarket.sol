@@ -35,12 +35,16 @@ contract EventMarket is Initializable, IEventMarket, ReentrancyGuard {
     mapping(address => uint256) public yesBalance;
     mapping(address => uint256) public noBalance;
 
-    // ---- APPENDED (Fix B) — objective-resolution config. MUST stay the LAST declared state var. ----
+    // ---- APPENDED (Fix B) — objective-resolution config. ----
     // Minimal-proxy clones are frozen at creation; a clone initialized under the OLD impl reads this
     // trailing slot group as all-zero => ResolutionConfig{source: UMA(0), ...} => it transparently
     // keeps the exact UMA path. Only clones created after the V2 impl is activated (and initialized
     // via `initializeV2`) carry a non-default config. NEVER insert state above this line.
     IEventMarket.ResolutionConfig private _resolution;
+
+    // Latest assertion proposed through this market. A rejected assertion remains recorded until
+    // a replacement is posted; this is the concurrency lock and recovery anchor for UMA resolution.
+    bytes32 private _resolutionAssertionId;
 
     event SharesBought(address indexed buyer, bool isYes, uint256 usdcAmount, uint256 sharesMinted);
     event SharesSold(address indexed seller, bool isYes, uint256 sharesAmount, uint256 usdcReturned);
@@ -248,10 +252,12 @@ contract EventMarket is Initializable, IEventMarket, ReentrancyGuard {
     }
 
     /// @inheritdoc IEventMarket
-    function proposeResolution(Outcome proposedOutcome) external nonReentrant onlyOpen {
+    function proposeResolution(Outcome proposedOutcome) external nonReentrant {
         // Objective (ORACLE_ROUTER) markets have no bonded proposal step — `settleResolution` reads
         // the feed directly — so a UMA proposal here would be meaningless. Reject it.
         if (_resolution.source != ResolutionSource.UMA) revert WrongResolutionSource();
+
+        _requireResolutionProposalAllowed();
 
         require(
             proposedOutcome == Outcome.YES || proposedOutcome == Outcome.NO || proposedOutcome == Outcome.VOID,
@@ -288,8 +294,27 @@ contract EventMarket is Initializable, IEventMarket, ReentrancyGuard {
             umaAdapter.proposeAssertionFor(_params.eventId, uint256(proposedOutcome), bytes(claim), msg.sender);
         bondCurrency.forceApprove(address(umaAdapter), 0);
 
+        _resolutionAssertionId = assertionId;
         _status = Status.PENDING_RESOLUTION;
         emit ResolutionProposed(assertionId, msg.sender, proposedOutcome, metric.currency, metric.bond);
+    }
+
+    /// @dev First proposals preserve the existing OPEN/deadline boundary. Once an assertion is
+    ///      pending, a replacement is allowed only after the adapter records a terminal rejection.
+    ///      A truthful assertion must be finalized through settleResolution instead of being
+    ///      overwritten, and an unsettled assertion remains the sole in-flight proposal.
+    function _requireResolutionProposalAllowed() private view {
+        if (_status == Status.OPEN) {
+            require(block.timestamp < _params.resolutionDeadline, "EventMarket: past deadline");
+            return;
+        }
+        require(_status == Status.PENDING_RESOLUTION, "EventMarket: not open");
+
+        bytes32 assertionId = _resolutionAssertionId;
+        require(assertionId != bytes32(0), "EventMarket: missing assertion");
+        (bool settled, bool truthful) = umaAdapter.assertionResult(assertionId);
+        if (!settled) revert ResolutionAssertionPending(assertionId);
+        if (truthful) revert ResolutionReadyToSettle(assertionId);
     }
 
     /// @inheritdoc IEventMarket
@@ -300,8 +325,23 @@ contract EventMarket is Initializable, IEventMarket, ReentrancyGuard {
         // `source == UMA` and take the UNCHANGED path below.
         Outcome resolved;
         if (_resolution.source == ResolutionSource.UMA) {
-            // ---- UMA (default): byte-for-byte the original logic. ----
-            (uint256 value,) = umaAdapter.latestValue(_params.eventId);
+            uint256 value;
+
+            // A proposal made through this market is authoritative for its pending lifecycle. Do
+            // not let an unrelated metric reading finalize a rejected or unsettled claim, or let
+            // a later assertion change the accepted outcome bound to this market lifecycle.
+            if (_resolutionAssertionId != bytes32(0)) {
+                (bool settled, bool truthful) = umaAdapter.assertionResult(_resolutionAssertionId);
+                if (!settled) revert ResolutionAssertionPending(_resolutionAssertionId);
+                if (!truthful) revert ResolutionAssertionRejected(_resolutionAssertionId);
+
+                value = umaAdapter.assertionOf(_resolutionAssertionId).claimedValue;
+            } else {
+                // Direct adapter assertions remain supported for the operational runbook and
+                // legacy markets whose stored assertion id is zero.
+                (value,) = umaAdapter.latestValue(_params.eventId);
+            }
+
             require(
                 value == uint256(Outcome.YES) || value == uint256(Outcome.NO) || value == uint256(Outcome.VOID),
                 "EventMarket: unsupported or unresolved value"
@@ -420,6 +460,11 @@ contract EventMarket is Initializable, IEventMarket, ReentrancyGuard {
 
     function status() external view returns (Status) {
         return _status;
+    }
+
+    /// @inheritdoc IEventMarket
+    function resolutionAssertionId() external view returns (bytes32) {
+        return _resolutionAssertionId;
     }
 
     function outcome() external view returns (Outcome) {

@@ -160,6 +160,9 @@ contract UMAAdapter is Initializable, UUPSUpgradeable, IOracleAdapter {
         // Immediate caller whose funds the adapter forwarded for each assertion. Appended so
         // existing v1 namespaced storage remains layout-compatible.
         mapping(bytes32 assertionId => address bondPayer) assertionBondPayers;
+        // Final truth verdict. Meaningful only when AssertionRecord.settled is true; appended so
+        // the existing namespaced layout and AssertionRecord ABI remain unchanged.
+        mapping(bytes32 assertionId => bool truthful) assertionTruthful;
     }
 
     /// @dev keccak256("people.markets.umaadapter.v1"). Matches the StorageLib convention. Using
@@ -536,6 +539,7 @@ contract UMAAdapter is Initializable, UUPSUpgradeable, IOracleAdapter {
         }
 
         rec.settled = true;
+        l.assertionTruthful[assertionId] = truthful;
 
         if (truthful) {
             // Update latest reading. Reject backdated overwrite: a slower-settled older assertion
@@ -599,6 +603,16 @@ contract UMAAdapter is Initializable, UUPSUpgradeable, IOracleAdapter {
     /// @notice Read the in-flight assertion record for `assertionId`.
     function assertionOf(bytes32 assertionId) external view returns (AssertionRecord memory) {
         return _layout().assertions[assertionId];
+    }
+
+    /// @notice Read an assertion's terminal state without widening the stable AssertionRecord ABI.
+    /// @dev `truthful` is meaningful only when `settled` is true. `(false, false)` means the
+    ///      assertion is unknown or still pending; callers that already hold its id can distinguish
+    ///      those cases with `assertionOf(assertionId).asserter` when needed.
+    function assertionResult(bytes32 assertionId) external view returns (bool settled, bool truthful) {
+        Layout storage l = _layout();
+        settled = l.assertions[assertionId].settled;
+        truthful = settled && l.assertionTruthful[assertionId];
     }
 
     /// @notice Immediate caller whose bond was forwarded for `assertionId` (zero for legacy data).

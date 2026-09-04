@@ -132,6 +132,10 @@ interface IEventMarket {
     function outcome() external view returns (Outcome);
     function params() external view returns (MarketParams memory);
 
+    /// @notice Latest UMA assertion proposed through this market, retained after settlement for audit.
+    /// @dev Zero for objective markets and UMA markets finalized from a direct adapter assertion.
+    function resolutionAssertionId() external view returns (bytes32);
+
     /// @notice The market's objective-resolution configuration. A zero-value struct (legacy clones
     ///         and any pre-V2 clone) reads as `{source: UMA, ...}` — i.e. the default UMA path.
     function resolutionConfig() external view returns (ResolutionConfig memory);
@@ -139,4 +143,13 @@ interface IEventMarket {
     /// @notice Thrown when a UMA-only entrypoint (`proposeResolution`) is called on a market whose
     ///         resolution source is ORACLE_ROUTER — objective markets have no bonded proposal step.
     error WrongResolutionSource();
+
+    /// @notice A replacement proposal cannot be posted until the current UMA assertion settles.
+    error ResolutionAssertionPending(bytes32 assertionId);
+
+    /// @notice The current assertion was accepted and the market should be settled, not reproposed.
+    error ResolutionReadyToSettle(bytes32 assertionId);
+
+    /// @notice A rejected assertion cannot finalize the market; a replacement proposal is required.
+    error ResolutionAssertionRejected(bytes32 assertionId);
 }

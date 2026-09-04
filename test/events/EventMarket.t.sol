@@ -858,6 +858,12 @@ contract EventMarketTest is Test {
         assertEq(uma.lastAsserter(), alice, "proposer remains economic asserter");
         assertEq(uma.lastMetricId(), EVENT_ID, "event id binds assertion metric");
         assertTrue(uma.lastAssertionId() != bytes32(0), "assertion id recorded");
+        assertEq(m.resolutionAssertionId(), uma.lastAssertionId(), "market anchors assertion id");
+        assertEq(
+            vm.load(address(m), bytes32(uint256(19))),
+            uma.lastAssertionId(),
+            "assertion anchor appended at storage slot 19"
+        );
         assertEq(usdc.allowance(address(m), address(uma)), 0, "transient adapter approval cleared");
         assertEq(uint256(m.status()), uint256(IEventMarket.Status.PENDING_RESOLUTION), "pending resolution");
     }
@@ -876,6 +882,74 @@ contract EventMarketTest is Test {
         assertEq(usdc.balanceOf(address(m)), marketBalanceBefore, "market collateral unchanged");
         assertEq(usdc.balanceOf(address(uma)), 0, "no bond forwarded");
         assertEq(uint256(m.status()), uint256(IEventMarket.Status.OPEN), "market remains open");
+    }
+
+    function test_proposeResolution_rejectsConcurrentAssertion() public {
+        EventMarket m = _defaultMarket();
+        vm.startPrank(alice);
+        usdc.approve(address(m), UMA_BOND);
+        m.proposeResolution(IEventMarket.Outcome.YES);
+        vm.stopPrank();
+
+        bytes32 firstAssertionId = m.resolutionAssertionId();
+        uma.setAssertionResult(firstAssertionId, false, false);
+        uint256 bobBalanceBefore = usdc.balanceOf(bob);
+
+        vm.startPrank(bob);
+        usdc.approve(address(m), UMA_BOND);
+        vm.expectRevert(abi.encodeWithSelector(IEventMarket.ResolutionAssertionPending.selector, firstAssertionId));
+        m.proposeResolution(IEventMarket.Outcome.NO);
+        vm.stopPrank();
+
+        assertEq(m.resolutionAssertionId(), firstAssertionId, "pending assertion remains authoritative");
+        assertEq(usdc.balanceOf(bob), bobBalanceBefore, "concurrent proposal takes no bond");
+    }
+
+    function test_proposeResolution_truthfulAssertionMustSettle() public {
+        EventMarket m = _defaultMarket();
+        vm.startPrank(alice);
+        usdc.approve(address(m), UMA_BOND);
+        m.proposeResolution(IEventMarket.Outcome.YES);
+        vm.stopPrank();
+
+        bytes32 assertionId = m.resolutionAssertionId();
+        vm.startPrank(bob);
+        usdc.approve(address(m), UMA_BOND);
+        vm.expectRevert(abi.encodeWithSelector(IEventMarket.ResolutionReadyToSettle.selector, assertionId));
+        m.proposeResolution(IEventMarket.Outcome.NO);
+        vm.stopPrank();
+
+        // A later direct adapter reading must not redirect the market away from its own accepted
+        // assertion. The exact assertion id, not mutable metric-level state, is authoritative.
+        uma.setLatestValue(uint256(IEventMarket.Outcome.NO), uint64(block.timestamp));
+        m.settleResolution();
+        assertEq(uint256(m.outcome()), uint256(IEventMarket.Outcome.YES), "truthful assertion finalized");
+    }
+
+    function test_rejectedResolutionCanBeReproposedAfterDeadlineAndSettled() public {
+        EventMarket m = _defaultMarket();
+        vm.startPrank(alice);
+        usdc.approve(address(m), UMA_BOND);
+        m.proposeResolution(IEventMarket.Outcome.YES);
+        vm.stopPrank();
+
+        bytes32 rejectedAssertionId = m.resolutionAssertionId();
+        uma.setAssertionResult(rejectedAssertionId, true, false);
+        vm.expectRevert(abi.encodeWithSelector(IEventMarket.ResolutionAssertionRejected.selector, rejectedAssertionId));
+        m.settleResolution();
+        assertEq(uint256(m.status()), uint256(IEventMarket.Status.PENDING_RESOLUTION), "market stays pending");
+
+        vm.warp(uint256(DEADLINE) + 1);
+        vm.startPrank(bob);
+        usdc.approve(address(m), UMA_BOND);
+        m.proposeResolution(IEventMarket.Outcome.NO);
+        vm.stopPrank();
+
+        bytes32 replacementAssertionId = m.resolutionAssertionId();
+        assertTrue(replacementAssertionId != rejectedAssertionId, "replacement assertion recorded");
+        m.settleResolution();
+        assertEq(uint256(m.outcome()), uint256(IEventMarket.Outcome.NO), "replacement assertion finalized");
+        assertEq(uint256(m.status()), uint256(IEventMarket.Status.RESOLVED), "market resolved after retry");
     }
 
     // ------------------------------------------------------------------------------------------
