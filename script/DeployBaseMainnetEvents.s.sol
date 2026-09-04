@@ -22,7 +22,7 @@ import {UMAAdapter} from "../src/oracle/UMAAdapter.sol";
 ///           - EventMarket implementation      (clone template for the factory)
 ///           - EventMarketFactory impl + proxy (initialized against the live LPVault / UMAAdapter /
 ///                                              FeedbackController / USDC)
-///           - EventMarketRouter  impl + proxy (engine-relayed custodial *For path)
+///           - EventMarketRouter  impl + proxy (engine-relayed, wallet-signed order path)
 ///
 ///         NO LPVault UPGRADE IS NEEDED. The live mainnet LPVault implementation
 ///         (0x7b904e341E14ae82e9Fa78a5CD2E856Bac56A3D5, deployed by DeployBaseMainnet from commit
@@ -149,6 +149,7 @@ contract DeployBaseMainnetEvents is Script {
         console2.log("    ...wait timelockDelay, then factory.activateAddOperator(router)");
         console2.log("(c) router.proposeAddOperator -> <EVENT_OPERATOR KMS signer>");
         console2.log("    ...wait timelockDelay, then router.activateAddOperator(operator)");
+        console2.log("    Wallets still authorize each exact order; allowlisting alone cannot spend funds.");
         console2.log("(d) UMAAdapter.proposeRegisterMetric per event, then activateRegisterMetric");
         console2.log("    (createMarket REVERTS MetricNotReady until the metric is registered)");
         console2.log("(e) factory.createMarket via governance; vault freeAssets must cover b*ln2 per market");

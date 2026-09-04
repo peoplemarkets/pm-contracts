@@ -54,7 +54,7 @@ contract DeployEventMarkets is Script {
         address factoryProxy = address(new ERC1967Proxy(address(factoryImpl), factoryInit));
         console2.log("EventMarketFactory Proxy:", factoryProxy);
 
-        console2.log("--- Deploying EventMarketRouter (engine-relayed *For path) ---");
+        console2.log("--- Deploying EventMarketRouter (wallet-signed relay path) ---");
         EventMarketRouter routerImpl = new EventMarketRouter();
         console2.log("EventMarketRouter Impl:", address(routerImpl));
 
@@ -77,7 +77,7 @@ contract DeployEventMarkets is Script {
         console2.log("   LPVault(proxy).proposeSetEventMarketFactory(EventMarketFactory)");
         console2.log("   ...wait LPVault.timelockDelay seconds...");
         console2.log("   LPVault(proxy).activateSetEventMarketFactory()");
-        console2.log("3. Enable the custodial path (layers i + ii) via EnableEventOperator:");
+        console2.log("3. Enable the signed relay allowlists via EnableEventOperator:");
         console2.log("   export EVENT_MARKET_FACTORY=<factory proxy above>");
         console2.log("   export EVENT_MARKET_ROUTER=<router proxy above>");
         console2.log("   export EVENT_OPERATOR=<engine operator signer address>");
@@ -88,7 +88,7 @@ contract DeployEventMarkets is Script {
         console2.log(
             "   forge script script/EnableEventOperator.s.sol:EnableEventOperator --sig 'activate()' --broadcast"
         );
-        console2.log("4. Users approve USDC to the EventMarketRouter (single approval).");
+        console2.log("4. Users approve the router, then sign each exact order for executeOrder().");
         console2.log("------------------------------------------");
         console2.log("Engine config contract (see docs/ENABLE_EVENT_DISPATCH.md):");
         console2.log("  chain.event_market_router :", routerProxy);
