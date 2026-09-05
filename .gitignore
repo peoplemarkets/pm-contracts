@@ -24,3 +24,9 @@ node_modules/
 # Build artifacts
 artifacts/
 typechain-types/
+
+# Backups of .env produced by tooling. One of these on disk holds DEPLOYER_PK in
+# plaintext and was NOT ignored, so a `git add -A` would have published a
+# private key. Ignore the pattern, not just the one file.
+.env.bak*
+.env.*.bak

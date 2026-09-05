@@ -1,0 +1,32 @@
+{
+  "version": "1.0",
+  "chainId": "8453",
+  "createdAt": 1784308726784,
+  "meta": {
+    "name": "PM C6 - add composer mark-writer",
+    "description": "proposeAddMarkWriter(0x048C9e7415e1a78672f81371326decb1d31A3baF) \u2014 composer CRI mark-writer (KMS committee slot 1, signer-only, no nonce contention with 0x4cFA). Execute now; starts 1h timelock.",
+    "txBuilderVersion": "1.16.5",
+    "createdFromSafeAddress": "0x1dfF78ED621fD37E495C6b5ef39D75a3e244651A"
+  },
+  "transactions": [
+    {
+      "to": "0x24b84FAA257d811213f488d48A7BB276cdCf9D9F",
+      "value": "0",
+      "data": null,
+      "contractMethod": {
+        "inputs": [
+          {
+            "internalType": "address",
+            "name": "writer",
+            "type": "address"
+          }
+        ],
+        "name": "proposeAddMarkWriter",
+        "payable": false
+      },
+      "contractInputsValues": {
+        "writer": "0x048C9e7415e1a78672f81371326decb1d31A3baF"
+      }
+    }
+  ]
+}
