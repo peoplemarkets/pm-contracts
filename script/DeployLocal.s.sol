@@ -207,8 +207,10 @@ contract DeployLocal is Script {
         output = string.concat(output, _uintLine("LOCAL_EVENT_LIVENESS", EVENT_LIVENESS));
         output = string.concat(output, _addressLine("USDC_ADDRESS", deployed.usdc));
         output = string.concat(output, _addressLine("EVENT_MARKET_USDC_ADDRESS", deployed.usdc));
+        output = string.concat(output, _addressLine("MATCHED_FILL_SETTLEMENT_TOKEN_ADDRESS", deployed.usdc));
         output = string.concat(output, _addressLine("SUBJECT_REGISTRY_ADDRESS", deployed.subjectRegistry));
         output = string.concat(output, _addressLine("LP_VAULT_ADDRESS", deployed.lpVault));
+        output = string.concat(output, _addressLine("MATCHED_FILL_COLLATERAL_SPENDER_ADDRESS", deployed.lpVault));
         output = string.concat(output, _addressLine("PERP_ENGINE_ADDRESS", deployed.perpEngine));
         output = string.concat(output, _addressLine("MARGIN_ENGINE_ADDRESS", deployed.marginEngine));
         output = string.concat(output, _addressLine("MATCHED_FILL_ROUTER_ADDRESS", deployed.matchedFillRouter));
