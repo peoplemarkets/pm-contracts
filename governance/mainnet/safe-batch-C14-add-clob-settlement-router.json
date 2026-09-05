@@ -1,0 +1,32 @@
+{
+  "version": "1.0",
+  "chainId": "8453",
+  "createdAt": 1788600600000,
+  "meta": {
+    "name": "PM C14 - add CLOB settlement router",
+    "description": "proposeAddRouter(0x4cFA24dDf33c9e17c1f5e93EE90416AB801f8599) on PerpEngine — flags the engine's operator signer (KMS key, already the mainnet mark-writer and KYC writer) as a trusted router so CLOB fill settlement can call openPositionFor/closePositionFor and attribute positions to the trader instead of to the operator. READ safe-batch-C14-add-clob-settlement-router.md BEFORE SIGNING: the router flag lets this key name any trader and spend that trader's standing LPVault allowance. Execute now; starts 1h timelock.",
+    "txBuilderVersion": "1.16.5",
+    "createdFromSafeAddress": "0x1dfF78ED621fD37E495C6b5ef39D75a3e244651A"
+  },
+  "transactions": [
+    {
+      "to": "0x24b84FAA257d811213f488d48A7BB276cdCf9D9F",
+      "value": "0",
+      "data": null,
+      "contractMethod": {
+        "inputs": [
+          {
+            "internalType": "address",
+            "name": "router",
+            "type": "address"
+          }
+        ],
+        "name": "proposeAddRouter",
+        "payable": false
+      },
+      "contractInputsValues": {
+        "router": "0x4cFA24dDf33c9e17c1f5e93EE90416AB801f8599"
+      }
+    }
+  ]
+}
