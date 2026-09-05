@@ -30,6 +30,8 @@ contract DeployLocal is Script {
     uint256 internal constant ANVIL_DEPLOYER_KEY = 0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80;
     string internal constant ANVIL_MNEMONIC = "test test test test test test test test test test test junk";
     uint32 internal constant EXECUTOR_INDEX = 5;
+    uint32 internal constant PERSON_MAKER_INDEX = 6;
+    uint32 internal constant PERSON_TAKER_INDEX = 7;
     uint32 internal constant TIMELOCK_DELAY = 1 hours;
     uint64 internal constant EVENT_LIVENESS = 60;
     uint256 internal constant EVENT_BOND = 10e6;
@@ -43,6 +45,8 @@ contract DeployLocal is Script {
     address internal constant TAKER_A = 0x90F79bf6EB2c4f870365E785982E1f101E93b906;
     address internal constant TAKER_B = 0x15d34AAf54267DB7D7c367839AAf71A00a2C6A65;
     address internal constant EXECUTOR = 0x9965507D1a55bcC2695C58ba16FB37d819B0A4dc;
+    address internal constant PERSON_MAKER = 0x976EA74026E726554dB657fA54763abd0C3a0aa9;
+    address internal constant PERSON_TAKER = 0x14dC79964da2C08b23698B3D3cc7Ca32193d9955;
 
     bytes32 internal constant SUBJECT_A = keccak256("drake");
     bytes32 internal constant SUBJECT_B = keccak256("kendrick");
@@ -69,6 +73,10 @@ contract DeployLocal is Script {
         // forge-lint: disable-next-line(unsafe-cheatcode)
         uint256 executorKey = vm.deriveKey(ANVIL_MNEMONIC, EXECUTOR_INDEX);
         require(vm.addr(executorKey) == EXECUTOR, "unexpected local executor");
+        // forge-lint: disable-next-line(unsafe-cheatcode)
+        require(vm.addr(vm.deriveKey(ANVIL_MNEMONIC, PERSON_MAKER_INDEX)) == PERSON_MAKER, "unexpected person maker");
+        // forge-lint: disable-next-line(unsafe-cheatcode)
+        require(vm.addr(vm.deriveKey(ANVIL_MNEMONIC, PERSON_TAKER_INDEX)) == PERSON_TAKER, "unexpected person taker");
         uint256 localStartBlock = block.number;
 
         vm.startBroadcast(ANVIL_DEPLOYER_KEY);
@@ -200,6 +208,8 @@ contract DeployLocal is Script {
         output = string.concat(output, _addressLine("LOCAL_MAKER_B", MAKER_B));
         output = string.concat(output, _addressLine("LOCAL_TAKER_A", TAKER_A));
         output = string.concat(output, _addressLine("LOCAL_TAKER_B", TAKER_B));
+        output = string.concat(output, _addressLine("LOCAL_PERSON_MAKER", PERSON_MAKER));
+        output = string.concat(output, _addressLine("LOCAL_PERSON_TAKER", PERSON_TAKER));
         output = string.concat(output, _bytes32Line("LOCAL_SUBJECT_A", SUBJECT_A));
         output = string.concat(output, _bytes32Line("LOCAL_SUBJECT_B", SUBJECT_B));
         output = string.concat(output, _bytes32Line("LOCAL_EVENT_ID", localEventId));

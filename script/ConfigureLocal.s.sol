@@ -70,6 +70,8 @@ contract ConfigureLocal is Script {
         _setKycIfNeeded(registry, vm.envAddress("LOCAL_MAKER_B"));
         _setKycIfNeeded(registry, vm.envAddress("LOCAL_TAKER_A"));
         _setKycIfNeeded(registry, vm.envAddress("LOCAL_TAKER_B"));
+        _setKycIfNeeded(registry, vm.envAddress("LOCAL_PERSON_MAKER"));
+        _setKycIfNeeded(registry, vm.envAddress("LOCAL_PERSON_TAKER"));
         margin.setKycCaps(2, 250_000 * ONE_USDC, 1_000_000 * ONE_USDC);
 
         uint256 deployerRequired = LP_DEPOSIT + INSURANCE_SEED;
@@ -86,6 +88,8 @@ contract ConfigureLocal is Script {
         _fundActor(usdc, vm.envAddress("LOCAL_MAKER_B"));
         _fundActor(usdc, vm.envAddress("LOCAL_TAKER_A"));
         _fundActor(usdc, vm.envAddress("LOCAL_TAKER_B"));
+        _fundActor(usdc, vm.envAddress("LOCAL_PERSON_MAKER"));
+        _fundActor(usdc, vm.envAddress("LOCAL_PERSON_TAKER"));
 
         (uint256 cappedTvl, uint64 cappedTvlUpdatedAt) = engine.cappedTvl();
         if (cappedTvlUpdatedAt == 0) engine.pokeCappedTvl();
