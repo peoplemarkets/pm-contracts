@@ -141,6 +141,10 @@ interface IFundingEngine {
 
     error SubjectNotRegistered(bytes32 subjectId);
     error SubjectAlreadyRegistered(bytes32 subjectId);
+    /// @dev Funding must freeze while the subject's reference metric is degraded, even when the
+    ///      router can return a fresh fallback value. Resuming accrual requires an explicit
+    ///      operator recovery that clears the router's degraded flag.
+    error OracleMetricDegraded(bytes32 metricId);
     /// @dev Thrown by `registerSubject` when `indexMetricId` is already bound to another subject.
     ///      Prevents the silent reverse-lookup overwrite on the `metricToSubject` mapping.
     error MetricAlreadyBound(bytes32 metricId);

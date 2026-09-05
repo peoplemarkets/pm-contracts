@@ -165,7 +165,9 @@ contract FundingEngine is Initializable, UUPSUpgradeable, ReentrancyGuard, IFund
     /// @inheritdoc IFundingEngine
     /// @dev Algorithm (matches spec §2):
     ///       1. Validate the subject is registered with this engine.
-    ///       2. Read the reference index from the OracleRouter (router handles degraded/stale).
+    ///       2. Read the reference index from the OracleRouter. The router rejects stale or
+    ///          degraded-without-fallback reads; this engine additionally freezes funding when a
+    ///          fresh fallback is carrying a degraded reading.
     ///       3. Read mark + longOI + shortOI from PerpEngine.
     ///       4. Read sentiment from local storage.
     ///       5. Compute `FundingTerms` via the pure library (no state writes here yet).
@@ -187,8 +189,12 @@ contract FundingEngine is Initializable, UUPSUpgradeable, ReentrancyGuard, IFund
         bytes32 metricId = s.subjectIndexMetric[subjectId];
         if (metricId == bytes32(0)) revert SubjectNotRegistered(subjectId);
 
-        // Step 2 — reference index from the router. Router reverts on stale or degraded-no-fallback.
+        // Step 2 — reference index from the router. The router reverts on stale or
+        // degraded-without-fallback. A fresh fallback still carries `degraded = true`; funding
+        // must freeze rather than accrue against a substituted reference until the operator
+        // explicitly clears the incident state.
         IOracleRouter.OracleReading memory r = IOracleRouter(s.oracleRouter).read(metricId);
+        if (r.degraded) revert OracleMetricDegraded(metricId);
         uint256 index1e18 = r.value;
 
         // Step 3 — mark + OI from PerpEngine.

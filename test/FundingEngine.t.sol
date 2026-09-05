@@ -35,6 +35,7 @@ import {MockUSDC} from "./mocks/MockUSDC.sol";
 ///            * subject not registered ⇒ reverts
 ///            * same-block double poke ⇒ elapsed=0 no-op
 ///            * subject paused ⇒ quote-index push reverts via requireTradeable
+///            * degraded metric with a fresh fallback ⇒ funding freezes
 ///            * negative funding (short-heavy + mark < index) ⇒ index goes down
 ///            * clamping: extreme premium hits ±F_max
 ///        - Governance transfer timelocked
@@ -825,6 +826,31 @@ contract FundingEngineTest is Test {
             )
         );
         funding.pokeFunding(SUBJECT_ID);
+    }
+
+    /// @dev A configured fallback keeps OracleRouter.read live while surfacing `degraded=true`.
+    ///      Funding must not silently accrue against that substituted reference. The clock and
+    ///      cumulative index stay frozen until the operator clears the degraded state.
+    function test_PokeFunding_RevertOnDegradedMetricWithFreshFallback() public {
+        funding.pokeFunding(SUBJECT_ID); // seed the funding clock before the incident
+        uint64 lastAtBefore = engine.lastQuoteFundingAt(SUBJECT_ID);
+        int256 indexBefore = engine.cumulativeFundingQuoteIndex(SUBJECT_ID);
+
+        vm.prank(governance);
+        router.proposeSetFallback(INDEX_METRIC_ID, address(adapter));
+        vm.warp(block.timestamp + TIMELOCK_DELAY);
+        router.activateSetFallback(INDEX_METRIC_ID);
+
+        // Refresh the shared adapter after the timelock so the fallback read itself is valid.
+        _pushIndex(INDEX_VALUE, uint64(block.timestamp));
+        vm.prank(routerOperator);
+        router.setDegraded(INDEX_METRIC_ID, true, keccak256("source quorum lost"));
+
+        vm.expectRevert(abi.encodeWithSelector(IFundingEngine.OracleMetricDegraded.selector, INDEX_METRIC_ID));
+        funding.pokeFunding(SUBJECT_ID);
+
+        assertEq(engine.lastQuoteFundingAt(SUBJECT_ID), lastAtBefore, "funding clock frozen");
+        assertEq(engine.cumulativeFundingQuoteIndex(SUBJECT_ID), indexBefore, "funding index frozen");
     }
 
     /// @dev Extreme premium hits the F_max clamp. Push a mark wildly above the index — the
