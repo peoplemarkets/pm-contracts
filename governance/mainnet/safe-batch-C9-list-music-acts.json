@@ -1,0 +1,113 @@
+{
+  "version": "1.0",
+  "chainId": "8453",
+  "createdAt": 1784555217163,
+  "meta": {
+    "name": "PM C9 - list music acts",
+    "description": "listSubject BTS, BLACKPINK, Taylor Swift, Drake under music category. onlyAdmin, immediate.",
+    "txBuilderVersion": "1.16.5",
+    "createdFromSafeAddress": "0x1dfF78ED621fD37E495C6b5ef39D75a3e244651A"
+  },
+  "transactions": [
+    {
+      "to": "0xae1C575368311C9b9C0405270B0992A3bCa51CB6",
+      "value": "0",
+      "data": null,
+      "contractMethod": {
+        "inputs": [
+          {
+            "internalType": "bytes32",
+            "name": "subjectId",
+            "type": "bytes32"
+          },
+          {
+            "internalType": "bytes32",
+            "name": "categoryId",
+            "type": "bytes32"
+          }
+        ],
+        "name": "listSubject",
+        "payable": false
+      },
+      "contractInputsValues": {
+        "subjectId": "0x3792295b8834f8dd4831ec6735012a70973cd907d3f5cbf9070a117cfd06f81a",
+        "categoryId": "0x24a84ec3e1702f9fb895ad84da713c835a201800011b2169605e1b4a76225ab9"
+      }
+    },
+    {
+      "to": "0xae1C575368311C9b9C0405270B0992A3bCa51CB6",
+      "value": "0",
+      "data": null,
+      "contractMethod": {
+        "inputs": [
+          {
+            "internalType": "bytes32",
+            "name": "subjectId",
+            "type": "bytes32"
+          },
+          {
+            "internalType": "bytes32",
+            "name": "categoryId",
+            "type": "bytes32"
+          }
+        ],
+        "name": "listSubject",
+        "payable": false
+      },
+      "contractInputsValues": {
+        "subjectId": "0xaff5b244448b7c637efee0fe80267cfb70295ea3dfb4f4e12d29b9c70d4419ce",
+        "categoryId": "0x24a84ec3e1702f9fb895ad84da713c835a201800011b2169605e1b4a76225ab9"
+      }
+    },
+    {
+      "to": "0xae1C575368311C9b9C0405270B0992A3bCa51CB6",
+      "value": "0",
+      "data": null,
+      "contractMethod": {
+        "inputs": [
+          {
+            "internalType": "bytes32",
+            "name": "subjectId",
+            "type": "bytes32"
+          },
+          {
+            "internalType": "bytes32",
+            "name": "categoryId",
+            "type": "bytes32"
+          }
+        ],
+        "name": "listSubject",
+        "payable": false
+      },
+      "contractInputsValues": {
+        "subjectId": "0x2294515513cf788331bd63a3f6891627600fa854c25d965d8767bf65d5b857f7",
+        "categoryId": "0x24a84ec3e1702f9fb895ad84da713c835a201800011b2169605e1b4a76225ab9"
+      }
+    },
+    {
+      "to": "0xae1C575368311C9b9C0405270B0992A3bCa51CB6",
+      "value": "0",
+      "data": null,
+      "contractMethod": {
+        "inputs": [
+          {
+            "internalType": "bytes32",
+            "name": "subjectId",
+            "type": "bytes32"
+          },
+          {
+            "internalType": "bytes32",
+            "name": "categoryId",
+            "type": "bytes32"
+          }
+        ],
+        "name": "listSubject",
+        "payable": false
+      },
+      "contractInputsValues": {
+        "subjectId": "0x928f15f0c2b88504b1268df4bfdfe6fbf3906fc378bacc83aee63d21116dcaa3",
+        "categoryId": "0x24a84ec3e1702f9fb895ad84da713c835a201800011b2169605e1b4a76225ab9"
+      }
+    }
+  ]
+}

@@ -1,0 +1,88 @@
+{
+  "version": "1.0",
+  "chainId": "8453",
+  "createdAt": 1784553107917,
+  "meta": {
+    "name": "PM C7 - list 3 creators",
+    "description": "listSubject 3 creators (MrBeast, IShowSpeed, Kai Cenat) under creator category. onlyAdmin, immediate.",
+    "txBuilderVersion": "1.16.5",
+    "createdFromSafeAddress": "0x1dfF78ED621fD37E495C6b5ef39D75a3e244651A"
+  },
+  "transactions": [
+    {
+      "to": "0xae1C575368311C9b9C0405270B0992A3bCa51CB6",
+      "value": "0",
+      "data": null,
+      "contractMethod": {
+        "inputs": [
+          {
+            "internalType": "bytes32",
+            "name": "subjectId",
+            "type": "bytes32"
+          },
+          {
+            "internalType": "bytes32",
+            "name": "categoryId",
+            "type": "bytes32"
+          }
+        ],
+        "name": "listSubject",
+        "payable": false
+      },
+      "contractInputsValues": {
+        "subjectId": "0x955d1148a9f65eb07a602c1b6f2b110d249c2775a94cf36cec489ace0c234e44",
+        "categoryId": "0x0d1f301a4d55e328cfe2f78743e489a98cedaf66d744b3ab1bb877ff82930b0b"
+      }
+    },
+    {
+      "to": "0xae1C575368311C9b9C0405270B0992A3bCa51CB6",
+      "value": "0",
+      "data": null,
+      "contractMethod": {
+        "inputs": [
+          {
+            "internalType": "bytes32",
+            "name": "subjectId",
+            "type": "bytes32"
+          },
+          {
+            "internalType": "bytes32",
+            "name": "categoryId",
+            "type": "bytes32"
+          }
+        ],
+        "name": "listSubject",
+        "payable": false
+      },
+      "contractInputsValues": {
+        "subjectId": "0xb9fbf7672f3f76f2b16a062c23a322d63a03e65c86837bada0e5f247ad641e24",
+        "categoryId": "0x0d1f301a4d55e328cfe2f78743e489a98cedaf66d744b3ab1bb877ff82930b0b"
+      }
+    },
+    {
+      "to": "0xae1C575368311C9b9C0405270B0992A3bCa51CB6",
+      "value": "0",
+      "data": null,
+      "contractMethod": {
+        "inputs": [
+          {
+            "internalType": "bytes32",
+            "name": "subjectId",
+            "type": "bytes32"
+          },
+          {
+            "internalType": "bytes32",
+            "name": "categoryId",
+            "type": "bytes32"
+          }
+        ],
+        "name": "listSubject",
+        "payable": false
+      },
+      "contractInputsValues": {
+        "subjectId": "0x714a8b2434b3ed5ac083a45bf03ed620f0c2c10cbc864d69270f34bc7599be8f",
+        "categoryId": "0x0d1f301a4d55e328cfe2f78743e489a98cedaf66d744b3ab1bb877ff82930b0b"
+      }
+    }
+  ]
+}

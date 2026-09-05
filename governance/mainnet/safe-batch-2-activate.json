@@ -1,0 +1,186 @@
+{
+  "version": "1.0",
+  "chainId": "8453",
+  "createdAt": 1784041797881,
+  "meta": {
+    "name": "PM mainnet wiring - 2 ACTIVATE",
+    "description": "Activate the timelocked proposals. Execute AFTER 1h (TIMELOCK_DELAY=3600s) has elapsed since batch 1.",
+    "txBuilderVersion": "1.16.5",
+    "createdFromSafeAddress": "0x1dfF78ED621fD37E495C6b5ef39D75a3e244651A"
+  },
+  "transactions": [
+    {
+      "to": "0xBcbF7734DD05DeB67313e75578cF68AA322777Fb",
+      "value": "0",
+      "data": null,
+      "contractMethod": {
+        "inputs": [],
+        "name": "activateSetPerpEngine",
+        "payable": false
+      },
+      "contractInputsValues": null
+    },
+    {
+      "to": "0xBcbF7734DD05DeB67313e75578cF68AA322777Fb",
+      "value": "0",
+      "data": null,
+      "contractMethod": {
+        "inputs": [],
+        "name": "activateSetLiquidationEngine",
+        "payable": false
+      },
+      "contractInputsValues": null
+    },
+    {
+      "to": "0x24b84FAA257d811213f488d48A7BB276cdCf9D9F",
+      "value": "0",
+      "data": null,
+      "contractMethod": {
+        "inputs": [],
+        "name": "activateSetMarginEngine",
+        "payable": false
+      },
+      "contractInputsValues": null
+    },
+    {
+      "to": "0x24b84FAA257d811213f488d48A7BB276cdCf9D9F",
+      "value": "0",
+      "data": null,
+      "contractMethod": {
+        "inputs": [],
+        "name": "activateSetFundingEngine",
+        "payable": false
+      },
+      "contractInputsValues": null
+    },
+    {
+      "to": "0x24b84FAA257d811213f488d48A7BB276cdCf9D9F",
+      "value": "0",
+      "data": null,
+      "contractMethod": {
+        "inputs": [],
+        "name": "activateSetLiquidationEngine",
+        "payable": false
+      },
+      "contractInputsValues": null
+    },
+    {
+      "to": "0x24b84FAA257d811213f488d48A7BB276cdCf9D9F",
+      "value": "0",
+      "data": null,
+      "contractMethod": {
+        "inputs": [],
+        "name": "activateSetFeedbackController",
+        "payable": false
+      },
+      "contractInputsValues": null
+    },
+    {
+      "to": "0x24b84FAA257d811213f488d48A7BB276cdCf9D9F",
+      "value": "0",
+      "data": null,
+      "contractMethod": {
+        "inputs": [
+          {
+            "internalType": "address",
+            "name": "router",
+            "type": "address"
+          }
+        ],
+        "name": "activateAddRouter",
+        "payable": false
+      },
+      "contractInputsValues": {
+        "router": "0x56b2C7aBA47e16f886af84d7aeD83D436E587335"
+      }
+    },
+    {
+      "to": "0x24b84FAA257d811213f488d48A7BB276cdCf9D9F",
+      "value": "0",
+      "data": null,
+      "contractMethod": {
+        "inputs": [
+          {
+            "internalType": "address",
+            "name": "router",
+            "type": "address"
+          }
+        ],
+        "name": "activateAddRouter",
+        "payable": false
+      },
+      "contractInputsValues": {
+        "router": "0x843464d27f7bFe37981bB42aE26d9E3483aB8501"
+      }
+    },
+    {
+      "to": "0x24b84FAA257d811213f488d48A7BB276cdCf9D9F",
+      "value": "0",
+      "data": null,
+      "contractMethod": {
+        "inputs": [
+          {
+            "internalType": "address",
+            "name": "writer",
+            "type": "address"
+          }
+        ],
+        "name": "activateAddMarkWriter",
+        "payable": false
+      },
+      "contractInputsValues": {
+        "writer": "0x4cFA24dDf33c9e17c1f5e93EE90416AB801f8599"
+      }
+    },
+    {
+      "to": "0xae1C575368311C9b9C0405270B0992A3bCa51CB6",
+      "value": "0",
+      "data": null,
+      "contractMethod": {
+        "inputs": [
+          {
+            "internalType": "address",
+            "name": "account",
+            "type": "address"
+          },
+          {
+            "internalType": "uint8",
+            "name": "role",
+            "type": "uint8"
+          }
+        ],
+        "name": "activateRoleChange",
+        "payable": false
+      },
+      "contractInputsValues": {
+        "account": "0x006170A8b83b6974cF79377a37BCf92696a4FEd5",
+        "role": "1"
+      }
+    },
+    {
+      "to": "0xae1C575368311C9b9C0405270B0992A3bCa51CB6",
+      "value": "0",
+      "data": null,
+      "contractMethod": {
+        "inputs": [
+          {
+            "internalType": "address",
+            "name": "account",
+            "type": "address"
+          },
+          {
+            "internalType": "uint8",
+            "name": "role",
+            "type": "uint8"
+          }
+        ],
+        "name": "activateRoleChange",
+        "payable": false
+      },
+      "contractInputsValues": {
+        "account": "0x006170A8b83b6974cF79377a37BCf92696a4FEd5",
+        "role": "2"
+      }
+    }
+  ]
+}
