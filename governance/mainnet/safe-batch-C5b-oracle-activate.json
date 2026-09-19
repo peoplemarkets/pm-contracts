@@ -1,0 +1,48 @@
+{
+  "version": "1.0",
+  "chainId": "8453",
+  "createdAt": 1784286584092,
+  "meta": {
+    "name": "PM C5b - activate Spotify metrics",
+    "description": "activateRegister the 7 metrics. Execute AFTER 1h.",
+    "txBuilderVersion": "1.16.5",
+    "createdFromSafeAddress": "0x1dfF78ED621fD37E495C6b5ef39D75a3e244651A"
+  },
+  "transactions": [
+    {
+      "to": "0x7343a5a45bcDC8a8d3C083cCeA900D8c032a6baf",
+      "value": "0",
+      "data": "0xb277019bcfc697ce8be490e6461ae23f11b886b363cd8cdf5204885da43dc92cc30637ae"
+    },
+    {
+      "to": "0x7343a5a45bcDC8a8d3C083cCeA900D8c032a6baf",
+      "value": "0",
+      "data": "0xb277019b819592fab9b0b3d35ece0fca917685dba3878422f9d348da2420e6cd13c2a8d7"
+    },
+    {
+      "to": "0x7343a5a45bcDC8a8d3C083cCeA900D8c032a6baf",
+      "value": "0",
+      "data": "0xb277019ba423c0f582aa51f031f5272b1daf7a97ee814e40ef3e95215f401761b22ac808"
+    },
+    {
+      "to": "0x7343a5a45bcDC8a8d3C083cCeA900D8c032a6baf",
+      "value": "0",
+      "data": "0xb277019bd09123856f892f68c03a93a75bc6a70e87a667024e4daaf3cff477801cfe4482"
+    },
+    {
+      "to": "0x7343a5a45bcDC8a8d3C083cCeA900D8c032a6baf",
+      "value": "0",
+      "data": "0xb277019b946ee49a149ff30fe518a24b09d7eaa051b2db010d474d2979cc4cc4ccfefeec"
+    },
+    {
+      "to": "0x7343a5a45bcDC8a8d3C083cCeA900D8c032a6baf",
+      "value": "0",
+      "data": "0xb277019ba641648e7868547f901f5a8688ecd7a883e15818605eda79c9f88478c05d5de9"
+    },
+    {
+      "to": "0x7343a5a45bcDC8a8d3C083cCeA900D8c032a6baf",
+      "value": "0",
+      "data": "0xb277019b0faefdac6b6f772c495dfc2195212ae0f82ea6cb09f24d0133f5f582a5683586"
+    }
+  ]
+}

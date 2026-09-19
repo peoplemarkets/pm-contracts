@@ -1,0 +1,81 @@
+{
+  "version": "1.0",
+  "chainId": "8453",
+  "createdAt": 1784995200000,
+  "meta": {
+    "name": "PM C10 - list crypto pod",
+    "description": "listSubject Jesse Pollak, Brian Armstrong, Vitalik Buterin, Changpeng Zhao under crypto category. onlyAdmin, immediate. subjectId = keccak256(display name), categoryId = keccak256('crypto').",
+    "txBuilderVersion": "1.16.5",
+    "createdFromSafeAddress": "0x1dfF78ED621fD37E495C6b5ef39D75a3e244651A"
+  },
+  "transactions": [
+    {
+      "to": "0xae1C575368311C9b9C0405270B0992A3bCa51CB6",
+      "value": "0",
+      "data": null,
+      "contractMethod": {
+        "inputs": [
+          { "internalType": "bytes32", "name": "subjectId", "type": "bytes32" },
+          { "internalType": "bytes32", "name": "categoryId", "type": "bytes32" }
+        ],
+        "name": "listSubject",
+        "payable": false
+      },
+      "contractInputsValues": {
+        "subjectId": "0x54ee7dc2425581581c47469e5eb1f5eed4233fcbddf6c7592f1580aa348c89b4",
+        "categoryId": "0x35006686fd78b85ed3fb52493d70cb3f7732177a19f352814df621b506c237a4"
+      }
+    },
+    {
+      "to": "0xae1C575368311C9b9C0405270B0992A3bCa51CB6",
+      "value": "0",
+      "data": null,
+      "contractMethod": {
+        "inputs": [
+          { "internalType": "bytes32", "name": "subjectId", "type": "bytes32" },
+          { "internalType": "bytes32", "name": "categoryId", "type": "bytes32" }
+        ],
+        "name": "listSubject",
+        "payable": false
+      },
+      "contractInputsValues": {
+        "subjectId": "0xfa4dffc9e824f830cf7d07fc7765ba1d7b344d923dd9083258189156f4932796",
+        "categoryId": "0x35006686fd78b85ed3fb52493d70cb3f7732177a19f352814df621b506c237a4"
+      }
+    },
+    {
+      "to": "0xae1C575368311C9b9C0405270B0992A3bCa51CB6",
+      "value": "0",
+      "data": null,
+      "contractMethod": {
+        "inputs": [
+          { "internalType": "bytes32", "name": "subjectId", "type": "bytes32" },
+          { "internalType": "bytes32", "name": "categoryId", "type": "bytes32" }
+        ],
+        "name": "listSubject",
+        "payable": false
+      },
+      "contractInputsValues": {
+        "subjectId": "0x33fd3a1a2f6025be5b2d3026fea143df162bb647c138b6d16851023d3c6518a7",
+        "categoryId": "0x35006686fd78b85ed3fb52493d70cb3f7732177a19f352814df621b506c237a4"
+      }
+    },
+    {
+      "to": "0xae1C575368311C9b9C0405270B0992A3bCa51CB6",
+      "value": "0",
+      "data": null,
+      "contractMethod": {
+        "inputs": [
+          { "internalType": "bytes32", "name": "subjectId", "type": "bytes32" },
+          { "internalType": "bytes32", "name": "categoryId", "type": "bytes32" }
+        ],
+        "name": "listSubject",
+        "payable": false
+      },
+      "contractInputsValues": {
+        "subjectId": "0x41c2f8ee4055280a02ce6bacede0b367df1684b6390ec2e81c0b81681de3d1a8",
+        "categoryId": "0x35006686fd78b85ed3fb52493d70cb3f7732177a19f352814df621b506c237a4"
+      }
+    }
+  ]
+}

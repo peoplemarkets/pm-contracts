@@ -1,0 +1,98 @@
+{
+  "version": "1.0",
+  "chainId": "8453",
+  "createdAt": 1785024000000,
+  "meta": {
+    "name": "PM C11 - list politics pod",
+    "description": "listSubject Javier Milei, Volodymyr Zelenskyy, Emmanuel Macron, Giorgia Meloni, Keir Starmer under politics category. Non-US figures only (US_POLITICIAN_ELECTION_YEAR policy flag deliberately avoided in a 2026 US election year). onlyAdmin, immediate. subjectId = keccak256(display name), categoryId = keccak256('politics').",
+    "txBuilderVersion": "1.16.5",
+    "createdFromSafeAddress": "0x1dfF78ED621fD37E495C6b5ef39D75a3e244651A"
+  },
+  "transactions": [
+    {
+      "to": "0xae1C575368311C9b9C0405270B0992A3bCa51CB6",
+      "value": "0",
+      "data": null,
+      "contractMethod": {
+        "inputs": [
+          { "internalType": "bytes32", "name": "subjectId", "type": "bytes32" },
+          { "internalType": "bytes32", "name": "categoryId", "type": "bytes32" }
+        ],
+        "name": "listSubject",
+        "payable": false
+      },
+      "contractInputsValues": {
+        "subjectId": "0x2f705861126468521fdae372898dd08249a79a312f1ffcc83dcb43bbedb33bd4",
+        "categoryId": "0x244cf72cb284fc7d430637a0d0fe497a88146c8eb8832a06e8aaf72bcb0f75c8"
+      }
+    },
+    {
+      "to": "0xae1C575368311C9b9C0405270B0992A3bCa51CB6",
+      "value": "0",
+      "data": null,
+      "contractMethod": {
+        "inputs": [
+          { "internalType": "bytes32", "name": "subjectId", "type": "bytes32" },
+          { "internalType": "bytes32", "name": "categoryId", "type": "bytes32" }
+        ],
+        "name": "listSubject",
+        "payable": false
+      },
+      "contractInputsValues": {
+        "subjectId": "0xca58fcca5efd55ababb1e46397133ca6655dc66c12c0ae860b1c8bd1518eeb3c",
+        "categoryId": "0x244cf72cb284fc7d430637a0d0fe497a88146c8eb8832a06e8aaf72bcb0f75c8"
+      }
+    },
+    {
+      "to": "0xae1C575368311C9b9C0405270B0992A3bCa51CB6",
+      "value": "0",
+      "data": null,
+      "contractMethod": {
+        "inputs": [
+          { "internalType": "bytes32", "name": "subjectId", "type": "bytes32" },
+          { "internalType": "bytes32", "name": "categoryId", "type": "bytes32" }
+        ],
+        "name": "listSubject",
+        "payable": false
+      },
+      "contractInputsValues": {
+        "subjectId": "0x7b8af8c7cd16b90370d1f6cb5cc5d184224b1f4ec3fbb3586da0d2af2242ebee",
+        "categoryId": "0x244cf72cb284fc7d430637a0d0fe497a88146c8eb8832a06e8aaf72bcb0f75c8"
+      }
+    },
+    {
+      "to": "0xae1C575368311C9b9C0405270B0992A3bCa51CB6",
+      "value": "0",
+      "data": null,
+      "contractMethod": {
+        "inputs": [
+          { "internalType": "bytes32", "name": "subjectId", "type": "bytes32" },
+          { "internalType": "bytes32", "name": "categoryId", "type": "bytes32" }
+        ],
+        "name": "listSubject",
+        "payable": false
+      },
+      "contractInputsValues": {
+        "subjectId": "0x1b43724599650543be026e236a93553a5a50de0bb9c061724cfefe46c71b7982",
+        "categoryId": "0x244cf72cb284fc7d430637a0d0fe497a88146c8eb8832a06e8aaf72bcb0f75c8"
+      }
+    },
+    {
+      "to": "0xae1C575368311C9b9C0405270B0992A3bCa51CB6",
+      "value": "0",
+      "data": null,
+      "contractMethod": {
+        "inputs": [
+          { "internalType": "bytes32", "name": "subjectId", "type": "bytes32" },
+          { "internalType": "bytes32", "name": "categoryId", "type": "bytes32" }
+        ],
+        "name": "listSubject",
+        "payable": false
+      },
+      "contractInputsValues": {
+        "subjectId": "0x47f1b537e17cffa3dd7d139018eacbeeb2a516c3d16e128cf7862ea7cdc131ae",
+        "categoryId": "0x244cf72cb284fc7d430637a0d0fe497a88146c8eb8832a06e8aaf72bcb0f75c8"
+      }
+    }
+  ]
+}

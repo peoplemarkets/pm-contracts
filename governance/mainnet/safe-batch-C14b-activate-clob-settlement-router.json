@@ -1,0 +1,32 @@
+{
+  "version": "1.0",
+  "chainId": "8453",
+  "createdAt": 1788600600001,
+  "meta": {
+    "name": "PM C14b - activate CLOB settlement router",
+    "description": "activateAddRouter(0x4cFA24dDf33c9e17c1f5e93EE90416AB801f8599) — execute AFTER 1h from C14. The call itself is permissionless once the timelock elapses; it is kept in the Safe so activation shows up in the same audit trail as the proposal.",
+    "txBuilderVersion": "1.16.5",
+    "createdFromSafeAddress": "0x1dfF78ED621fD37E495C6b5ef39D75a3e244651A"
+  },
+  "transactions": [
+    {
+      "to": "0x24b84FAA257d811213f488d48A7BB276cdCf9D9F",
+      "value": "0",
+      "data": null,
+      "contractMethod": {
+        "inputs": [
+          {
+            "internalType": "address",
+            "name": "router",
+            "type": "address"
+          }
+        ],
+        "name": "activateAddRouter",
+        "payable": false
+      },
+      "contractInputsValues": {
+        "router": "0x4cFA24dDf33c9e17c1f5e93EE90416AB801f8599"
+      }
+    }
+  ]
+}

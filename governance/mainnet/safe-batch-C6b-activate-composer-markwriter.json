@@ -1,0 +1,32 @@
+{
+  "version": "1.0",
+  "chainId": "8453",
+  "createdAt": 1784308726785,
+  "meta": {
+    "name": "PM C6b - activate composer mark-writer",
+    "description": "activateAddMarkWriter(0x048C9e7415e1a78672f81371326decb1d31A3baF) \u2014 execute AFTER 1h from C6.",
+    "txBuilderVersion": "1.16.5",
+    "createdFromSafeAddress": "0x1dfF78ED621fD37E495C6b5ef39D75a3e244651A"
+  },
+  "transactions": [
+    {
+      "to": "0x24b84FAA257d811213f488d48A7BB276cdCf9D9F",
+      "value": "0",
+      "data": null,
+      "contractMethod": {
+        "inputs": [
+          {
+            "internalType": "address",
+            "name": "writer",
+            "type": "address"
+          }
+        ],
+        "name": "activateAddMarkWriter",
+        "payable": false
+      },
+      "contractInputsValues": {
+        "writer": "0x048C9e7415e1a78672f81371326decb1d31A3baF"
+      }
+    }
+  ]
+}

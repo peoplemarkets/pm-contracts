@@ -1,0 +1,32 @@
+{
+  "version": "1.0",
+  "chainId": "8453",
+  "createdAt": 1788557121030,
+  "meta": {
+    "name": "PM C13 - tighten mark max-delta cap to 5%",
+    "description": "setMarkMaxDeltaBps(500) on PerpEngine — lowers the per-push mark move cap from 1500 bps (15%) to 500 bps (5%). At 1500 a single max-legal adverse push liquidates a 5x short (margin ratio 434 bps < 500 bps maintenance); at 500 it takes three. Matches the composer's own configured 5% cap, so no legitimate push is affected. No timelock — takes effect on execution.",
+    "txBuilderVersion": "1.16.5",
+    "createdFromSafeAddress": "0x1dfF78ED621fD37E495C6b5ef39D75a3e244651A"
+  },
+  "transactions": [
+    {
+      "to": "0x24b84FAA257d811213f488d48A7BB276cdCf9D9F",
+      "value": "0",
+      "data": null,
+      "contractMethod": {
+        "inputs": [
+          {
+            "internalType": "uint16",
+            "name": "bps",
+            "type": "uint16"
+          }
+        ],
+        "name": "setMarkMaxDeltaBps",
+        "payable": false
+      },
+      "contractInputsValues": {
+        "bps": "500"
+      }
+    }
+  ]
+}

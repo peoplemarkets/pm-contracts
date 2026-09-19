@@ -1,0 +1,81 @@
+{
+  "version": "1.0",
+  "chainId": "8453",
+  "createdAt": 1785200000000,
+  "meta": {
+    "name": "PM C12 - music cohort expansion",
+    "description": "listSubject The Weeknd, Billie Eilish, Bad Bunny, Ariana Grande under music category (cohort 4 -> 8 so the min-max Level percentile gains real granularity; BLACKPINK/cohort-min stops pinning at the 5% Level floor). onlyAdmin, immediate.",
+    "txBuilderVersion": "1.16.5",
+    "createdFromSafeAddress": "0x1dfF78ED621fD37E495C6b5ef39D75a3e244651A"
+  },
+  "transactions": [
+    {
+      "to": "0xae1C575368311C9b9C0405270B0992A3bCa51CB6",
+      "value": "0",
+      "data": null,
+      "contractMethod": {
+        "inputs": [
+          { "internalType": "bytes32", "name": "subjectId", "type": "bytes32" },
+          { "internalType": "bytes32", "name": "categoryId", "type": "bytes32" }
+        ],
+        "name": "listSubject",
+        "payable": false
+      },
+      "contractInputsValues": {
+        "subjectId": "0xd8b065863f55bb7e29eac9b1e3e8225f3f3c7726c361fe8ffcc18b835f683e50",
+        "categoryId": "0x24a84ec3e1702f9fb895ad84da713c835a201800011b2169605e1b4a76225ab9"
+      }
+    },
+    {
+      "to": "0xae1C575368311C9b9C0405270B0992A3bCa51CB6",
+      "value": "0",
+      "data": null,
+      "contractMethod": {
+        "inputs": [
+          { "internalType": "bytes32", "name": "subjectId", "type": "bytes32" },
+          { "internalType": "bytes32", "name": "categoryId", "type": "bytes32" }
+        ],
+        "name": "listSubject",
+        "payable": false
+      },
+      "contractInputsValues": {
+        "subjectId": "0xf805e75277ea8866a01e57963dafa59ac6bb8446640b723388af25a985da4ff7",
+        "categoryId": "0x24a84ec3e1702f9fb895ad84da713c835a201800011b2169605e1b4a76225ab9"
+      }
+    },
+    {
+      "to": "0xae1C575368311C9b9C0405270B0992A3bCa51CB6",
+      "value": "0",
+      "data": null,
+      "contractMethod": {
+        "inputs": [
+          { "internalType": "bytes32", "name": "subjectId", "type": "bytes32" },
+          { "internalType": "bytes32", "name": "categoryId", "type": "bytes32" }
+        ],
+        "name": "listSubject",
+        "payable": false
+      },
+      "contractInputsValues": {
+        "subjectId": "0xb40f02e23e6c2ad6e039a2340ff04fbdeda31ef2a24a715be91e664193a6c1f7",
+        "categoryId": "0x24a84ec3e1702f9fb895ad84da713c835a201800011b2169605e1b4a76225ab9"
+      }
+    },
+    {
+      "to": "0xae1C575368311C9b9C0405270B0992A3bCa51CB6",
+      "value": "0",
+      "data": null,
+      "contractMethod": {
+        "inputs": [
+          { "internalType": "bytes32", "name": "subjectId", "type": "bytes32" },
+          { "internalType": "bytes32", "name": "categoryId", "type": "bytes32" }
+        ],
+        "name": "listSubject",
+        "payable": false
+      },
+      "contractInputsValues": {
+        "subjectId": "0x1487da92e71f82e62d2882e1dd0b17ae0b34130884e785412c8755a01a8c572a",
+        "categoryId": "0x24a84ec3e1702f9fb895ad84da713c835a201800011b2169605e1b4a76225ab9"
+      }
+    }
+  ]
+}

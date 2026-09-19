@@ -1,0 +1,321 @@
+{
+  "version": "1.0",
+  "chainId": "8453",
+  "createdAt": 1788693600000,
+  "meta": {
+    "name": "PM C15 - finalize the BTS member delistings opened by C8",
+    "description": "Completes the delisting of the 7 BTS members opened by C8 on 2026-07-20. C8 called requestDelisting, which only OPENS the 7-day wind-down window; nothing closes it. The window elapsed 2026-07-27 12:53 UTC and no finalizing transaction was ever sent, so all 7 have sat in DELISTING (status 6) for 41 days. Because pm-platform-api's subjects list shows every status except DELISTED (subjects-service.ts:311), they reappeared on the board the moment the indexer start block was corrected to cover their original listing. Phase 1 (tx 1-7) SubjectRegistry.forceSettle -> DELISTED. Permissionless and the window has long elapsed, but batched here so it is ordered before phase 2. Phase 2 (tx 8-14) PerpEngine.forceSettleSubject captures each subject's current on-chain mark, which is what a position holder would settle at. All 7 have ZERO open interest (longOI=0, shortOI=0 verified on chain), so phase 2 settles nothing today - it completes the lifecycle so no DELISTED subject is left without a settlement mark. Marks are read from PerpEngine.markOf at build time and are stale (the oracle has not pushed since early August); with zero OI that is economically irrelevant and every value is inside [MIN_MARK=1, MAX_MARK=1e36]. IRREVERSIBLE: DELISTED is terminal and forceSettleSubject reverts on a second call (SubjectAlreadyForceSettled).",
+    "txBuilderVersion": "1.16.5",
+    "createdFromSafeAddress": "0x1dfF78ED621fD37E495C6b5ef39D75a3e244651A"
+  },
+  "transactions": [
+    {
+      "to": "0xae1C575368311C9b9C0405270B0992A3bCa51CB6",
+      "value": "0",
+      "data": null,
+      "contractMethod": {
+        "inputs": [
+          {
+            "internalType": "bytes32",
+            "name": "subjectId",
+            "type": "bytes32"
+          }
+        ],
+        "name": "forceSettle",
+        "payable": false
+      },
+      "contractInputsValues": {
+        "subjectId": "0xf475c0d8cf7c2f79236e68b8cf748d90148a0de91e7eb7427ab3b0453112e3e4"
+      }
+    },
+    {
+      "to": "0xae1C575368311C9b9C0405270B0992A3bCa51CB6",
+      "value": "0",
+      "data": null,
+      "contractMethod": {
+        "inputs": [
+          {
+            "internalType": "bytes32",
+            "name": "subjectId",
+            "type": "bytes32"
+          }
+        ],
+        "name": "forceSettle",
+        "payable": false
+      },
+      "contractInputsValues": {
+        "subjectId": "0xd9aab5d0141904b138bdb52d832e730b52781cdf50adeef9757ef2f3376a8b55"
+      }
+    },
+    {
+      "to": "0xae1C575368311C9b9C0405270B0992A3bCa51CB6",
+      "value": "0",
+      "data": null,
+      "contractMethod": {
+        "inputs": [
+          {
+            "internalType": "bytes32",
+            "name": "subjectId",
+            "type": "bytes32"
+          }
+        ],
+        "name": "forceSettle",
+        "payable": false
+      },
+      "contractInputsValues": {
+        "subjectId": "0xd10f8d6b6a31e3279b17d8c9cf1ecb8889742f6cd055e9dc402039c2a406f825"
+      }
+    },
+    {
+      "to": "0xae1C575368311C9b9C0405270B0992A3bCa51CB6",
+      "value": "0",
+      "data": null,
+      "contractMethod": {
+        "inputs": [
+          {
+            "internalType": "bytes32",
+            "name": "subjectId",
+            "type": "bytes32"
+          }
+        ],
+        "name": "forceSettle",
+        "payable": false
+      },
+      "contractInputsValues": {
+        "subjectId": "0x4f78156d9dee955fb5a82f66c7f77f107ebf94e572b6485bef10898e2840e20a"
+      }
+    },
+    {
+      "to": "0xae1C575368311C9b9C0405270B0992A3bCa51CB6",
+      "value": "0",
+      "data": null,
+      "contractMethod": {
+        "inputs": [
+          {
+            "internalType": "bytes32",
+            "name": "subjectId",
+            "type": "bytes32"
+          }
+        ],
+        "name": "forceSettle",
+        "payable": false
+      },
+      "contractInputsValues": {
+        "subjectId": "0xe028da789bdbafb802b6cc82503078425b4259718fb2d925d4e13e7bbfc874b8"
+      }
+    },
+    {
+      "to": "0xae1C575368311C9b9C0405270B0992A3bCa51CB6",
+      "value": "0",
+      "data": null,
+      "contractMethod": {
+        "inputs": [
+          {
+            "internalType": "bytes32",
+            "name": "subjectId",
+            "type": "bytes32"
+          }
+        ],
+        "name": "forceSettle",
+        "payable": false
+      },
+      "contractInputsValues": {
+        "subjectId": "0x1faca8bd84061b89fcd24f2fca6bfeaf0809d8d461faebe7c014f5a691d7a6a1"
+      }
+    },
+    {
+      "to": "0xae1C575368311C9b9C0405270B0992A3bCa51CB6",
+      "value": "0",
+      "data": null,
+      "contractMethod": {
+        "inputs": [
+          {
+            "internalType": "bytes32",
+            "name": "subjectId",
+            "type": "bytes32"
+          }
+        ],
+        "name": "forceSettle",
+        "payable": false
+      },
+      "contractInputsValues": {
+        "subjectId": "0xbd94e7b1000204dc5902be88e2ee619b248009c18b6da8ce1dbe9a573561d59f"
+      }
+    },
+    {
+      "to": "0x24b84FAA257d811213f488d48A7BB276cdCf9D9F",
+      "value": "0",
+      "data": null,
+      "contractMethod": {
+        "inputs": [
+          {
+            "internalType": "bytes32",
+            "name": "subjectId",
+            "type": "bytes32"
+          },
+          {
+            "internalType": "uint256",
+            "name": "settlementMark",
+            "type": "uint256"
+          }
+        ],
+        "name": "forceSettleSubject",
+        "payable": false
+      },
+      "contractInputsValues": {
+        "subjectId": "0xf475c0d8cf7c2f79236e68b8cf748d90148a0de91e7eb7427ab3b0453112e3e4",
+        "settlementMark": "5617070000000000000"
+      }
+    },
+    {
+      "to": "0x24b84FAA257d811213f488d48A7BB276cdCf9D9F",
+      "value": "0",
+      "data": null,
+      "contractMethod": {
+        "inputs": [
+          {
+            "internalType": "bytes32",
+            "name": "subjectId",
+            "type": "bytes32"
+          },
+          {
+            "internalType": "uint256",
+            "name": "settlementMark",
+            "type": "uint256"
+          }
+        ],
+        "name": "forceSettleSubject",
+        "payable": false
+      },
+      "contractInputsValues": {
+        "subjectId": "0xd9aab5d0141904b138bdb52d832e730b52781cdf50adeef9757ef2f3376a8b55",
+        "settlementMark": "29930977000000000000"
+      }
+    },
+    {
+      "to": "0x24b84FAA257d811213f488d48A7BB276cdCf9D9F",
+      "value": "0",
+      "data": null,
+      "contractMethod": {
+        "inputs": [
+          {
+            "internalType": "bytes32",
+            "name": "subjectId",
+            "type": "bytes32"
+          },
+          {
+            "internalType": "uint256",
+            "name": "settlementMark",
+            "type": "uint256"
+          }
+        ],
+        "name": "forceSettleSubject",
+        "payable": false
+      },
+      "contractInputsValues": {
+        "subjectId": "0xd10f8d6b6a31e3279b17d8c9cf1ecb8889742f6cd055e9dc402039c2a406f825",
+        "settlementMark": "17763838000000000000"
+      }
+    },
+    {
+      "to": "0x24b84FAA257d811213f488d48A7BB276cdCf9D9F",
+      "value": "0",
+      "data": null,
+      "contractMethod": {
+        "inputs": [
+          {
+            "internalType": "bytes32",
+            "name": "subjectId",
+            "type": "bytes32"
+          },
+          {
+            "internalType": "uint256",
+            "name": "settlementMark",
+            "type": "uint256"
+          }
+        ],
+        "name": "forceSettleSubject",
+        "payable": false
+      },
+      "contractInputsValues": {
+        "subjectId": "0x4f78156d9dee955fb5a82f66c7f77f107ebf94e572b6485bef10898e2840e20a",
+        "settlementMark": "35692540000000000000"
+      }
+    },
+    {
+      "to": "0x24b84FAA257d811213f488d48A7BB276cdCf9D9F",
+      "value": "0",
+      "data": null,
+      "contractMethod": {
+        "inputs": [
+          {
+            "internalType": "bytes32",
+            "name": "subjectId",
+            "type": "bytes32"
+          },
+          {
+            "internalType": "uint256",
+            "name": "settlementMark",
+            "type": "uint256"
+          }
+        ],
+        "name": "forceSettleSubject",
+        "payable": false
+      },
+      "contractInputsValues": {
+        "subjectId": "0xe028da789bdbafb802b6cc82503078425b4259718fb2d925d4e13e7bbfc874b8",
+        "settlementMark": "42117174000000000000"
+      }
+    },
+    {
+      "to": "0x24b84FAA257d811213f488d48A7BB276cdCf9D9F",
+      "value": "0",
+      "data": null,
+      "contractMethod": {
+        "inputs": [
+          {
+            "internalType": "bytes32",
+            "name": "subjectId",
+            "type": "bytes32"
+          },
+          {
+            "internalType": "uint256",
+            "name": "settlementMark",
+            "type": "uint256"
+          }
+        ],
+        "name": "forceSettleSubject",
+        "payable": false
+      },
+      "contractInputsValues": {
+        "subjectId": "0x1faca8bd84061b89fcd24f2fca6bfeaf0809d8d461faebe7c014f5a691d7a6a1",
+        "settlementMark": "31298522000000000000"
+      }
+    },
+    {
+      "to": "0x24b84FAA257d811213f488d48A7BB276cdCf9D9F",
+      "value": "0",
+      "data": null,
+      "contractMethod": {
+        "inputs": [
+          {
+            "internalType": "bytes32",
+            "name": "subjectId",
+            "type": "bytes32"
+          },
+          {
+            "internalType": "uint256",
+            "name": "settlementMark",
+            "type": "uint256"
+          }
+        ],
+        "name": "forceSettleSubject",
+        "payable": false
+      },
+      "contractInputsValues": {
+        "subjectId": "0xbd94e7b1000204dc5902be88e2ee619b248009c18b6da8ce1dbe9a573561d59f",
+        "settlementMark": "65454545000000000000"
+      }
+    }
+  ]
+}
