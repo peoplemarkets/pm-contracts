@@ -1,0 +1,102 @@
+{
+  "schemaVersion": "solidity-canonical-v1",
+  "sourceCommit": "d930bf870a63d678fd97b3a9a91b898f3026335e",
+  "status": "source-observed-not-owner-accepted",
+  "units": {
+    "money": "1e6",
+    "shares": "1e6",
+    "price": "1e18",
+    "fundingIndex": "signed 1e18 quote per base"
+  },
+  "lmsr": [
+    {
+      "id": "balanced",
+      "q1": "0",
+      "q2": "0",
+      "b": "100000000",
+      "usdcIn6": "10000000",
+      "cost6": "69314718",
+      "buyShares6": "19090282",
+      "sellReturn6": "9999999"
+    },
+    {
+      "id": "favorite",
+      "q1": "100000000",
+      "q2": "0",
+      "b": "100000000",
+      "usdcIn6": "10000000",
+      "cost6": "131326168",
+      "buyShares6": "13440949",
+      "sellReturn6": "9999999"
+    },
+    {
+      "id": "underdog",
+      "q1": "0",
+      "q2": "100000000",
+      "b": "100000000",
+      "usdcIn6": "10000000",
+      "cost6": "131326168",
+      "buyShares6": "33006252",
+      "sellReturn6": "10000000"
+    },
+    {
+      "id": "asymmetric",
+      "q1": "25000000",
+      "q2": "75000000",
+      "b": "100000000",
+      "usdcIn6": "10000000",
+      "cost6": "122407698",
+      "buyShares6": "24574105",
+      "sellReturn6": "10000000"
+    }
+  ],
+  "finance": {
+    "notional6": "6000000",
+    "makerFee6": "1500",
+    "takerFee6": "4500",
+    "dustFee6": "0",
+    "nonintegralNotional6": "4",
+    "marginRatioBps": "2000",
+    "longDebt6": "40000",
+    "shortDebt6": "-40000",
+    "negativeRateLongDebt6": "-40000",
+    "negativeRateShortDebt6": "40000",
+    "hourlyQuoteDelta18": "100000000000000000",
+    "negativeDustDebt6": "0"
+  },
+  "financeInputs": {
+    "notionalAndFees": {
+      "size6": "3000000",
+      "price18": "2000000000000000000",
+      "lpRebatePercent": "50"
+    },
+    "dustFee": {
+      "notional6": "1",
+      "isMaker": false,
+      "lpRebatePercent": "50"
+    },
+    "nonintegralNotional": {
+      "size6": "3",
+      "price18": "1500000000000000000"
+    },
+    "marginRatio": {
+      "equity6": "2000000",
+      "notional6": "10000000"
+    },
+    "fundingQuadrants": {
+      "absoluteSize6": "2000000",
+      "absoluteCurrentIndex18": "20000000000000000",
+      "entryIndex18": "0"
+    },
+    "hourlyQuoteDelta": {
+      "rate18": "1000000000000000",
+      "mark18": "100000000000000000000",
+      "elapsedSeconds": "3600"
+    },
+    "negativeDustDebt": {
+      "size6": "-1",
+      "currentIndex18": "500000000000000000",
+      "entryIndex18": "0"
+    }
+  }
+}
