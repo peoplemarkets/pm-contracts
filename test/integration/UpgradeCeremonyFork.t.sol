@@ -31,8 +31,7 @@ import {UMAAdapter} from "../../src/oracle/UMAAdapter.sol";
 ///           (E) INVARIANT I1 — vault balance == freeAssets + positionCollateral + insurance +
 ///               fees + unvestedEventSurplus holds post-upgrade.
 ///
-/// @dev    Skips gracefully (test passes as a no-op) if BASE_SEPOLIA_RPC_URL is unset, so CI without
-///         a fork stays green. Run locally with:
+/// @dev    Reports a skipped test if BASE_SEPOLIA_RPC_URL is unset. Run locally with:
 ///           BASE_SEPOLIA_RPC_URL=https://sepolia.base.org forge test \
 ///             --match-contract UpgradeCeremonyFork -vvv
 contract UpgradeCeremonyForkTest is Test {
@@ -62,7 +61,7 @@ contract UpgradeCeremonyForkTest is Test {
     function setUp() public {
         string memory rpc = vm.envOr("BASE_SEPOLIA_RPC_URL", string(""));
         if (bytes(rpc).length == 0) {
-            console2.log("BASE_SEPOLIA_RPC_URL unset - skipping fork ceremony test (CI no-op).");
+            console2.log("BASE_SEPOLIA_RPC_URL unset - fork ceremony not verified.");
             return;
         }
         vm.createSelectFork(rpc);
@@ -80,7 +79,7 @@ contract UpgradeCeremonyForkTest is Test {
 
     /// @dev The whole ceremony, in order, with the load-bearing assertions inline.
     function test_upgradeCeremony_fork() public {
-        if (!forked) return;
+        vm.skip(!forked);
 
         // ==================================================================================
         // PHASE 1 — deploy the four new implementations (plain `new`).

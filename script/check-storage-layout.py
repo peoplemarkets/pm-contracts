@@ -50,7 +50,7 @@ def compare_types(old,new,ot,nt,path):
   compare_types(old,new,x['key'],y['key'],path+'.key');compare_types(old,new,x['value'],y['value'],path+'.value')
  elif 'base' in x:
   if x['numberOfBytes']!=y['numberOfBytes']:
-   assert path.endswith('.rings.value.entries') and x['label'].endswith('[128]') and y['label'].endswith('[721]'),path
+   assert path=='PauseGuardianStorageHarness.state.rings.value.entries' and x['label'].endswith('[128]') and y['label'].endswith('[721]'),path
    expansions.append(path)
   compare_types(old,new,x['base'],y['base'],path+'[]')
  else:assert (x['label'],x['numberOfBytes'])==(y['label'],y['numberOfBytes']),path
