@@ -195,8 +195,10 @@ contract EventMarketRouter is Initializable, UUPSUpgradeable, EIP712, Reentrancy
         IERC20 token = IERC20(usdc_);
         // The validated wallet signature binds this exact trader, token spend, market, executor,
         // nonce, and deadline. The router operator cannot choose an arbitrary allowance owner.
+        // slither-disable-start arbitrary-send-erc20 -- executeOrder verifies the trader's exact signed spend before calling _buy.
         // forge-lint: disable-next-line(arbitrary-send-erc20)
         token.safeTransferFrom(order.trader, address(this), order.amountIn);
+        // slither-disable-end arbitrary-send-erc20
         token.forceApprove(order.market, order.amountIn);
         shares = IEventMarket(order.market).buyOutcomeFor(order.trader, order.isYes, order.amountIn, order.minAmountOut);
         token.forceApprove(order.market, 0);
