@@ -2962,8 +2962,8 @@ contract PerpEngineTest is Test {
         assertEq(shortOi, 0);
     }
 
-    function test_MatchedMakerSlicesFullCloseClearsRoundedOpeningOi() public {
-        address router = makeAddr("matchedRouter");
+    function _openRoundedMatchedSlices(uint256 fills) internal returns (bytes32 positionId, address router) {
+        router = makeAddr("matchedRouter");
         _activateRouter(router);
 
         IPerpEngine.MatchedOpenParams memory openParams = _baseMatchedOpenParams();
@@ -2972,23 +2972,108 @@ contract PerpEngineTest is Test {
         openParams.executionPrice = INITIAL_MARK + 5e11;
         openParams.maxFee = 25_000;
 
-        vm.prank(router);
-        bytes32 positionId = engine.openPositionForMatched(trader, openParams);
-        vm.prank(router);
-        assertEq(engine.openPositionForMatched(trader, openParams), positionId);
+        for (uint256 i; i < fills; ++i) {
+            vm.prank(router);
+            bytes32 openedId = engine.openPositionForMatched(trader, openParams);
+            if (i == 0) positionId = openedId;
+            else assertEq(openedId, positionId);
+        }
+    }
+
+    function test_MatchedMakerSlicesFullCloseClearsRoundedOpeningOi() public {
+        (bytes32 positionId, address router) = _openRoundedMatchedSlices(2);
 
         (uint256 longOi,) = engine.openInterestOf(SUBJECT_ID);
         assertEq(longOi, 200 * ONE_USDC);
 
         IPerpEngine.MatchedCloseParams memory closeParams = _baseMatchedCloseParams(positionId);
         closeParams.quantity = 2 * ONE_USDC;
-        closeParams.executionPrice = openParams.executionPrice;
+        closeParams.executionPrice = INITIAL_MARK + 5e11;
         closeParams.maxFee = 150_000;
         vm.prank(router);
         engine.closePositionForMatched(trader, closeParams);
 
         (longOi,) = engine.openInterestOf(SUBJECT_ID);
         assertEq(longOi, 0);
+    }
+
+    function test_RoundedOpeningOiDrainsAcrossPartialAndFullLiquidation() public {
+        address le = makeAddr("liqEngine");
+        _activateLiquidationEngine(le);
+        (bytes32 positionId,) = _openRoundedMatchedSlices(2);
+
+        IPerpEngine.Position memory position = engine.positionOf(positionId);
+        (uint256 longOi,) = engine.openInterestOf(SUBJECT_ID);
+        assertEq(longOi, 200 * ONE_USDC);
+        assertEq((uint256(position.size) * position.entryPrice) / ONE_18, longOi + 1);
+
+        vm.prank(le);
+        engine.liquidateClose(positionId, int256(ONE_USDC), 25 * ONE_USDC, 0, 0, le, 1);
+        (longOi,) = engine.openInterestOf(SUBJECT_ID);
+        assertEq(longOi, 100 * ONE_USDC);
+        assertEq(engine.positionOf(positionId).size, int256(ONE_USDC));
+        assertEq(marginEngine.netCategoryOiOf(CATEGORY_ID), int256(longOi));
+
+        vm.prank(le);
+        engine.liquidateClose(positionId, int256(ONE_USDC), 25 * ONE_USDC, 0, 0, le, 2);
+        (longOi,) = engine.openInterestOf(SUBJECT_ID);
+        assertEq(longOi, 0);
+        assertEq(engine.positionOf(positionId).size, 0);
+        assertEq(marginEngine.netCategoryOiOf(CATEGORY_ID), 0);
+    }
+
+    function test_RoundedOpeningOiDrainsAtForcedSettlement() public {
+        (bytes32 positionId,) = _openRoundedMatchedSlices(2);
+        IPerpEngine.Position memory position = engine.positionOf(positionId);
+        (uint256 longOi,) = engine.openInterestOf(SUBJECT_ID);
+        assertEq(longOi, 200 * ONE_USDC);
+        assertEq((uint256(position.size) * position.entryPrice) / ONE_18, longOi + 1);
+
+        _delistSubject(SUBJECT_ID);
+        vm.prank(governance);
+        engine.forceSettleSubject(SUBJECT_ID, INITIAL_MARK);
+        vm.prank(trader);
+        engine.closeAtForcedSettlement(SUBJECT_ID);
+
+        (longOi,) = engine.openInterestOf(SUBJECT_ID);
+        assertEq(longOi, 0);
+        assertEq(engine.positionIdOf(trader, SUBJECT_ID), bytes32(0));
+        assertEq(marginEngine.netCategoryOiOf(CATEGORY_ID), 0);
+    }
+
+    function test_LegacyOpeningOiSeedsBeforeMatchedIncreaseAndDrains() public {
+        (bytes32 positionId, address router) = _openRoundedMatchedSlices(1);
+        uint256 oldOpeningNotional = 100 * ONE_USDC;
+        // PerpStorage.Layout's final mapping is slot 27 relative to its v1 namespace.
+        // Assert the slot before changing it so this test fails if the layout moves.
+        bytes32 mappingSlot = bytes32(uint256(keccak256("people.markets.perp.v1")) + 27);
+        bytes32 valueSlot = keccak256(abi.encode(positionId, mappingSlot));
+        assertEq(uint256(vm.load(address(engine), valueSlot)), oldOpeningNotional);
+        vm.store(address(engine), valueSlot, bytes32(0)); // simulate a pre-upgrade position
+
+        IPerpEngine.MatchedOpenParams memory increase = _baseMatchedOpenParams();
+        increase.quantity = ONE_USDC;
+        increase.collateralAmount = 25 * ONE_USDC;
+        increase.executionPrice = 101 * ONE_18;
+        increase.maxFee = 25_250;
+        vm.prank(router);
+        assertEq(engine.openPositionForMatched(trader, increase), positionId);
+
+        (uint256 longOi,) = engine.openInterestOf(SUBJECT_ID);
+        assertEq(longOi, 201 * ONE_USDC);
+        assertEq(uint256(vm.load(address(engine), valueSlot)), longOi);
+        assertEq(marginEngine.netCategoryOiOf(CATEGORY_ID), int256(longOi));
+
+        IPerpEngine.MatchedCloseParams memory closeParams = _baseMatchedCloseParams(positionId);
+        closeParams.quantity = 2 * ONE_USDC;
+        closeParams.executionPrice = INITIAL_MARK;
+        closeParams.maxFee = 150_000;
+        vm.prank(router);
+        engine.closePositionForMatched(trader, closeParams);
+        (longOi,) = engine.openInterestOf(SUBJECT_ID);
+        assertEq(longOi, 0);
+        assertEq(uint256(vm.load(address(engine), valueSlot)), 0);
+        assertEq(marginEngine.netCategoryOiOf(CATEGORY_ID), 0);
     }
 
     function test_OpenPositionForMatched_MakerIncreasePreservesAccruedFundingDebt() public {
