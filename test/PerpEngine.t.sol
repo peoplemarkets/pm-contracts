@@ -2920,6 +2920,35 @@ contract PerpEngineTest is Test {
         assertEq(shortOi, 0);
     }
 
+    function test_MatchedMakerSlicesFullCloseClearsRoundedOpeningOi() public {
+        address router = makeAddr("matchedRouter");
+        _activateRouter(router);
+
+        IPerpEngine.MatchedOpenParams memory openParams = _baseMatchedOpenParams();
+        openParams.quantity = ONE_USDC;
+        openParams.collateralAmount = 25 * ONE_USDC;
+        openParams.executionPrice = INITIAL_MARK + 5e11;
+        openParams.maxFee = 25_000;
+
+        vm.prank(router);
+        bytes32 positionId = engine.openPositionForMatched(trader, openParams);
+        vm.prank(router);
+        assertEq(engine.openPositionForMatched(trader, openParams), positionId);
+
+        (uint256 longOi,) = engine.openInterestOf(SUBJECT_ID);
+        assertEq(longOi, 200 * ONE_USDC);
+
+        IPerpEngine.MatchedCloseParams memory closeParams = _baseMatchedCloseParams(positionId);
+        closeParams.quantity = 2 * ONE_USDC;
+        closeParams.executionPrice = openParams.executionPrice;
+        closeParams.maxFee = 150_000;
+        vm.prank(router);
+        engine.closePositionForMatched(trader, closeParams);
+
+        (longOi,) = engine.openInterestOf(SUBJECT_ID);
+        assertEq(longOi, 0);
+    }
+
     function test_OpenPositionForMatched_MakerIncreasePreservesAccruedFundingDebt() public {
         address router = makeAddr("matchedRouter");
         address fundingWriter = makeAddr("matchedFundingWriter");

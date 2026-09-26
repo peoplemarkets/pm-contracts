@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: BUSL-1.1
 pragma solidity 0.8.24;
 
+import {Math} from "@openzeppelin/contracts/utils/math/Math.sol";
+
 import {IPerpEngine} from "../core/IPerpEngine.sol";
 import {IOracleRouter} from "../oracle/IOracleRouter.sol";
 import {ISubjectRegistry} from "../registry/ISubjectRegistry.sol";
@@ -110,6 +112,30 @@ library PerpStorage {
         // Removes are immediate (compromised router can be cut off without delay).
         mapping(address router => bool) routers;
         mapping(address router => uint64) pendingRouterActivatesAt;
+        // Exact opening-notional contribution still held by each position. Weighted entry-price
+        // rounding cannot reconstruct the sum of separately rounded matched fills.
+        mapping(bytes32 positionId => uint256) positionOpeningNotional;
+    }
+
+    function consumeOpeningNotional(
+        Layout storage s,
+        bytes32 positionId,
+        uint256 closeQuantity,
+        uint256 positionQuantity,
+        uint256 entryPrice
+    )
+        internal
+        returns (uint256 amount)
+    {
+        uint256 remaining = s.positionOpeningNotional[positionId];
+        // Positions opened before this field existed retain the historical calculation.
+        if (remaining == 0) remaining = (positionQuantity * entryPrice) / 1e18;
+        amount = closeQuantity == positionQuantity ? remaining : Math.mulDiv(remaining, closeQuantity, positionQuantity);
+        if (closeQuantity == positionQuantity) {
+            delete s.positionOpeningNotional[positionId];
+        } else if (s.positionOpeningNotional[positionId] != 0) {
+            s.positionOpeningNotional[positionId] = remaining - amount;
+        }
     }
 
     function load() internal pure returns (Layout storage l) {

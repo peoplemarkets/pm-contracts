@@ -280,6 +280,7 @@ contract PerpEngine is Initializable, UUPSUpgradeable, ReentrancyGuard, IPerpEng
         });
         quoteS.entryQuoteIndex[positionId] = quoteS.cumulativeQuoteIndex[p.subjectId];
         perpS.openPositionId[trader][p.subjectId] = positionId;
+        perpS.positionOpeningNotional[positionId] = p.sizeNotional;
 
         // OI side-counters live on PerpStorage. Signed per-category OI + per-trader exposure live
         // on MarginEngine — delegate the update so the canonical state stays in one place.
@@ -375,6 +376,10 @@ contract PerpEngine is Initializable, UUPSUpgradeable, ReentrancyGuard, IPerpEng
         int256 entryQuoteIndex = quoteS.entryQuoteIndex[positionId];
         _CloseValues memory v =
             _computeCloseValues(orig, markNow, p.sizeFractionBps, p.isMaker, currentQuoteIndex, entryQuoteIndex);
+        uint256 positionQuantity = orig.size > 0 ? uint256(orig.size) : uint256(-orig.size);
+        uint256 closeQuantity = v.closeSize > 0 ? uint256(v.closeSize) : uint256(-v.closeSize);
+        v.openingNotionalDelta =
+            PerpStorage.consumeOpeningNotional(perpS, positionId, closeQuantity, positionQuantity, orig.entryPrice);
 
         // Update position state.
         if (v.fullClose) {
@@ -448,7 +453,6 @@ contract PerpEngine is Initializable, UUPSUpgradeable, ReentrancyGuard, IPerpEng
         }
 
         uint256 absCloseSize = v.closeSize > 0 ? uint256(v.closeSize) : uint256(-v.closeSize);
-        v.openingNotionalDelta = (absCloseSize * orig.entryPrice) / ONE;
         uint256 closeNotionalAtMark = (absCloseSize * markNow) / ONE;
         v.realizedPnl = PositionMath.unrealizedPnl(v.closeSize, orig.entryPrice, markNow);
 
