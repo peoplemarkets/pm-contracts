@@ -24,9 +24,8 @@ import {PerpVaultHandler} from "./PerpVaultHandler.sol";
 ///               insurance + accruedFees
 ///         - I2  position consistency: pos.size != 0 → pos.collateral > 0; openPositionId mapping
 ///               matches the position record
-///         - I3  OI conservation: per subject, totalLong/ShortOI matches the sum of opening
-///               notionals walked from the ghost position list (plus a redundant ghost-counter
-///               cross-check)
+///         - I3  OI conservation: per-subject counters match the handler's ghost ledger of
+///               remaining opening notional
 ///         - I7  mark staleness: no openPosition succeeded against a stale mark
 ///         - I8  pause respect: no openPosition succeeded against a non-ACTIVE / policy-flagged
 ///               subject
@@ -260,19 +259,9 @@ contract PerpVaultInvariants is Test {
         }
     }
 
-    /// @notice I3 — OI conservation per subject. Strict ghost-counter mirror.
-    /// @dev    The handler tracks `ghostExpectedLongOI` / `ghostExpectedShortOI` by mirroring the
-    ///         contract's open/close arithmetic exactly: open `+= sizeNotional`, close
-    ///         `-= (closeSize × entryPrice) / 1e18`. Both sides perform identical math, so the
-    ///         strict `assertEq` is the right shape.
-    ///
-    /// @dev    A naïve walk-recompute (sum `(size × entryPrice) / 1e18` over open positions)
-    ///         would diverge: the contract's OI accumulator carries cumulative open-time
-    ///         rounding loss across full-close cycles (`sizeNotional - (size × entryPrice) / 1e18`
-    ///         is left in OI when the position is fully closed). An independent walk-form would
-    ///         require tracking that cumulative loss in the handler — which collapses back to
-    ///         the same arithmetic the ghost-counter already does. The independent-recompute
-    ///         property is a v1.5 nice-to-have and is left as future work.
+    /// @notice I3 — OI conservation per subject. The handler records exact opening notional on
+    ///         each successful open and consumes it pro rata on partial close. Entry-price
+    ///         reconstruction would lose rounding dust and disagree with the canonical counter.
     function invariant_OIConservation() public view {
         uint256 nS = handler.subjectsLength();
         for (uint256 j = 0; j < nS; j++) {
