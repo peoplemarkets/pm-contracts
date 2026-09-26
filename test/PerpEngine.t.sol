@@ -529,6 +529,16 @@ contract PerpEngineTest is Test {
         engine.openPosition(p);
     }
 
+    function test_OpenPosition_RevertWhenNotionalRoundsToZeroSize() public {
+        IPerpEngine.OpenParams memory p = _baseOpenParams();
+        p.sizeNotional = 1; // One USDC micro at a $100 mark has no base unit.
+        p.collateralAmount = 10 * ONE_USDC;
+        vm.prank(trader);
+        vm.expectRevert(IPerpEngine.AmountZero.selector);
+        engine.openPosition(p);
+        assertEq(engine.positionIdOf(trader, SUBJECT_ID), bytes32(0));
+    }
+
     function test_OpenPosition_RevertOnSubjectNotTradeable() public {
         // Pause the subject and try to open.
         vm.prank(regGuardian);
@@ -963,6 +973,38 @@ contract PerpEngineTest is Test {
         vm.prank(trader);
         vm.expectRevert(abi.encodeWithSelector(IPerpEngine.InvalidSizeFraction.selector, uint256(10_001)));
         engine.closePosition(p);
+    }
+
+    function test_ClosePosition_RevertWhenPartialFractionClosesZeroSize() public {
+        IPerpEngine.OpenParams memory openParams = _baseOpenParams();
+        openParams.sizeNotional = 500_000; // 0.5 USDC at $100 gives 5,000 base units.
+        openParams.collateralAmount = 10 * ONE_USDC;
+        bytes32 positionId = _open(openParams);
+        IPerpEngine.Position memory beforePosition = engine.positionOf(positionId);
+        assertEq(beforePosition.size, 5_000);
+
+        IPerpEngine.CloseParams memory closeParams = _baseCloseParams();
+        closeParams.sizeFractionBps = 1; // Floors size to zero, but would release 1,000 USDC micros.
+        uint256 balanceBefore = usdc.balanceOf(trader);
+        (uint256 longOiBefore,) = engine.openInterestOf(SUBJECT_ID);
+
+        vm.prank(trader);
+        vm.expectRevert(IPerpEngine.AmountZero.selector);
+        engine.closePosition(closeParams);
+
+        address router = makeAddr("router");
+        _activateRouter(router);
+        closeParams.deadline = uint64(block.timestamp + 1 hours);
+        vm.prank(router);
+        vm.expectRevert(IPerpEngine.AmountZero.selector);
+        engine.closePositionFor(trader, closeParams);
+
+        IPerpEngine.Position memory afterPosition = engine.positionOf(positionId);
+        assertEq(afterPosition.size, beforePosition.size);
+        assertEq(afterPosition.collateral, beforePosition.collateral);
+        assertEq(usdc.balanceOf(trader), balanceBefore);
+        (uint256 longOiAfter,) = engine.openInterestOf(SUBJECT_ID);
+        assertEq(longOiAfter, longOiBefore);
     }
 
     function test_ClosePosition_RevertOnUnderwater() public {

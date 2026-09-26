@@ -255,6 +255,7 @@ contract PerpEngine is Initializable, UUPSUpgradeable, ReentrancyGuard, IPerpEng
         // Compute signed size in base units. Bound check: sizeNotional × ONE fits since
         // sizeNotional ≤ tier cap (max ≈ 1e6 USDC × 1e18 = 1e24 — safe).
         int256 absSize = int256((p.sizeNotional * ONE) / markNow);
+        if (absSize == 0) revert AmountZero();
         int256 signedSize = p.side == Side.LONG ? absSize : -absSize;
 
         // Allocate positionId from monotonic nonce.
@@ -451,6 +452,7 @@ contract PerpEngine is Initializable, UUPSUpgradeable, ReentrancyGuard, IPerpEng
             v.closeSize = (orig.size * int256(sizeFractionBps)) / int256(BPS_DENOMINATOR);
             v.closeCollateral = (orig.collateral * sizeFractionBps) / BPS_DENOMINATOR;
         }
+        if (!v.fullClose && v.closeSize == 0) revert AmountZero();
 
         uint256 absCloseSize = v.closeSize > 0 ? uint256(v.closeSize) : uint256(-v.closeSize);
         uint256 closeNotionalAtMark = (absCloseSize * markNow) / ONE;
