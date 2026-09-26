@@ -754,24 +754,7 @@ contract PerpEngine is Initializable, UUPSUpgradeable, ReentrancyGuard, IPerpEng
     /// @dev First-ever push for a subject (mark == 0) reverts: applying a multiplicative impulse
     ///      to an uninitialized mark would still leave it at zero and silently drop the bump.
     function applyImpulse(bytes32 subjectId, int256 impulseBps) external onlyFeedbackController {
-        PerpStorage.Layout storage perpS = PerpStorage.load();
-        ISubjectRegistry(perpS.subjectRegistry).requireTradeable(subjectId);
-
-        uint256 oldMark = perpS.markPrice[subjectId];
-        if (oldMark == 0) revert MarkNotInitialized(subjectId);
-
-        // newMark = oldMark × (BPS + impulseBps) / BPS. The multiplier is signed; for
-        // `impulseBps = -BPS_DENOMINATOR` it is zero and we revert as ImpulseUnderflow. For
-        // anything more negative it would be negative — also caught by the underflow guard.
-        int256 multiplier = int256(BPS_DENOMINATOR) + impulseBps;
-        int256 newMarkSigned = (int256(oldMark) * multiplier) / int256(BPS_DENOMINATOR);
-        if (newMarkSigned <= 0) revert ImpulseUnderflow();
-        uint256 newMark = uint256(newMarkSigned);
-
-        perpS.markPrice[subjectId] = newMark;
-        perpS.markUpdatedAt[subjectId] = uint64(block.timestamp);
-
-        emit MarkImpulsed(subjectId, oldMark, newMark, impulseBps, uint64(block.timestamp));
+        PerpInternals.applyImpulse(subjectId, impulseBps);
     }
 
     /// @inheritdoc IPerpEngine
@@ -1172,12 +1155,7 @@ contract PerpEngine is Initializable, UUPSUpgradeable, ReentrancyGuard, IPerpEng
 
     /// @inheritdoc IPerpEngine
     function leverageBpsOf(bytes32 positionId) external view returns (uint256) {
-        Position memory pos = PerpStorage.load().positions[positionId];
-        if (pos.size == 0 || pos.collateral == 0) return 0;
-        uint256 markNow = PerpStorage.load().markPrice[pos.subjectId];
-        if (markNow == 0) return 0;
-        uint256 notional_ = PositionMath.notional(pos.size, markNow);
-        return PositionMath.leverageBps(notional_, pos.collateral);
+        return PerpInternals.leverageBpsOf(positionId);
     }
 
     /// @inheritdoc IPerpEngine

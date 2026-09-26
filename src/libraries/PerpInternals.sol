@@ -104,6 +104,9 @@ library PerpInternals {
     );
     event QuoteFundingActivated(uint64 timestamp);
     event CollateralRemoved(bytes32 indexed positionId, uint256 amount, uint256 newCollateral);
+    event MarkImpulsed(
+        bytes32 indexed subjectId, uint256 oldMark, uint256 newMark, int256 impulseBps, uint64 timestamp
+    );
 
     // ------------------------------------------------------------------------------------------
     // Errors (signatures must match IPerpEngine)
@@ -137,6 +140,27 @@ library PerpInternals {
     error SubjectIsForceSettled(bytes32 subjectId);
     error MaintenanceMarginShort(uint256 mmBps, uint256 ratioBps);
     error MarginEngineUnset();
+    error MarkNotInitialized(bytes32 subjectId);
+    error ImpulseUnderflow();
+
+    /// @dev PerpEngine checks the FeedbackController role before delegating here.
+    function applyImpulse(bytes32 subjectId, int256 impulseBps) public {
+        PerpStorage.Layout storage perpS = PerpStorage.load();
+        ISubjectRegistry(perpS.subjectRegistry).requireTradeable(subjectId);
+
+        uint256 oldMark = perpS.markPrice[subjectId];
+        if (oldMark == 0) revert MarkNotInitialized(subjectId);
+
+        int256 multiplier = int256(BPS_DENOMINATOR) + impulseBps;
+        int256 newMarkSigned = (int256(oldMark) * multiplier) / int256(BPS_DENOMINATOR);
+        if (newMarkSigned <= 0) revert ImpulseUnderflow();
+        uint256 newMark = uint256(newMarkSigned);
+
+        perpS.markPrice[subjectId] = newMark;
+        perpS.markUpdatedAt[subjectId] = uint64(block.timestamp);
+
+        emit MarkImpulsed(subjectId, oldMark, newMark, impulseBps, uint64(block.timestamp));
+    }
 
     /// @notice Apply one side of an EIP-712-authorized matched open at its execution price.
     /// @dev The PerpEngine wrapper enforces the trusted-router role and reentrancy guard. The
@@ -581,6 +605,15 @@ library PerpInternals {
         if (markNow == 0) return 0;
         uint256 notional = PositionMath.notional(pos.size, markNow);
         return PositionMath.marginRatioBps(equityOf(positionId), notional);
+    }
+
+    function leverageBpsOf(bytes32 positionId) public view returns (uint256) {
+        IPerpEngine.Position memory pos = PerpStorage.load().positions[positionId];
+        if (pos.size == 0 || pos.collateral == 0) return 0;
+        uint256 markNow = PerpStorage.load().markPrice[pos.subjectId];
+        if (markNow == 0) return 0;
+        uint256 notional = PositionMath.notional(pos.size, markNow);
+        return PositionMath.leverageBps(notional, pos.collateral);
     }
 
     /// @notice Liquidation-engine 3-way close. See PerpEngine.liquidateClose for full semantics.
