@@ -17,19 +17,19 @@ import {UMAAdapter} from "../../src/oracle/UMAAdapter.sol";
 import {MockFeedbackController, MockLPVault, MockUMAAdapter} from "../events/mocks/MockEventDeps.sol";
 import {MockUSDC} from "../mocks/MockUSDC.sol";
 
-/// @title  EventDispatchE2E — custodial event-dispatch path, enabled via the real Sepolia sequence.
+/// @title  EventDispatchE2E — signed event-dispatch path, enabled via the real Sepolia sequence.
 ///
 /// @notice pm-engine #10 dogfood proof. Stands up the production EventMarketFactory + EventMarket
-///         Router (both behind UUPS proxies), then enables the custodial path using the EXACT
+///         Router (both behind UUPS proxies), then enables the signed relay path using the EXACT
 ///         two-layer, timelocked propose -> wait -> activate allowlisting that
 ///         `script/EnableEventOperator.s.sol` performs on Base Sepolia — including the router's
-///         MIN_TIMELOCK_DELAY = 1h floor. It then proves the operator-relayed buy/sell credit the
-///         trader (not the operator/router), and that non-operators and removed operators are
-///         rejected on both trust layers.
+///         MIN_TIMELOCK_DELAY = 1h floor. It then proves wallet-signed, operator-relayed buy/sell
+///         credit the trader (not the operator/router), and that non-operators and removed
+///         operators are rejected on both trust layers.
 ///
 /// @dev    This is the on-chain-behaviour twin of the deploy + enable tooling: if this test is
 ///         green, the Sepolia command sequence in docs/ENABLE_EVENT_DISPATCH.md yields a working
-///         custodial path.
+///         signed relay path.
 contract EventDispatchE2E is Test {
     EventMarketFactory internal factory;
     EventMarketRouter internal router;
@@ -40,7 +40,7 @@ contract EventDispatchE2E is Test {
 
     address internal governance = makeAddr("governance");
     address internal eventOperator = makeAddr("eventOperator"); // engine signer (EVENT_OPERATOR)
-    address internal trader = makeAddr("trader");
+    address internal trader;
     address internal stranger = makeAddr("stranger");
 
     // Base Sepolia dogfood timelock. NOTE: the router hard-floors timelockDelay at
@@ -49,6 +49,7 @@ contract EventDispatchE2E is Test {
     uint32 internal constant SEPOLIA_TIMELOCK = 1 hours;
     uint256 internal constant LMSR_B = 2_000e6;
     uint64 internal constant DEADLINE = 2_000_000_000;
+    uint256 internal constant TRADER_KEY = 0xA11CE;
 
     bytes32 internal constant SUBJECT_ID = keccak256("subject.worldcup.argentina");
     bytes32 internal constant EVENT_ID = keccak256("event.worldcup.argentina.win");
@@ -57,6 +58,7 @@ contract EventDispatchE2E is Test {
 
     function setUp() public {
         vm.warp(1_900_000_000);
+        trader = vm.addr(TRADER_KEY);
 
         usdc = new MockUSDC();
         lpVault = new MockLPVault(IERC20(address(usdc)));
@@ -88,7 +90,7 @@ contract EventDispatchE2E is Test {
         router = EventMarketRouter(address(new ERC1967Proxy(address(routerImpl), rInit)));
 
         // --- Enable the custodial path via the EnableEventOperator propose->wait->activate flow ---
-        _enableCustodialPath();
+        _enableRelayPath();
 
         // A live market to trade.
         vm.prank(governance);
@@ -100,7 +102,7 @@ contract EventDispatchE2E is Test {
     }
 
     /// @dev The exact effect of `EnableEventOperator.propose()` then `.activate()` on Sepolia.
-    function _enableCustodialPath() internal {
+    function _enableRelayPath() internal {
         // STEP 1 — propose (governance).
         vm.startPrank(governance);
         factory.proposeAddOperator(address(router)); // layer (i)
@@ -122,6 +124,41 @@ contract EventDispatchE2E is Test {
         assertTrue(router.isOperator(eventOperator), "layer (ii) enabled");
     }
 
+    function _order(
+        IEventMarketRouter.OrderIntent intent,
+        bool isYes,
+        uint256 amountIn,
+        uint256 minAmountOut,
+        uint256 nonce
+    )
+        internal
+        view
+        returns (IEventMarketRouter.EventOrder memory order)
+    {
+        order = IEventMarketRouter.EventOrder({
+            trader: trader,
+            executor: eventOperator,
+            market: address(market),
+            isYes: isYes,
+            intent: intent,
+            amountIn: amountIn,
+            minAmountOut: minAmountOut,
+            nonce: nonce,
+            deadline: uint64(block.timestamp + 5 minutes)
+        });
+    }
+
+    function _sign(IEventMarketRouter.EventOrder memory order) internal view returns (bytes memory) {
+        (uint8 v, bytes32 r, bytes32 s) = vm.sign(TRADER_KEY, router.hashOrder(order));
+        return abi.encodePacked(r, s, v);
+    }
+
+    function _execute(IEventMarketRouter.EventOrder memory order) internal returns (uint256 amountOut) {
+        bytes memory signature = _sign(order);
+        vm.prank(eventOperator);
+        return router.executeOrder(order, signature);
+    }
+
     // ------------------------------------------------------------------------------------------
     // Enablement wiring
     // ------------------------------------------------------------------------------------------
@@ -139,10 +176,10 @@ contract EventDispatchE2E is Test {
     }
 
     // ------------------------------------------------------------------------------------------
-    // Custodial buy: operator relays, trader is credited + charged
+    // Signed buy: operator relays, trader is credited + charged
     // ------------------------------------------------------------------------------------------
 
-    function test_custodialBuy_creditsTrader_pullsTraderUsdc() public {
+    function test_signedBuy_creditsTrader_pullsTraderUsdc() public {
         uint256 spend = 500e6;
 
         // Trader gives a single approval to the ROUTER (the one approval target).
@@ -151,9 +188,8 @@ contract EventDispatchE2E is Test {
 
         uint256 traderBefore = usdc.balanceOf(trader);
 
-        // Engine operator relays the buy on the trader's behalf.
-        vm.prank(eventOperator);
-        uint256 shares = router.buyOutcomeFor(trader, address(market), true, spend, 0);
+        IEventMarketRouter.EventOrder memory order = _order(IEventMarketRouter.OrderIntent.BUY, true, spend, 0, 1);
+        uint256 shares = _execute(order);
 
         assertGt(shares, 0, "shares minted");
         assertEq(market.yesBalance(trader), shares, "shares credited to trader");
@@ -165,20 +201,20 @@ contract EventDispatchE2E is Test {
     }
 
     // ------------------------------------------------------------------------------------------
-    // Custodial sell: proceeds paid directly to the trader
+    // Signed sell: proceeds paid directly to the trader
     // ------------------------------------------------------------------------------------------
 
-    function test_custodialSell_paysTrader() public {
+    function test_signedSell_paysTrader() public {
         vm.prank(trader);
         usdc.approve(address(router), type(uint256).max);
 
-        vm.prank(eventOperator);
-        uint256 shares = router.buyOutcomeFor(trader, address(market), true, 500e6, 0);
+        IEventMarketRouter.EventOrder memory buy = _order(IEventMarketRouter.OrderIntent.BUY, true, 500e6, 0, 2);
+        uint256 shares = _execute(buy);
 
         uint256 traderBefore = usdc.balanceOf(trader);
 
-        vm.prank(eventOperator);
-        uint256 out = router.sellOutcomeFor(trader, address(market), true, shares, 0);
+        IEventMarketRouter.EventOrder memory sell = _order(IEventMarketRouter.OrderIntent.SELL, true, shares, 0, 3);
+        uint256 out = _execute(sell);
 
         assertGt(out, 0, "proceeds returned");
         assertEq(market.yesBalance(trader), 0, "shares burned");
@@ -190,35 +226,37 @@ contract EventDispatchE2E is Test {
     // Access control — non-operator + removed operator rejected
     // ------------------------------------------------------------------------------------------
 
-    function test_custodial_nonOperatorReverts() public {
-        vm.prank(trader);
-        usdc.approve(address(router), type(uint256).max);
+    function test_signedRelay_nonOperatorReverts() public {
+        IEventMarketRouter.EventOrder memory order = _order(IEventMarketRouter.OrderIntent.BUY, true, 500e6, 0, 4);
+        bytes memory signature = _sign(order);
         vm.expectRevert(abi.encodeWithSelector(IEventMarketRouter.NotOperator.selector, stranger));
         vm.prank(stranger);
-        router.buyOutcomeFor(trader, address(market), true, 500e6, 0);
+        router.executeOrder(order, signature);
     }
 
-    function test_custodial_removedOperatorReverts() public {
+    function test_signedRelay_removedOperatorReverts() public {
         // Governance kill switch on layer (ii): immediate removal.
         vm.prank(governance);
         router.removeOperator(eventOperator);
 
-        vm.prank(trader);
-        usdc.approve(address(router), type(uint256).max);
+        IEventMarketRouter.EventOrder memory order = _order(IEventMarketRouter.OrderIntent.BUY, true, 500e6, 0, 5);
+        bytes memory signature = _sign(order);
         vm.expectRevert(abi.encodeWithSelector(IEventMarketRouter.NotOperator.selector, eventOperator));
         vm.prank(eventOperator);
-        router.buyOutcomeFor(trader, address(market), true, 500e6, 0);
+        router.executeOrder(order, signature);
     }
 
-    function test_custodial_routerRemovedFromFactoryReverts() public {
+    function test_signedRelay_routerRemovedFromFactoryReverts() public {
         // Governance kill switch on layer (i): remove router as a factory operator -> markets reject.
         vm.prank(governance);
         factory.removeOperator(address(router));
 
         vm.prank(trader);
         usdc.approve(address(router), type(uint256).max);
+        IEventMarketRouter.EventOrder memory order = _order(IEventMarketRouter.OrderIntent.BUY, true, 500e6, 0, 6);
+        bytes memory signature = _sign(order);
         vm.expectRevert(abi.encodeWithSelector(EventMarket.NotOperator.selector, address(router)));
         vm.prank(eventOperator);
-        router.buyOutcomeFor(trader, address(market), true, 500e6, 0);
+        router.executeOrder(order, signature);
     }
 }

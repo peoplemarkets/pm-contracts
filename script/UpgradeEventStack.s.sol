@@ -16,19 +16,22 @@ import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 
 /// @title  UpgradeEventStack — in-place upgrade ceremony for the LIVE Base Sepolia event-market stack.
 ///
-/// @notice Upgrades the three deployed proxies (LPVault, EventMarketFactory, and — via the factory's
-///         governance-timelocked market-implementation setter — the EventMarket clone template) to
-///         `current main`, then allowlists the operator relay path. RUN THE FORK TEST FIRST
+/// @notice Upgrades the deployed LPVault, EventMarketFactory, and EventMarketRouter proxies plus —
+///         via the factory's governance-timelocked setter — the EventMarket clone template to the
+///         reviewed release, then allowlists the wallet-signed operator relay. RUN THE FORK TEST FIRST
 ///         (`test/integration/UpgradeCeremonyFork.t.sol`) — the LPVault proxy also backs live perp
-///         positions, so its NAV/share-price reads MUST be unchanged across the upgrade.
+///         positions, so booked collateral and real USDC MUST be unchanged; NAV/share price may
+///         only correct downward under the event-recoverability fix and must never inflate.
 ///
 /// @dev    THIS SCRIPT IS PHASED so the live runbook can wait the 1h timelock floor between the
 ///         propose and activate legs (mirrors EnableEventOperator's propose()/activate() split):
 ///
-///           PHASE 1  deploy()                — deploy 3 new impls (plain `new`, no proxies). PRINTS
+///           PHASE 1  deploy()                — deploy 5 new impls (plain `new`, no proxies). PRINTS
 ///                                              the impl addresses; export them for the next phases.
 ///           PHASE 2  upgrade()               — upgradeToAndCall(newImpl, "") on the LPVault proxy,
-///                                              then on the EventMarketFactory proxy (NO reinit).
+///                                              EventMarketFactory proxy, then EventMarketRouter proxy
+///                                              (NO reinit). The router upgrade disables unsigned
+///                                              relays and enables EIP-712/ERC-1271 authorization.
 ///           PHASE 3  proposeSetMarketImpl()  — factory.proposeSetMarketImplementation(newEventImpl).
 ///           ...wait factory.timelockDelay (3600s)...
 ///           PHASE 4  activateSetMarketImpl() — factory.activateSetMarketImplementation().
@@ -45,7 +48,7 @@ import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 ///           EVENT_MARKET_ROUTER      — EventMarketRouter proxy (0x0AE0…)
 ///           EVENT_OPERATOR           — engine operator signer to allowlist on the router (0xbFE2…)
 ///         Required env for upgrade()/set-market-impl phases (the impls printed by deploy()):
-///           NEW_LPVAULT_IMPL, NEW_FACTORY_IMPL, NEW_EVENT_MARKET_IMPL
+///           NEW_LPVAULT_IMPL, NEW_FACTORY_IMPL, NEW_EVENT_MARKET_IMPL, NEW_ROUTER_IMPL
 ///           DEPLOYER_PK / PRIVATE_KEY — GOVERNANCE key (must be the vault + factory + router owner).
 contract UpgradeEventStack is Script {
     function _beginBroadcast() internal {
@@ -67,7 +70,7 @@ contract UpgradeEventStack is Script {
         return EventMarketRouter(vm.envAddress("EVENT_MARKET_ROUTER"));
     }
 
-    /// @notice Default entrypoint: PHASE 1 — deploy the three new implementations (safe, no proxies touched).
+    /// @notice Default entrypoint: PHASE 1 — deploy five new implementations (safe, no proxies touched).
     function run() external {
         deploy();
     }
@@ -77,7 +80,13 @@ contract UpgradeEventStack is Script {
     // ------------------------------------------------------------------------------------------
     function deploy()
         public
-        returns (address newVaultImpl, address newFactoryImpl, address newEventMarketImpl, address newFeedbackImpl)
+        returns (
+            address newVaultImpl,
+            address newFactoryImpl,
+            address newEventMarketImpl,
+            address newRouterImpl,
+            address newFeedbackImpl
+        )
     {
         console2.log("=== UpgradeEventStack: PHASE 1 DEPLOY (impls only) ===");
         _beginBroadcast();
@@ -85,6 +94,7 @@ contract UpgradeEventStack is Script {
         LPVault vaultImpl = new LPVault();
         EventMarketFactory factoryImpl = new EventMarketFactory();
         EventMarket eventMarketImpl = new EventMarket();
+        EventMarketRouter routerImpl = new EventMarketRouter();
         // Launch-critical: the FeedbackController V2 impl carries the appended election/sports/
         // milestone EventClasses + the idempotent seedV2Coefficients() backfiller.
         FeedbackController feedbackImpl = new FeedbackController();
@@ -94,17 +104,20 @@ contract UpgradeEventStack is Script {
         newVaultImpl = address(vaultImpl);
         newFactoryImpl = address(factoryImpl);
         newEventMarketImpl = address(eventMarketImpl);
+        newRouterImpl = address(routerImpl);
         newFeedbackImpl = address(feedbackImpl);
 
         console2.log("New LPVault impl            :", newVaultImpl);
         console2.log("New EventMarketFactory impl :", newFactoryImpl);
         console2.log("New EventMarket impl        :", newEventMarketImpl);
+        console2.log("New EventMarketRouter impl  :", newRouterImpl);
         console2.log("New FeedbackController impl :", newFeedbackImpl);
         console2.log("--------------------------------------");
         console2.log("Export these, then run PHASE 2 upgrade():");
         console2.log("  export NEW_LPVAULT_IMPL=", newVaultImpl);
         console2.log("  export NEW_FACTORY_IMPL=", newFactoryImpl);
         console2.log("  export NEW_EVENT_MARKET_IMPL=", newEventMarketImpl);
+        console2.log("  export NEW_ROUTER_IMPL=", newRouterImpl);
         console2.log("  export NEW_FEEDBACK_IMPL=", newFeedbackImpl);
         console2.log("Ceremony after PHASE 4 (setMarketImpl activate):");
         console2.log("  - upgradeFeedback()  : upgradeToAndCall on the FeedbackController proxy");
@@ -159,29 +172,38 @@ contract UpgradeEventStack is Script {
     }
 
     // ------------------------------------------------------------------------------------------
-    // PHASE 2 — upgrade the LPVault + EventMarketFactory proxies to their new impls (NO reinit).
+    // PHASE 2 — upgrade LPVault + EventMarketFactory + EventMarketRouter proxies (NO reinit).
     //
-    // Storage-compat to current main is verified GO (append-only) for both proxies, so the second
+    // Storage compatibility is append-only for all three proxies, so the second
     // arg to upgradeToAndCall is empty ("") — no reinitializer is run.
     // ------------------------------------------------------------------------------------------
     function upgrade() public {
         LPVault vault = _vault();
         EventMarketFactory factory = _factory();
+        EventMarketRouter router = _router();
         address newVaultImpl = vm.envAddress("NEW_LPVAULT_IMPL");
         address newFactoryImpl = vm.envAddress("NEW_FACTORY_IMPL");
+        address newRouterImpl = vm.envAddress("NEW_ROUTER_IMPL");
         require(newVaultImpl.code.length != 0, "NEW_LPVAULT_IMPL has no code");
         require(newFactoryImpl.code.length != 0, "NEW_FACTORY_IMPL has no code");
+        require(newRouterImpl.code.length != 0, "NEW_ROUTER_IMPL has no code");
 
         console2.log("=== UpgradeEventStack: PHASE 2 UPGRADE (proxies) ===");
         console2.log("vault proxy   :", address(vault));
         console2.log("factory proxy :", address(factory));
+        console2.log("router proxy  :", address(router));
 
-        // Perp-safety pre-reads (money-safety: these MUST be identical after the vault upgrade).
+        // Perp-safety pre-reads: booked collateral and real USDC must be identical after upgrade;
+        // accounting NAV may only correct downward and must remain bounded by real backing.
         uint256 taBefore = vault.totalAssets();
         uint256 ppsBefore = vault.convertToAssets(1e18);
         uint256 pcBefore = vault.positionCollateral();
         uint256 faBefore = vault.freeAssets();
         uint256 usdcBefore = IERC20(vault.asset()).balanceOf(address(vault));
+        address routerGovernanceBefore = router.governance();
+        address routerFactoryBefore = router.factory();
+        address routerUsdcBefore = router.usdc();
+        uint32 routerDelayBefore = router.timelockDelay();
         console2.log("PRE  totalAssets        :", taBefore);
         console2.log("PRE  pps(1e18 shares)   :", ppsBefore);
         console2.log("PRE  positionCollateral :", pcBefore);
@@ -192,6 +214,9 @@ contract UpgradeEventStack is Script {
         UUPSUpgradeable(address(vault)).upgradeToAndCall(newVaultImpl, "");
         // (c) EventMarketFactory proxy -> new factory impl.
         UUPSUpgradeable(address(factory)).upgradeToAndCall(newFactoryImpl, "");
+        // (d) EventMarketRouter proxy -> signed-order router impl. Its replay mappings append to
+        //     the existing namespaced layout; no reinitializer is required.
+        UUPSUpgradeable(address(router)).upgradeToAndCall(newRouterImpl, "");
         vm.stopBroadcast();
 
         uint256 taAfter = vault.totalAssets();
@@ -214,8 +239,13 @@ contract UpgradeEventStack is Script {
         require(taAfter <= taBefore, "MONEY-SAFETY FAIL: totalAssets INCREASED (NAV inflation)");
         require(ppsAfter <= ppsBefore, "MONEY-SAFETY FAIL: share price INCREASED (NAV inflation)");
         require(taAfter <= usdcAfter + pcAfter, "MONEY-SAFETY FAIL: totalAssets over-marks USDC+collateral");
+        require(router.governance() == routerGovernanceBefore, "ROUTER-SAFETY FAIL: governance changed");
+        require(router.factory() == routerFactoryBefore, "ROUTER-SAFETY FAIL: factory changed");
+        require(router.usdc() == routerUsdcBefore, "ROUTER-SAFETY FAIL: USDC changed");
+        require(router.timelockDelay() == routerDelayBefore, "ROUTER-SAFETY FAIL: timelock changed");
+        require(router.domainSeparator() != bytes32(0), "ROUTER-SAFETY FAIL: signed domain unavailable");
         console2.log("--------------------------------------");
-        console2.log("Perp collateral + vault USDC UNTOUCHED; NAV corrected down, no inflation. Next: PHASE 3.");
+        console2.log("Vault funds safe; router config retained; wallet-signed relay enabled. Next: PHASE 3.");
     }
 
     // ------------------------------------------------------------------------------------------

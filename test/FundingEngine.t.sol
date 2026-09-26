@@ -30,11 +30,12 @@ import {MockUSDC} from "./mocks/MockUSDC.sol";
 ///        - Sentiment-writer rotation: timelocked add (propose/activate/cancel), immediate remove
 ///        - setFundingCoefficients: midpoint happy + per-field band errors
 ///        - pokeFunding:
-///            * first poke on a fresh subject (lastFundingAt == 0) seeds clock with rate=0
+///            * first poke on a fresh subject (lastQuoteFundingAt == 0) seeds clock with rate=0
 ///            * second poke after elapsed time advances the cumulative index
 ///            * subject not registered ⇒ reverts
 ///            * same-block double poke ⇒ elapsed=0 no-op
-///            * subject paused ⇒ pushFundingIndex reverts via requireTradeable
+///            * subject paused ⇒ quote-index push reverts via requireTradeable
+///            * degraded metric with a fresh fallback ⇒ funding freezes
 ///            * negative funding (short-heavy + mark < index) ⇒ index goes down
 ///            * clamping: extreme premium hits ±F_max
 ///        - Governance transfer timelocked
@@ -266,6 +267,10 @@ contract FundingEngineTest is Test {
 
         // 15. Push an initial value via the SignedFeed for the index metric.
         _pushIndex(INDEX_VALUE, uint64(block.timestamp));
+        // Funding quote pushes independently require a fresh canonical mark. The funding-writer
+        // and sentiment-writer timelocks above intentionally advance beyond the original mark's
+        // freshness window, so re-stamp it at the final setup timestamp.
+        _refreshMark(INITIAL_MARK);
     }
 
     // ------------------------------------------------------------------------------------------
@@ -729,13 +734,13 @@ contract FundingEngineTest is Test {
 
     /// @dev First poke on a fresh subject seeds the clock with rate=0 and `newIndex == oldIndex`.
     function test_PokeFunding_FirstPokeSeedsClock() public {
-        assertEq(engine.lastFundingAt(SUBJECT_ID), 0);
+        assertEq(engine.lastQuoteFundingAt(SUBJECT_ID), 0);
         vm.expectEmit(true, false, false, true, address(funding));
-        emit IFundingEngine.FundingPoked(SUBJECT_ID, 0, 0, 0, 0);
+        emit IFundingEngine.FundingQuotePoked(SUBJECT_ID, 0, 0, 0, INITIAL_MARK, 0);
         funding.pokeFunding(SUBJECT_ID);
-        assertEq(engine.lastFundingAt(SUBJECT_ID), uint64(block.timestamp));
+        assertEq(engine.lastQuoteFundingAt(SUBJECT_ID), uint64(block.timestamp));
         // No index change on the seeding push.
-        assertEq(engine.cumulativeFundingIndex(SUBJECT_ID), 0);
+        assertEq(engine.cumulativeFundingQuoteIndex(SUBJECT_ID), 0);
     }
 
     /// @dev Subject not registered ⇒ reverts before reading anything else.
@@ -744,15 +749,15 @@ contract FundingEngineTest is Test {
         funding.pokeFunding(SUBJECT_ID_UNREGISTERED);
     }
 
-    /// @dev Same-block re-poke is a no-op return. `lastFundingAt` does not change; no event emitted.
+    /// @dev Same-block re-poke is a no-op. The quote clock and index do not change.
     function test_PokeFunding_SameBlockNoOp() public {
         funding.pokeFunding(SUBJECT_ID); // seed
-        uint64 lastAt = engine.lastFundingAt(SUBJECT_ID);
-        int256 idx = engine.cumulativeFundingIndex(SUBJECT_ID);
+        uint64 lastAt = engine.lastQuoteFundingAt(SUBJECT_ID);
+        int256 idx = engine.cumulativeFundingQuoteIndex(SUBJECT_ID);
         // Second poke in the same block: no state change.
         funding.pokeFunding(SUBJECT_ID);
-        assertEq(engine.lastFundingAt(SUBJECT_ID), lastAt);
-        assertEq(engine.cumulativeFundingIndex(SUBJECT_ID), idx);
+        assertEq(engine.lastQuoteFundingAt(SUBJECT_ID), lastAt);
+        assertEq(engine.cumulativeFundingQuoteIndex(SUBJECT_ID), idx);
     }
 
     /// @dev After elapsed time the cumulative index moves. Long-heavy book + mark above index ⇒
@@ -776,7 +781,7 @@ contract FundingEngineTest is Test {
         engine.pushMark(SUBJECT_ID, 105 * ONE_18); // re-stamp mark to defeat staleness
 
         funding.pokeFunding(SUBJECT_ID);
-        int256 idx = engine.cumulativeFundingIndex(SUBJECT_ID);
+        int256 idx = engine.cumulativeFundingQuoteIndex(SUBJECT_ID);
         assertGt(idx, 0, "index should grow when long-heavy + mark above index");
     }
 
@@ -798,11 +803,11 @@ contract FundingEngineTest is Test {
         engine.pushMark(SUBJECT_ID, 95 * ONE_18);
 
         funding.pokeFunding(SUBJECT_ID);
-        int256 idx = engine.cumulativeFundingIndex(SUBJECT_ID);
+        int256 idx = engine.cumulativeFundingQuoteIndex(SUBJECT_ID);
         assertLt(idx, 0, "index should shrink when short-heavy + mark below index");
     }
 
-    /// @dev Paused subject ⇒ pushFundingIndex reverts via requireTradeable. The exact revert
+    /// @dev Paused subject ⇒ quote-index push reverts via requireTradeable. The exact revert
     ///      surface comes from the registry's `requireTradeable`.
     function test_PokeFunding_RevertOnPausedSubject() public {
         funding.pokeFunding(SUBJECT_ID); // seed
@@ -821,6 +826,31 @@ contract FundingEngineTest is Test {
             )
         );
         funding.pokeFunding(SUBJECT_ID);
+    }
+
+    /// @dev A configured fallback keeps OracleRouter.read live while surfacing `degraded=true`.
+    ///      Funding must not silently accrue against that substituted reference. The clock and
+    ///      cumulative index stay frozen until the operator clears the degraded state.
+    function test_PokeFunding_RevertOnDegradedMetricWithFreshFallback() public {
+        funding.pokeFunding(SUBJECT_ID); // seed the funding clock before the incident
+        uint64 lastAtBefore = engine.lastQuoteFundingAt(SUBJECT_ID);
+        int256 indexBefore = engine.cumulativeFundingQuoteIndex(SUBJECT_ID);
+
+        vm.prank(governance);
+        router.proposeSetFallback(INDEX_METRIC_ID, address(adapter));
+        vm.warp(block.timestamp + TIMELOCK_DELAY);
+        router.activateSetFallback(INDEX_METRIC_ID);
+
+        // Refresh the shared adapter after the timelock so the fallback read itself is valid.
+        _pushIndex(INDEX_VALUE, uint64(block.timestamp));
+        vm.prank(routerOperator);
+        router.setDegraded(INDEX_METRIC_ID, true, keccak256("source quorum lost"));
+
+        vm.expectRevert(abi.encodeWithSelector(IFundingEngine.OracleMetricDegraded.selector, INDEX_METRIC_ID));
+        funding.pokeFunding(SUBJECT_ID);
+
+        assertEq(engine.lastQuoteFundingAt(SUBJECT_ID), lastAtBefore, "funding clock frozen");
+        assertEq(engine.cumulativeFundingQuoteIndex(SUBJECT_ID), indexBefore, "funding index frozen");
     }
 
     /// @dev Extreme premium hits the F_max clamp. Push a mark wildly above the index — the
@@ -845,14 +875,10 @@ contract FundingEngineTest is Test {
         engine.pushMark(SUBJECT_ID, 150 * ONE_18);
 
         funding.pokeFunding(SUBJECT_ID);
-        int256 idx = engine.cumulativeFundingIndex(SUBJECT_ID);
-        // After exactly 1 hour, the cumulative-index delta equals the (clamped) rate. Assert the
-        // ceiling: index ≤ DEFAULT_F_MAX (with a small tolerance for the second-level rounding
-        // produced by the slight elapsed > 3600 from intermediate operations).
+        int256 idx = engine.cumulativeFundingQuoteIndex(SUBJECT_ID);
+        // After one hour the quote delta is `clamped rate × $150 mark`.
         assertGt(idx, 0);
-        // Cap is 7.5e14 over exactly 1 hour. Allow up to 1% overshoot for any second-rounding
-        // (delta computes elapsed/3600 via integer division). In practice elapsed == 3600 here.
-        assertLe(idx, (DEFAULT_F_MAX * 101) / 100);
+        assertLe(idx, (DEFAULT_F_MAX * 150 * 101) / 100);
     }
 
     /// @dev Sentiment-only path. Balanced book + mark == index ⇒ only sentiment drives the rate.
@@ -874,9 +900,8 @@ contract FundingEngineTest is Test {
         engine.pushMark(SUBJECT_ID, INITIAL_MARK); // restamp mark
         funding.pokeFunding(SUBJECT_ID);
 
-        // Expected delta over 1h = kSentiment * sentiment / 1e18 = 4e15 * 0.1e18 / 1e18 = 4e14.
-        // Within F_max so no clamping.
-        assertEq(engine.cumulativeFundingIndex(SUBJECT_ID), 4e14);
+        // Rate is 4e14 and the mark is $100, so quote delta is 4e16 ($0.04/base).
+        assertEq(engine.cumulativeFundingQuoteIndex(SUBJECT_ID), 4e16);
     }
 
     // ------------------------------------------------------------------------------------------
@@ -962,11 +987,28 @@ contract FundingEngineTest is Test {
     // ------------------------------------------------------------------------------------------
 
     function test_View_CumulativeFundingIndexAndLastFundingAt() public {
-        // Before any poke both are zero.
-        assertEq(funding.cumulativeFundingIndex(SUBJECT_ID), 0);
-        assertEq(funding.lastFundingAt(SUBJECT_ID), 0);
+        // Simulate pre-cutover state in the legacy dimensionless namespace.
+        vm.prank(address(funding));
+        engine.pushFundingIndex(SUBJECT_ID, 123e15, 1e15);
+
+        assertEq(funding.cumulativeFundingIndex(SUBJECT_ID), 123e15);
+        assertEq(funding.lastFundingAt(SUBJECT_ID), engine.lastFundingAt(SUBJECT_ID));
+        assertEq(funding.cumulativeFundingQuoteIndex(SUBJECT_ID), 0);
+        assertEq(funding.lastQuoteFundingAt(SUBJECT_ID), 0);
+
+        // Advance just enough to distinguish the clocks while keeping setup's signed observation
+        // fresh and strictly avoiding a duplicate-timestamp feed update.
+        vm.warp(block.timestamp + 1);
+        _refreshMark(INITIAL_MARK);
         funding.pokeFunding(SUBJECT_ID); // seed
-        assertEq(funding.lastFundingAt(SUBJECT_ID), uint64(block.timestamp));
+
+        // Legacy selectors retain the frozen legacy domain; quote-aware consumers use the
+        // explicit versioned views.
+        assertEq(funding.cumulativeFundingIndex(SUBJECT_ID), 123e15);
+        assertEq(funding.lastFundingAt(SUBJECT_ID), engine.lastFundingAt(SUBJECT_ID));
+        assertEq(funding.cumulativeFundingQuoteIndex(SUBJECT_ID), 0);
+        assertEq(funding.lastQuoteFundingAt(SUBJECT_ID), engine.lastQuoteFundingAt(SUBJECT_ID));
+        assertNotEq(funding.lastFundingAt(SUBJECT_ID), funding.lastQuoteFundingAt(SUBJECT_ID));
     }
 
     function test_View_IsSentimentWriter() public view {

@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: BUSL-1.1
 pragma solidity 0.8.24;
 
+import {Math} from "@openzeppelin/contracts/utils/math/Math.sol";
+
 import {IPerpEngine} from "../core/IPerpEngine.sol";
 import {IOracleRouter} from "../oracle/IOracleRouter.sol";
 import {ISubjectRegistry} from "../registry/ISubjectRegistry.sol";
@@ -73,12 +75,9 @@ library PerpStorage {
         // freeAssets() to defeat same-block flash-deposit OI cap inflation.
         uint256 cappedTvl;
         uint64 cappedTvlUpdatedAt;
-        // ---- APPENDED: Tier-1 funding event stub — FundingEngine v1 wiring ----
-        // Authorized writer for `pushFundingIndex`. Rotated through the standard timelocked
-        // propose/activate/cancel flow (same shape as `pendingPerpEngine` on LPVault). The
-        // funding-math contract has not shipped yet; this address is `0x0` at v0 launch and
-        // populated when FundingEngine v1 deploys. Until then, `pushFundingIndex` reverts on
-        // every call and traders open positions with `entryFundingIndex = 0`.
+        // ---- APPENDED: FundingEngine writer ----
+        // Authorized writer for both the legacy transition selector and quote-index selector.
+        // Rotated through the standard timelocked propose/activate/cancel flow.
         address fundingEngine;
         address pendingFundingEngine;
         uint64 pendingFundingEngineActivatesAt;
@@ -113,6 +112,30 @@ library PerpStorage {
         // Removes are immediate (compromised router can be cut off without delay).
         mapping(address router => bool) routers;
         mapping(address router => uint64) pendingRouterActivatesAt;
+        // Exact opening-notional contribution still held by each position. Weighted entry-price
+        // rounding cannot reconstruct the sum of separately rounded matched fills.
+        mapping(bytes32 positionId => uint256) positionOpeningNotional;
+    }
+
+    function consumeOpeningNotional(
+        Layout storage s,
+        bytes32 positionId,
+        uint256 closeQuantity,
+        uint256 positionQuantity,
+        uint256 entryPrice
+    )
+        internal
+        returns (uint256 amount)
+    {
+        uint256 remaining = s.positionOpeningNotional[positionId];
+        // Positions opened before this field existed retain the historical calculation.
+        if (remaining == 0) remaining = (positionQuantity * entryPrice) / 1e18;
+        amount = closeQuantity == positionQuantity ? remaining : Math.mulDiv(remaining, closeQuantity, positionQuantity);
+        if (closeQuantity == positionQuantity) {
+            delete s.positionOpeningNotional[positionId];
+        } else if (s.positionOpeningNotional[positionId] != 0) {
+            s.positionOpeningNotional[positionId] = remaining - amount;
+        }
     }
 
     function load() internal pure returns (Layout storage l) {
@@ -177,11 +200,12 @@ library MarginStorage {
     }
 }
 
+/// @notice Legacy dimensionless funding state. Preserved for storage and log compatibility only.
 library FundingStorage {
     bytes32 internal constant SLOT = keccak256("people.markets.funding.v1");
 
     struct Layout {
-        // cumulative funding index per subject (signed, scaled by 1e18). Frozen during pauses.
+        // Legacy cumulative dimensionless rate per subject (signed, scaled by 1e18).
         mapping(bytes32 subjectId => int256) cumulativeFundingIndex;
         // last accrual timestamp per subject
         mapping(bytes32 subjectId => uint64) lastFundingAt;
@@ -197,6 +221,37 @@ library FundingStorage {
         uint256 minEventOiForSentiment;
         // permissioned writer for funding-rate keeper pushes
         mapping(address => bool) fundingWriters;
+    }
+
+    function load() internal pure returns (Layout storage l) {
+        bytes32 slot = SLOT;
+        assembly ("memory-safe") {
+            l.slot := slot
+        }
+    }
+}
+
+/// @title QuoteFundingStorage — versioned quote-denominated funding state.
+/// @notice Kept separate from `FundingStorage` because the legacy cumulative index is a
+///         dimensionless integrated rate. Reinterpreting that namespace as quote-per-base would
+///         corrupt every open position that snapshotted the old unit domain.
+library QuoteFundingStorage {
+    bytes32 internal constant SLOT = keccak256("people.markets.funding.quote.v1");
+
+    struct Layout {
+        // Cumulative signed quote funding per one base contract, scaled by 1e18.
+        mapping(bytes32 subjectId => int256) cumulativeQuoteIndex;
+        // Last quote-index accrual timestamp. Independent of the legacy clock.
+        mapping(bytes32 subjectId => uint64) lastQuoteFundingAt;
+        // Canonical quote-index snapshot for each position. Legacy positions read the zero
+        // default, intentionally waiving pre-activation funding rather than mixing dimensions.
+        mapping(bytes32 positionId => int256) entryQuoteIndex;
+        // Global version handshake. The first valid quote-index seed enables v2 and permanently
+        // disables legacy pushes on quote-aware PerpEngine implementations. This makes an old
+        // FundingEngine writer fail closed after cutover; proxy downgrade policy remains a separate
+        // governance and deployment control.
+        bool enabled;
+        uint64 activatedAt;
     }
 
     function load() internal pure returns (Layout storage l) {
@@ -455,15 +510,22 @@ library RegistryStorage {
 library PauseGuardianStorage {
     bytes32 internal constant SLOT = keccak256("people.markets.pauseguardian.v1");
 
-    /// @dev Number of slots in the per-subject mark-observation ring buffer. Sized so that, in
-    ///      normal operation (mark pushes every ~30s under the spec §1 default `markStaleAfter`),
-    ///      the buffer spans roughly 60 minutes — the longest breaker window. With the 5-second
-    ///      minimum-interval rate-limit, the worst-case buffer span is 128 × 5s = 10.6 minutes,
-    ///      which still covers the 30-second and 30-minute windows. Operators who push marks at
-    ///      a higher cadence may briefly under-cover the 1-hour window during ramp-up; this is an
-    ///      explicit tradeoff against per-subject storage cost (a denser buffer costs more gas on
-    ///      every `observe`).
-    uint16 internal constant RING_SIZE = 128;
+    /// @dev The original deployed ring used 128 entries. Keep the value explicit so
+    ///      `PauseGuardian` can rotate an already-wrapped legacy history before it starts writing
+    ///      with the expanded modulus.
+    uint16 internal constant LEGACY_RING_SIZE = 128;
+
+    /// @dev Number of slots in the per-subject mark-observation ring buffer. At the contract's
+    ///      five-second minimum interval, 721 observations span exactly 3,600 seconds including
+    ///      both endpoints: `(721 - 1) * 5 = 3,600`. `PauseGuardian.MAX_WINDOW_SECONDS` is capped
+    ///      to the same hour, so every permitted breaker window remains represented even at the
+    ///      densest allowed keeper cadence.
+    ///
+    ///      This expands only the trailing fixed array in `Ring`; `head` and `length` retain their
+    ///      original slots, and `rings` is the last field in the namespaced layout. Existing first
+    ///      128 entries therefore remain storage-compatible. A wrapped legacy ring is rotated once
+    ///      in `PauseGuardian.observe` before the new slots are used.
+    uint16 internal constant RING_SIZE = 721;
 
     /// @dev Single observation of a subject's mark. Packed so each entry occupies one storage slot
     ///      (uint192 mark + uint64 timestamp = 256 bits). MAX_MARK in PerpEngine is 1e36 which fits

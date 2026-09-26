@@ -7,18 +7,22 @@ import "forge-std/console2.sol";
 import {EventMarketFactory} from "../src/events/EventMarketFactory.sol";
 import {EventMarketRouter} from "../src/events/EventMarketRouter.sol";
 
-/// @title  EnableEventOperator — allowlist the custodial event-dispatch path on a live deployment.
+/// @title  EnableEventOperator — allowlist the wallet-signed event-dispatch path.
 ///
-/// @notice Executes the two-layer operator allowlisting that turns on the engine-relayed event
-///         market path (pm-engine #10 dogfood). It wires:
+/// @notice Executes the two operator allowlists required by the engine-relayed event-market path.
+///         Wallet authorization is a separate, mandatory layer enforced by `executeOrder`. It wires:
 ///
 ///           (i)  the ROUTER  as an operator on the FACTORY  — so every market accepts the router's
 ///                `*For` calls (`factory.isOperator(router) == true`); and
 ///           (ii) the ENGINE OPERATOR key as an operator on the ROUTER — so only that KMS/signer key
-///                can relay an approving trader's USDC (`router.isOperator(EVENT_OPERATOR) == true`).
+///                can relay an exact wallet-signed order (`router.isOperator(EVENT_OPERATOR) == true`).
+///
+///         Allowlisting does not authorize the engine to spend a trader's allowance or burn their
+///         outcome shares. The trader must sign every execution-sensitive field, including the
+///         executor, and the router enforces nonce and deadline replay protection on chain.
 ///
 /// @dev    Both allowlists are governance-timelocked (propose -> wait -> activate). On Base Sepolia
-///         the delay is set short (~225s) for the dogfood, so this is a genuine two-step operation:
+///         the router floors the delay at one hour, so this is a genuine two-step operation:
 ///
 ///           STEP 1 (propose):   forge script script/EnableEventOperator.s.sol:EnableEventOperator \
 ///                                 --sig "propose()" --rpc-url $BASE_SEPOLIA_RPC_URL --broadcast

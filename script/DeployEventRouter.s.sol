@@ -12,7 +12,7 @@ import {ERC1967Proxy} from "@openzeppelin/contracts/proxy/ERC1967/ERC1967Proxy.s
 ///
 /// Use this when the event-market stack (factory + vault upgrade + vault.eventMarketFactory)
 /// is already live — on Base Sepolia that is the case (factory 0xb73f…, vault already
-/// upgraded + pointed at it) — and the only missing piece of the custodial dispatch path
+/// upgraded + pointed at it) — and the only missing piece of the wallet-signed dispatch path
 /// is the router (pm-engine #10). `DeployEventMarkets.s.sol` redeploys the whole stack;
 /// this script deliberately does not.
 ///
@@ -70,6 +70,7 @@ contract DeployEventRouter is Script {
         console2.log("Engine config:");
         console2.log("  PM_CHAIN__EVENT_MARKET_ROUTER  =", routerProxy);
         console2.log("  PM_CHAIN__EVENT_MARKET_FACTORY =", factoryProxy);
+        console2.log("Clients must sign PeopleMarketsEventOrders v1 payloads for this proxy + chain.");
         console2.log("------------------------------------------");
     }
 }

@@ -2,6 +2,7 @@
 out/
 cache/
 broadcast/
+deployments/local/
 
 # Coverage
 lcov.info
