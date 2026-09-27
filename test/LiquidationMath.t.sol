@@ -36,6 +36,36 @@ contract Harness {
         );
     }
 
+    function partialIncWithFunding(
+        int256 currentSize,
+        uint256 currentCollateral,
+        uint256 markPrice,
+        uint256 entryPrice,
+        uint16 partialIncrementBps,
+        uint16 liquidatorBountyBps,
+        uint16 maintenanceMarginBps,
+        uint16 mmRestoreBufferBps,
+        int256 fundingDebt6,
+        int256 fundingDebtOnSlice6
+    )
+        external
+        pure
+        returns (LiquidationMath.PartialResult memory)
+    {
+        return LiquidationMath.computePartialIncrement(
+            currentSize,
+            currentCollateral,
+            markPrice,
+            entryPrice,
+            partialIncrementBps,
+            liquidatorBountyBps,
+            maintenanceMarginBps,
+            mmRestoreBufferBps,
+            fundingDebt6,
+            fundingDebtOnSlice6
+        );
+    }
+
     function full(
         int256 currentSize,
         uint256 currentCollateral,
@@ -49,6 +79,23 @@ contract Harness {
     {
         return LiquidationMath.computeFullLiquidation(
             currentSize, currentCollateral, markPrice, entryPrice, fullLiquidationBountyBps
+        );
+    }
+
+    function fullWithFunding(
+        int256 currentSize,
+        uint256 currentCollateral,
+        uint256 markPrice,
+        uint256 entryPrice,
+        uint16 fullLiquidationBountyBps,
+        int256 fundingDebt6
+    )
+        external
+        pure
+        returns (LiquidationMath.FullResult memory)
+    {
+        return LiquidationMath.computeFullLiquidation(
+            currentSize, currentCollateral, markPrice, entryPrice, fullLiquidationBountyBps, fundingDebt6
         );
     }
 
@@ -83,6 +130,19 @@ contract Harness {
         return LiquidationMath.bankruptcyPrice(size, collateral, entryPrice);
     }
 
+    function bankruptcyWithFunding(
+        int256 size,
+        uint256 collateral,
+        uint256 entryPrice,
+        int256 fundingDebt6
+    )
+        external
+        pure
+        returns (uint256)
+    {
+        return LiquidationMath.bankruptcyPrice(size, collateral, entryPrice, fundingDebt6);
+    }
+
     function signedPnlAt(int256 size, uint256 entryPrice, uint256 closePrice) external pure returns (int256) {
         return LiquidationMath.signedPnlAt(size, entryPrice, closePrice);
     }
@@ -100,6 +160,25 @@ contract Harness {
         returns (bool)
     {
         return LiquidationMath.isUnderLiquidationBuffer(size, collateral, markPrice, entryPrice, mmBps, bufBps);
+    }
+
+    function underBufWithFunding(
+        int256 size,
+        uint256 collateral,
+        uint256 markPrice,
+        uint256 entryPrice,
+        uint16 mmBps,
+        uint16 bufBps,
+        int256 fundingDebt6
+    )
+        external
+        pure
+        returns (bool)
+    {
+        return
+            LiquidationMath.isUnderLiquidationBuffer(
+                size, collateral, markPrice, entryPrice, mmBps, bufBps, fundingDebt6
+            );
     }
 }
 
@@ -125,6 +204,26 @@ contract LiquidationMathTest is Test {
     // ===========================================================================================
 
     // ----- guard reverts ------------------------------------------------------------------------
+
+    function test_Partial_FundingDebtReducesPayoutAndRestoresResidual() public view {
+        LiquidationMath.PartialResult memory r =
+            h.partialIncWithFunding(int256(500e6), 10_000e6, 100e18, 100e18, 2_500, 100, 500, 100, 7_000e6, 1_750e6);
+        assertEq(r.reducedSize, int256(125e6));
+        assertEq(r.signedPnl, -int256(1_750e6));
+        assertEq(r.bountyToLiquidator, 125e6);
+        assertEq(r.collateralFreed, 625e6);
+    }
+
+    function test_Partial_UsesExactRoundedSliceForFundingAndCollateral() public view {
+        // 70% of 5 base micro-units rounds to a 3-unit slice. Whole-position funding debt rounds
+        // to 1 and the exact slice debt also rounds to 1; prorating the rounded whole debt would
+        // incorrectly produce zero. Collateral must follow 3/5 of 101, not 70% of 101.
+        LiquidationMath.PartialResult memory r =
+            h.partialIncWithFunding(int256(5), 101, 1e18, 1e18, 7_000, 0, 0, 0, 1, 1);
+        assertEq(r.reducedSize, int256(3));
+        assertEq(r.signedPnl, -int256(1));
+        assertEq(r.collateralFreed, 59);
+    }
 
     function test_Partial_RevertOnZeroMark() public {
         vm.expectRevert(LiquidationMath.MarkNotPositive.selector);
@@ -657,6 +756,25 @@ contract LiquidationMathTest is Test {
     /// @dev Short: same numbers ⇒ P_b = 100 + 25 = $125 (above entry).
     function test_Bankruptcy_Short() public view {
         assertEq(h.bankruptcy(-int256(4000e6), 100_000e6, 100e18), 125e18);
+    }
+
+    function test_Bankruptcy_FundingDebtAdjustsEffectiveCollateral() public view {
+        assertEq(h.bankruptcyWithFunding(int256(500e6), 10_000e6, 100e18, 2_000e6), 84e18);
+        assertEq(h.bankruptcyWithFunding(-int256(500e6), 10_000e6, 100e18, 2_000e6), 116e18);
+        assertEq(h.bankruptcyWithFunding(int256(500e6), 10_000e6, 100e18, -int256(2_000e6)), 76e18);
+    }
+
+    function test_Full_FundingDebtCreatesBountyShortfall() public view {
+        LiquidationMath.FullResult memory r = h.fullWithFunding(int256(500e6), 10_000e6, 100e18, 100e18, 100, 9_800e6);
+        assertEq(r.bountyToLiquidator, 200e6);
+        assertEq(r.collateralReturned, 0);
+        assertEq(r.shortfall, 300e6);
+    }
+
+    function test_UnderBuffer_UsesSignedFundingDebt() public view {
+        assertFalse(h.underBuf(int256(500e6), 10_000e6, 100e18, 100e18, 500, 250));
+        assertTrue(h.underBufWithFunding(int256(500e6), 10_000e6, 100e18, 100e18, 500, 250, 7_000e6));
+        assertFalse(h.underBufWithFunding(int256(500e6), 10_000e6, 84e18, 100e18, 500, 250, -int256(2_000e6)));
     }
 
     /// @dev At P_b the position has exactly zero equity: collateral + size×(P_b−entry)/1e18 == 0.

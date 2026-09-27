@@ -100,6 +100,14 @@ contract MockOptimisticOracleV3 is IOptimisticOracleV3 {
             truthful = true;
         }
         a.settled = true;
+
+        // Mirror the minimum bond outcome the adapter and local lifecycle rely
+        // on: a truthful assertion returns the posted bond to UMA's economic
+        // asserter, while a rejected assertion remains slashed in the oracle.
+        // Disputer rewards are intentionally outside this small OOv3 stand-in.
+        if (truthful && a.bond != 0) {
+            IERC20(a.currency).safeTransfer(a.asserter, a.bond);
+        }
     }
 
     // ------------------------------------------------------------------------------------------

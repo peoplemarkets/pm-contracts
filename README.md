@@ -119,7 +119,7 @@ FOUNDRY_PROFILE=lite forge test
 2. **On-chain handles money; off-chain handles everything else.** Position state, collateral, funding accrual, liquidations, settlement live on chain. Mark price computation and order matching live off chain and are pushed in via permissioned writers.
 3. **Safety boundaries are explicit and audited.** Per-subject OI caps, per-trader exposure caps, leverage caps, and circuit breakers are first-class state, not parameters tucked in admin functions.
 4. **Namespaced storage.** Each storage namespace lives at a `keccak256("people.markets.<contract>.v1")` slot (Synthetix v3 / Diamond pattern). Allows UUPS upgrades without storage collisions.
-5. **Upgrade strategy.** Core contracts behind UUPS proxies with 48h timelock + multi-sig. Routers immutable (deploy new, migrate front-end if buggy). Libraries immutable.
+5. **Upgrade strategy.** Core contracts and routers are UUPS proxies whose `_authorizeUpgrade` is `onlyGovernance` with **no on-chain delay**: an upgrade takes effect in the block where the governance transaction executes. The on-chain `timelockDelay` (3,600 s on the live Base deployments) delays only the actions each contract routes through a propose/activate pair (for `PerpEngine`: mark-writer and router additions, engine-pointer rotations and governance transfer), never upgrades. On Base mainnet `governance` is the Safe `0x1dfF78ED621fD37E495C6b5ef39D75a3e244651A`; read on chain on 2026-09-27 it has threshold 1 and a single owner, so an upgrade needs one signature and no waiting period. Review and any delay before an upgrade are off-chain process (`script/DEPLOYMENT.md`). Deployed library code is immutable: a `PerpEngine` upgrade deploys and links a new `PerpInternals`.
 
 ---
 
@@ -141,8 +141,8 @@ struct MetricConfig {
 ```
 
 **Two roles.**
-- `governance` — slow lever, all config changes timelocked (48h baseline). UUPS upgrades gated here.
-- `operator` — fast lever, `setDegraded` only, no timelock. Required to be a separate multi-sig.
+- `governance` — slow lever. Metric registration, fallback changes and governance transfer are timelocked by the on-chain `timelockDelay` (1 hour minimum; 3,600 s on Base mainnet). `setOperator` and UUPS upgrades take effect immediately.
+- `operator` — fast lever, `setDegraded` only, no timelock. Intended to be a separate multi-sig; on Base mainnet it is currently the governance Safe itself (read on chain 2026-09-27).
 
 **Adapters** implement `IOracleAdapter.readMetric(bytes32)`. Three are planned:
 - `SignedFeedAdapter` — 3-of-5 EIP-712 multi-sig for licensed APIs (Spotify, YouTube, X, etc.). **Shipped.**

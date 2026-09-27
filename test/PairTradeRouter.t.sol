@@ -15,7 +15,9 @@ import {PerpEngine} from "../src/core/PerpEngine.sol";
 
 import {SubjectRegistry} from "../src/registry/SubjectRegistry.sol";
 
+import {IMatchedFillRouter} from "../src/routers/IMatchedFillRouter.sol";
 import {IPairTradeRouter} from "../src/routers/IPairTradeRouter.sol";
+import {MatchedFillRouter} from "../src/routers/MatchedFillRouter.sol";
 import {PairTradeRouter} from "../src/routers/PairTradeRouter.sol";
 
 import {MockUSDC} from "./mocks/MockUSDC.sol";
@@ -30,6 +32,7 @@ contract PairTradeRouterTest is Test {
     SubjectRegistry internal registry;
     MockUSDC internal usdc;
     PairTradeRouter internal router;
+    MatchedFillRouter internal matchedRouter;
 
     address internal governance = makeAddr("governance");
     address internal vaultOperator = makeAddr("vaultOperator");
@@ -42,6 +45,14 @@ contract PairTradeRouterTest is Test {
     address internal trader = makeAddr("trader");
     address internal trader2 = makeAddr("trader2");
     address internal stranger = makeAddr("stranger");
+    address internal executor = makeAddr("executor");
+
+    uint256 internal constant MAKER_A_KEY = 0xA11CE;
+    uint256 internal constant MAKER_B_KEY = 0xB0B;
+    uint256 internal constant PAIR_TRADER_KEY = 0xCAFE;
+    address internal makerA;
+    address internal makerB;
+    address internal pairTrader;
 
     bytes32 internal constant SUBJECT_A = keccak256("drake");
     bytes32 internal constant SUBJECT_B = keccak256("taylor");
@@ -60,6 +71,9 @@ contract PairTradeRouterTest is Test {
 
     function setUp() public {
         vm.warp(2_000_000_000);
+        makerA = vm.addr(MAKER_A_KEY);
+        makerB = vm.addr(MAKER_B_KEY);
+        pairTrader = vm.addr(PAIR_TRADER_KEY);
 
         usdc = new MockUSDC();
 
@@ -111,6 +125,14 @@ contract PairTradeRouterTest is Test {
             router = PairTradeRouter(address(new ERC1967Proxy(address(impl), initData)));
         }
 
+        // Signed single- and multi-leg CLOB settlement router.
+        {
+            MatchedFillRouter impl = new MatchedFillRouter();
+            bytes memory initData =
+                abi.encodeCall(MatchedFillRouter.initialize, (governance, address(engine), TIMELOCK_DELAY));
+            matchedRouter = MatchedFillRouter(address(new ERC1967Proxy(address(impl), initData)));
+        }
+
         // 6. Wire LPVault → PerpEngine.
         vm.prank(governance);
         vault.proposeSetPerpEngine(address(engine));
@@ -131,6 +153,9 @@ contract PairTradeRouterTest is Test {
         vm.startPrank(kycWriter);
         registry.setKycTier(trader, 2); // T2 → $250K per-subject, $1M combined
         registry.setKycTier(trader2, 1); // T1 → $50K per-subject, $200K combined
+        registry.setKycTier(makerA, 1);
+        registry.setKycTier(makerB, 1);
+        registry.setKycTier(pairTrader, 1);
         vm.stopPrank();
 
         // 9. MarginEngine caps + delta cap + mark writer.
@@ -142,10 +167,12 @@ contract PairTradeRouterTest is Test {
         engine.proposeAddMarkWriter(markWriter);
         // Register the router on PerpEngine (timelocked).
         engine.proposeAddRouter(address(router));
+        engine.proposeAddRouter(address(matchedRouter));
         vm.stopPrank();
         vm.warp(block.timestamp + TIMELOCK_DELAY);
         engine.activateAddMarkWriter(markWriter);
         engine.activateAddRouter(address(router));
+        engine.activateAddRouter(address(matchedRouter));
 
         // 10. Push initial marks.
         vm.startPrank(markWriter);
@@ -157,11 +184,20 @@ contract PairTradeRouterTest is Test {
         usdc.mint(alice, USDC_10M);
         usdc.mint(trader, USDC_1M);
         usdc.mint(trader2, USDC_1M);
+        usdc.mint(makerA, USDC_1M);
+        usdc.mint(makerB, USDC_1M);
+        usdc.mint(pairTrader, USDC_1M);
         vm.prank(alice);
         usdc.approve(address(vault), type(uint256).max);
         vm.prank(trader);
         usdc.approve(address(vault), type(uint256).max);
         vm.prank(trader2);
+        usdc.approve(address(vault), type(uint256).max);
+        vm.prank(makerA);
+        usdc.approve(address(vault), type(uint256).max);
+        vm.prank(makerB);
+        usdc.approve(address(vault), type(uint256).max);
+        vm.prank(pairTrader);
         usdc.approve(address(vault), type(uint256).max);
 
         // 12. Seed LP and prime cap snapshot.
@@ -201,6 +237,87 @@ contract PairTradeRouterTest is Test {
     {
         vm.prank(trader);
         return router.openPair(p);
+    }
+
+    function _matchedMaker(
+        address maker,
+        bytes32 subjectId,
+        IPerpEngine.Side side,
+        uint256 nonce
+    )
+        internal
+        view
+        returns (IMatchedFillRouter.Order memory order)
+    {
+        order = IMatchedFillRouter.Order({
+            trader: maker,
+            executor: executor,
+            subaccount: bytes32(0),
+            subjectId: subjectId,
+            positionId: bytes32(0),
+            side: side,
+            intent: IMatchedFillRouter.OrderIntent.OPEN,
+            quantity: 100 * ONE_USDC,
+            collateralAmount: 2_000 * ONE_USDC,
+            limitPrice: INITIAL_MARK,
+            maxFee: 10 * ONE_USDC,
+            maxMarkDivergenceBps: 100,
+            nonce: nonce,
+            deadline: uint64(block.timestamp + 1 hours),
+            reduceOnly: false,
+            postOnly: true
+        });
+    }
+
+    function _matchedPairOrder() internal view returns (IMatchedFillRouter.PairOrder memory order) {
+        order = IMatchedFillRouter.PairOrder({
+            trader: pairTrader,
+            executor: executor,
+            subaccount: bytes32(0),
+            legA: IMatchedFillRouter.PairLeg({
+                subjectId: SUBJECT_A,
+                side: IPerpEngine.Side.LONG,
+                quantity: 100 * ONE_USDC,
+                collateralAmount: 2_000 * ONE_USDC,
+                limitPrice: 101 * ONE_18,
+                maxFee: 10 * ONE_USDC,
+                maxMarkDivergenceBps: 100
+            }),
+            legB: IMatchedFillRouter.PairLeg({
+                subjectId: SUBJECT_B,
+                side: IPerpEngine.Side.SHORT,
+                quantity: 100 * ONE_USDC,
+                collateralAmount: 2_000 * ONE_USDC,
+                limitPrice: 99 * ONE_18,
+                maxFee: 10 * ONE_USDC,
+                maxMarkDivergenceBps: 100
+            }),
+            maxNotionalImbalanceBps: 0,
+            nonce: 3,
+            deadline: uint64(block.timestamp + 1 hours),
+            postOnly: false
+        });
+    }
+
+    function _signMatchedOrder(uint256 key, IMatchedFillRouter.Order memory order)
+        internal
+        view
+        returns (bytes memory)
+    {
+        (uint8 v, bytes32 r, bytes32 s) = vm.sign(key, matchedRouter.hashOrder(order));
+        return abi.encodePacked(r, s, v);
+    }
+
+    function _signMatchedPair(
+        uint256 key,
+        IMatchedFillRouter.PairOrder memory order
+    )
+        internal
+        view
+        returns (bytes memory)
+    {
+        (uint8 v, bytes32 r, bytes32 s) = vm.sign(key, matchedRouter.hashPairOrder(order));
+        return abi.encodePacked(r, s, v);
     }
 
     // ------------------------------------------------------------------------------------------
@@ -250,6 +367,57 @@ contract PairTradeRouterTest is Test {
     function test_Initialize_DoubleInitReverts() public {
         vm.expectRevert();
         router.initialize(governance, address(engine), TIMELOCK_DELAY);
+    }
+
+    // ------------------------------------------------------------------------------------------
+    // settlePair — real engine integration
+    // ------------------------------------------------------------------------------------------
+
+    function test_SettlePair_HappyPath_SettlesFourRealPositionsAtomically() public {
+        IMatchedFillRouter.Order memory makerOrderA = _matchedMaker(makerA, SUBJECT_A, IPerpEngine.Side.SHORT, 1);
+        IMatchedFillRouter.Order memory makerOrderB = _matchedMaker(makerB, SUBJECT_B, IPerpEngine.Side.LONG, 2);
+        IMatchedFillRouter.PairOrder memory pairOrder = _matchedPairOrder();
+        bytes memory makerSignatureA = _signMatchedOrder(MAKER_A_KEY, makerOrderA);
+        bytes memory makerSignatureB = _signMatchedOrder(MAKER_B_KEY, makerOrderB);
+        bytes memory pairSignature = _signMatchedPair(PAIR_TRADER_KEY, pairOrder);
+        bytes32 fillId = keccak256("matched-pair-real-engine");
+
+        vm.prank(executor);
+        IMatchedFillRouter.PairMatchResult memory result = matchedRouter.settlePair(
+            fillId, makerOrderA, makerSignatureA, makerOrderB, makerSignatureB, pairOrder, pairSignature
+        );
+
+        IPerpEngine.Position memory makerPositionA = engine.positionOf(result.makerPositionA);
+        IPerpEngine.Position memory traderPositionA = engine.positionOf(result.traderPositionA);
+        IPerpEngine.Position memory makerPositionB = engine.positionOf(result.makerPositionB);
+        IPerpEngine.Position memory traderPositionB = engine.positionOf(result.traderPositionB);
+
+        assertEq(makerPositionA.owner, makerA);
+        assertEq(makerPositionA.subjectId, SUBJECT_A);
+        assertEq(makerPositionA.size, -int256(100 * ONE_USDC));
+        assertEq(makerPositionA.entryPrice, INITIAL_MARK);
+        assertEq(traderPositionA.owner, pairTrader);
+        assertEq(traderPositionA.subjectId, SUBJECT_A);
+        assertEq(traderPositionA.size, int256(100 * ONE_USDC));
+        assertEq(traderPositionA.entryPrice, INITIAL_MARK);
+
+        assertEq(makerPositionB.owner, makerB);
+        assertEq(makerPositionB.subjectId, SUBJECT_B);
+        assertEq(makerPositionB.size, int256(100 * ONE_USDC));
+        assertEq(makerPositionB.entryPrice, INITIAL_MARK);
+        assertEq(traderPositionB.owner, pairTrader);
+        assertEq(traderPositionB.subjectId, SUBJECT_B);
+        assertEq(traderPositionB.size, -int256(100 * ONE_USDC));
+        assertEq(traderPositionB.entryPrice, INITIAL_MARK);
+
+        assertEq(engine.positionIdOf(makerA, SUBJECT_A), result.makerPositionA);
+        assertEq(engine.positionIdOf(pairTrader, SUBJECT_A), result.traderPositionA);
+        assertEq(engine.positionIdOf(makerB, SUBJECT_B), result.makerPositionB);
+        assertEq(engine.positionIdOf(pairTrader, SUBJECT_B), result.traderPositionB);
+        assertTrue(matchedRouter.isFillUsed(fillId));
+        assertEq(matchedRouter.filledQuantity(matchedRouter.hashOrder(makerOrderA)), makerOrderA.quantity);
+        assertEq(matchedRouter.filledQuantity(matchedRouter.hashOrder(makerOrderB)), makerOrderB.quantity);
+        assertTrue(matchedRouter.isPairOrderFilled(matchedRouter.hashPairOrder(pairOrder)));
     }
 
     // ------------------------------------------------------------------------------------------

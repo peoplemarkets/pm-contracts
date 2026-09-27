@@ -626,7 +626,8 @@ contract MarginEngine is Initializable, UUPSUpgradeable, IMarginEngine {
         if (markNow == 0) return false;
         uint256 notional_ = PositionMath.notional(pos.size, markNow);
         int256 uPnl = PositionMath.unrealizedPnl(pos.size, pos.entryPrice, markNow);
-        int256 eq = PositionMath.equity(pos.collateral, uPnl);
+        int256 fundingDebt6 = IPerpEngine(pe).fundingDebtOf(positionId);
+        int256 eq = PositionMath.equity(pos.collateral, uPnl - fundingDebt6);
         uint256 ratio = PositionMath.marginRatioBps(eq, notional_);
         return ratio >= MarginStorage.load().maintenanceMarginBps;
     }

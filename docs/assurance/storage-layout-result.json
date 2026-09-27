@@ -1,0 +1,9 @@
+{
+  "base": "dc1d7c2dc16b08dae4012b4885030c24effc5d89",
+  "compiler": "0.8.24",
+  "memberChecks": 340,
+  "allowedTrailingArrayExpansions": [
+    "PauseGuardianStorageHarness.state.rings.value.entries"
+  ],
+  "status": "PASS"
+}

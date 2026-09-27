@@ -2,6 +2,7 @@
 out/
 cache/
 broadcast/
+deployments/local/
 
 # Coverage
 lcov.info
@@ -30,3 +31,6 @@ typechain-types/
 # private key. Ignore the pattern, not just the one file.
 .env.bak*
 .env.*.bak
+
+# Python
+__pycache__/

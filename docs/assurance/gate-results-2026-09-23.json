@@ -1,0 +1,239 @@
+{
+  "runtimeSourceCommit": "d930bf870a63d678fd97b3a9a91b898f3026335e",
+  "vectorCommit": "02f7b472a0b691ae054bd6540c5e6c0b7a2c8f88",
+  "foundry": "1.8.1",
+  "solc": "0.8.24",
+  "evm": "cancun",
+  "optimizerRuns": 200,
+  "viaIR": true,
+  "fuzzRuns": 10000,
+  "fuzzTests": 13,
+  "invariantRuns": 1000,
+  "invariantDepth": 100,
+  "invariantProperties": 15,
+  "invariantSuites": 3,
+  "invariantCalls": 300000,
+  "processAddressSpaceLimitBytes": 3221225472,
+  "compilerWorkers": 1,
+  "filesExecuted": 36,
+  "aggregate": {
+    "passed": 1567,
+    "failed": 0,
+    "skipped": 1
+  },
+  "partitionSeconds": 2263.33,
+  "allAtOnceCompile": {
+    "status": "resource-failed",
+    "seconds": 586.87,
+    "error": "std::bad_alloc",
+    "testsExecuted": 0
+  },
+  "infraWrapper": {
+    "status": "not-run",
+    "assignedFiles": 33,
+    "actualFiles": 36,
+    "unassignedFiles": [
+      "test/CanonicalVectors.t.sol",
+      "test/MatchedFillRouter.t.sol",
+      "test/events/EventMarketRouterUpgrade.t.sol"
+    ]
+  },
+  "partitions": [
+    {
+      "selected": [
+        "test/BatchRouter.t.sol",
+        "test/CanonicalVectors.t.sol",
+        "test/ChainlinkAdapter.t.sol"
+      ],
+      "exit": 0,
+      "seconds": 142.6,
+      "counts": [
+        96,
+        0,
+        0
+      ]
+    },
+    {
+      "selected": [
+        "test/FeedbackController.t.sol",
+        "test/FundingEngine.t.sol",
+        "test/FundingMath.t.sol"
+      ],
+      "exit": 0,
+      "seconds": 182.21,
+      "counts": [
+        228,
+        0,
+        0
+      ]
+    },
+    {
+      "selected": [
+        "test/InsuranceFund.t.sol",
+        "test/LPVault.t.sol",
+        "test/LiquidationADL.t.sol"
+      ],
+      "exit": 0,
+      "seconds": 222.98,
+      "counts": [
+        175,
+        0,
+        0
+      ]
+    },
+    {
+      "selected": [
+        "test/LiquidationEngine.t.sol",
+        "test/LiquidationMath.t.sol",
+        "test/MarginEngine.t.sol"
+      ],
+      "exit": 0,
+      "seconds": 197.17,
+      "counts": [
+        221,
+        0,
+        0
+      ]
+    },
+    {
+      "selected": [
+        "test/MatchedFillRouter.t.sol",
+        "test/OracleRouter.t.sol",
+        "test/PairTradeRouter.t.sol"
+      ],
+      "exit": 0,
+      "seconds": 154.02,
+      "counts": [
+        143,
+        0,
+        0
+      ]
+    },
+    {
+      "selected": [
+        "test/PauseGuardian.t.sol",
+        "test/PerpEngine.t.sol",
+        "test/PerpEngineFunding.t.sol"
+      ],
+      "exit": 0,
+      "seconds": 421.04,
+      "counts": [
+        324,
+        0,
+        0
+      ]
+    },
+    {
+      "selected": [
+        "test/PositionMath.t.sol",
+        "test/SignedFeedAdapter.t.sol",
+        "test/SubjectRegistry.t.sol"
+      ],
+      "exit": 0,
+      "seconds": 100.9,
+      "counts": [
+        184,
+        0,
+        0
+      ]
+    },
+    {
+      "selected": [
+        "test/UMAAdapter.t.sol",
+        "test/events/DeployBaseMainnetEventsScript.t.sol",
+        "test/events/EventFactorySetMarketImpl.t.sol"
+      ],
+      "exit": 0,
+      "seconds": 0.6,
+      "counts": [
+        86,
+        0,
+        0
+      ]
+    },
+    {
+      "selected": [
+        "test/events/EventMarket.t.sol",
+        "test/events/EventMarketObjective.t.sol",
+        "test/events/EventMarketRouterUpgrade.t.sol"
+      ],
+      "exit": 0,
+      "seconds": 0.71,
+      "counts": [
+        82,
+        0,
+        0
+      ]
+    },
+    {
+      "selected": [
+        "test/events/EventNavArb.t.sol",
+        "test/events/EventNavVesting.t.sol",
+        "test/events/ScriptRunbookSims.t.sol"
+      ],
+      "exit": 0,
+      "seconds": 35.78,
+      "counts": [
+        17,
+        0,
+        0
+      ]
+    },
+    {
+      "selected": [
+        "test/integration/EventDispatchE2E.t.sol",
+        "test/integration/PerpVaultE2E.t.sol",
+        "test/integration/UpgradeCeremonyFork.t.sol"
+      ],
+      "exit": 0,
+      "seconds": 143.46,
+      "counts": [
+        8,
+        0,
+        1
+      ]
+    },
+    {
+      "selected": [
+        "test/invariant/EventNavInvariants.t.sol",
+        "test/invariant/EventNavVestingInvariants.t.sol",
+        "test/invariant/PerpVaultInvariants.t.sol"
+      ],
+      "exit": 0,
+      "seconds": 661.86,
+      "counts": [
+        3,
+        0,
+        0
+      ]
+    }
+  ],
+  "build": {
+    "status": "pass",
+    "compilerSeconds": 328.33,
+    "runtimeBytes": {
+      "PerpEngine": 24300,
+      "LPVault": 22825,
+      "MatchedFillRouter": 16983,
+      "EventMarket": 13540,
+      "EventMarketRouter": 8122,
+      "PauseGuardian": 8823,
+      "UMAAdapter": 9209
+    },
+    "PerpEngineRuntimeHeadroomBytes": 276
+  },
+  "targetedGas": {
+    "passed": 2,
+    "failed": 0,
+    "skipped": 0,
+    "seconds": 7.49,
+    "migrationObserveGas": 983222,
+    "legacyHarnessObserve": {
+      "calls": 721,
+      "min": 69513,
+      "average": 1163663,
+      "median": 1166805,
+      "max": 2264743
+    }
+  }
+}

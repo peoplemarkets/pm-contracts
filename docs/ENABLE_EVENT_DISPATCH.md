@@ -1,30 +1,31 @@
-# Enable Event Dispatch (Custodial Event-Market Path) — Base Sepolia
+# Enable Wallet-Signed Event Dispatch — Base Sepolia
 
-> Contracts side of pm-engine issue #10. This turns on the **engine-relayed / custodial**
-> event-market execution path on Base Sepolia for the play-money dogfood: an approving trader's
-> USDC is moved into LMSR event markets by a single engine operator key, with shares credited to
-> the trader.
+> Contracts side of the event-dispatch path. The engine relays an exact EIP-712 order authorized by
+> the wallet that owns the USDC or outcome shares. The operator key cannot choose the trader,
+> market, outcome, intent, quantity, slippage, nonce, deadline, or executor after signing.
 >
-> **This is testnet play-money.** A single operator key is fine — **no KMS / audit / multisig is
-> required for the dogfood** (mainnet would want KMS custody + a governance multisig; see the trust
-> model in `src/events/EventMarketRouter.sol`). Say so to whoever provisions the key.
+> **This runbook is testnet-only.** Isolate and fund the relayer key only for this environment.
+> Production requires managed signer custody, governance review, monitoring, and security approval.
 
 ---
 
 ## 1. What the path is
 
-Two trust layers (both governance-timelocked to add, immediate to remove):
+Three independent authorization layers:
 
 - **Layer (i): the market trusts the router.** `EventMarketRouter` is allowlisted as an operator on
   `EventMarketFactory` (`factory.isOperator(router) == true`). Every market's `*For` entrypoints
   then accept the router as caller.
 - **Layer (ii): the router trusts the engine operator key.** The engine's operator **signer**
   address (`EVENT_OPERATOR`) is allowlisted on the router (`router.isOperator(EVENT_OPERATOR) ==
-  true`). Only that key can call `buyOutcomeFor` / `sellOutcomeFor`.
+  true`). Only that key can relay, and the signed `executor` must equal it.
+- **Layer (iii): the wallet authorizes the order.** `executeOrder` validates an EIP-712 EOA or
+  ERC-1271 signature over every execution-sensitive field and consumes a one-use trader nonce.
 
-Net authority: the engine operator key can spend the USDC a user has approved **to the router**, on
-that user's behalf, into genuine factory markets. Kill switch: `removeOperator` on either the router
-(cut the key) or the factory (cut the whole router) — both immediate.
+Net authority: the engine key can relay only a still-valid order that the wallet signed for that
+exact key. An allowance by itself is not authorization. The legacy router `buyOutcomeFor` and
+`sellOutcomeFor` selectors always revert `SignedOrderRequired`. Kill switch: `removeOperator` on
+either the router (cut the key) or factory (cut the whole router) — both immediate.
 
 ---
 
@@ -40,7 +41,8 @@ address allowlisted on the router as `EVENT_OPERATOR`.
 | `chain.event_operator` (signer) | the `EVENT_OPERATOR` address (must match the key allowlisted on the router) |
 
 Users perform a **single USDC approval to the router** (`chain.event_market_router`), not to each
-market.
+market, and then sign each order. The same operator address must be exposed to clients as the
+EIP-712 `executor`.
 
 ---
 
@@ -48,7 +50,7 @@ market.
 
 The task brief mentions a "~225s" timelock. **The router hard-floors `timelockDelay` at
 `MIN_TIMELOCK_DELAY = 1 hour`** in `initialize()` (`src/events/EventMarketRouter.sol`), so the
-shortest achievable delay for the *custodial* enable is **1 hour**. The factory alone would allow a
+shortest achievable delay for the signed relay is **1 hour**. The factory alone would allow a
 shorter (even zero) delay, but the router path gates the floor, so plan for a **1-hour wait** between
 propose and activate. (The fully-isolated `DeployWorldCupTest` stack sidesteps this by using a
 factory-timelock of 0 and a direct-resolve market impl — but it does **not** use the router.)
@@ -85,7 +87,7 @@ Record the printed **`EventMarketFactory Proxy`** and **`EventMarketRouter Proxy
 Also complete the LPVault wiring the deploy script prints (upgrade LPVault to the new impl and grant
 `EVENT_MARKET_ROLE` to the factory) so the factory can seed markets.
 
-### 4.2 Allowlist the operator (custodial enable) — two steps
+### 4.2 Allowlist the signed-order relayer — two steps
 
 `script/EnableEventOperator.s.sol` performs both allowlist layers. It is idempotent (safe to re-run).
 
@@ -114,6 +116,13 @@ factory.isOperator(router)  : true
 router.isOperator(operator) : true
 ```
 
+Also confirm that the proxy exposes the signed-order implementation:
+
+```bash
+cast call $EVENT_MARKET_ROUTER "EVENT_ORDER_TYPEHASH()(bytes32)" --rpc-url "$BASE_SEPOLIA_RPC_URL"
+cast call $EVENT_MARKET_ROUTER "domainSeparator()(bytes32)" --rpc-url "$BASE_SEPOLIA_RPC_URL"
+```
+
 > The default entrypoint `run()` == `propose()` (STEP 1) if you omit `--sig`.
 
 ### 4.3 Create markets
@@ -123,23 +132,52 @@ stack (note: that stack is router-less; it is a separate dogfood path).
 
 ---
 
-## 5. Verification
+## 5. Wallet authorization contract
 
-Local proof that the enable sequence yields a working custodial path:
+The EIP-712 domain is:
+
+- name: `PeopleMarketsEventOrders`
+- version: `1`
+- chain id: the execution chain
+- verifying contract: the `EventMarketRouter` proxy
+
+The signed `EventOrder` fields, in order, are `trader`, `executor`, `market`, `isYes`, `intent`,
+`amountIn`, `minAmountOut`, `nonce`, and `deadline`. `intent` is `BUY = 1` or `SELL = 2`;
+`amountIn` is USDC for a buy and outcome shares for a sell. The deadline is valid through the exact
+timestamp and invalid afterward. A `(trader, nonce)` can execute once. Wallets may call
+`cancelOrder` for one nonce or `invalidateNoncesBelow` to invalidate a range.
+
+```text
+EventOrder(address trader,address executor,address market,bool isYes,uint8 intent,uint256 amountIn,uint256 minAmountOut,uint256 nonce,uint64 deadline)
+```
+
+The engine submits only `executeOrder(order, signature)`. It must not call or expose the deprecated
+unsigned router selectors.
+
+---
+
+## 6. Verification
+
+Local proof that the enable sequence yields a working signed path:
 `test/integration/EventDispatchE2E.t.sol` stands up the real factory + router behind proxies, runs
-the exact propose → wait(1h) → activate flow, then asserts operator buy/sell credit + charge the
-trader, and that non-operators / removed operators / a router removed from the factory all revert.
+the exact propose → wait(1h) → activate flow, then executes wallet-signed buys and sells. The unit
+suite also covers EOA/ERC-1271 signatures, tampering, replay, cancellation, nonce floors, deadlines,
+slippage rollback, factory validation, deprecated-selector failure, and proxy storage compatibility.
 
 ```bash
-forge test --match-contract EventDispatchE2E -vv
+forge test --match-path test/events/EventMarket.t.sol --threads 1
+forge test --match-path test/events/EventMarketRouterUpgrade.t.sol --threads 1
+forge test --match-path test/integration/EventDispatchE2E.t.sol --threads 1
 ```
 
 ---
 
-## 6. Needs a human
+## 7. Needs a human
 
-- **Provision the `EVENT_OPERATOR` key** and hand its address to both the engine (as the operator
-  signer) and this enable script. Testnet play-money: a single hot key is acceptable; no KMS.
+- **Provision the `EVENT_OPERATOR` key** and hand its address to the engine, client signing-domain
+  response, and this enable script. Keep the testnet key isolated and monitored.
+- **Client + API integration** must build the canonical payload, bind the authenticated wallet and
+  configured executor server-side, and carry the signature unchanged to the engine.
 - **Governance key** (`DEPLOYER_PK` / `GOVERNANCE`) must own both the factory and the router.
 - Fund the operator key with Base Sepolia ETH for gas (it submits every relayed trade).
 - On-chain broadcast is intentionally **not** performed here (no keys committed); the scripts

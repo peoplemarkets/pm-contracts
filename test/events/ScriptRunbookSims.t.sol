@@ -51,6 +51,7 @@ contract ScriptRunbookSimsTest is Test {
     // Distinct metrics/events per script so a stale env read cannot cross-contaminate on-chain state.
     bytes32 internal constant REGISTER_EVENT_ID = keccak256("uma.metric.election.2028");
     bytes32 internal constant ASSERT_EVENT_ID = keccak256("uma.event.election.win");
+    bytes32 internal constant RECOVERY_EVENT_ID = keccak256("uma.event.rejected.recovery");
     bytes32 internal constant SUBJECT_ID = keccak256("subject.candidate");
 
     function setUp() public {
@@ -122,6 +123,7 @@ contract ScriptRunbookSimsTest is Test {
         _run_register();
         _run_registerProposeIdempotent();
         _run_assert();
+        _run_rejectedResolutionRecovery();
     }
 
     function _run_register() internal {
@@ -208,5 +210,69 @@ contract ScriptRunbookSimsTest is Test {
 
         assertEq(uint256(market.outcome()), uint256(IEventMarket.Outcome.YES), "market settled YES");
         assertEq(uint256(market.status()), uint256(IEventMarket.Status.RESOLVED), "resolved");
+    }
+
+    function _run_rejectedResolutionRecovery() internal {
+        address replacementAsserter = makeAddr("replacementAsserter");
+        usdc.mint(replacementAsserter, BOND);
+
+        vm.startPrank(governance);
+        adapter.proposeRegisterMetric(RECOVERY_EVENT_ID, BOND, LIVENESS, IDENTIFIER, address(usdc));
+        vm.warp(block.timestamp + TIMELOCK_DELAY + 1);
+        adapter.activateRegisterMetric(RECOVERY_EVENT_ID);
+        EventMarket market = EventMarket(
+            factory.createMarket(
+                SUBJECT_ID, RECOVERY_EVENT_ID, uint8(1), "Recover after rejected assertion?", DEADLINE, 0, LMSR_B
+            )
+        );
+        vm.stopPrank();
+
+        uint256 originalAsserterBalance = usdc.balanceOf(asserter);
+        vm.startPrank(asserter);
+        usdc.approve(address(market), BOND);
+        market.proposeResolution(IEventMarket.Outcome.YES);
+        vm.stopPrank();
+
+        bytes32 rejectedAssertionId = market.resolutionAssertionId();
+        assertEq(adapter.assertionBondPayerOf(rejectedAssertionId), address(market), "market forwarded first bond");
+        assertEq(adapter.assertionOf(rejectedAssertionId).asserter, asserter, "first proposer is economic asserter");
+        assertEq(usdc.balanceOf(asserter), originalAsserterBalance - BOND, "first proposal bond posted");
+
+        oo.disputeAssertion(rejectedAssertionId);
+        oo.resolveDispute(rejectedAssertionId, false);
+        adapter.settleAssertion(rejectedAssertionId);
+
+        (bool rejectedSettled, bool rejectedTruthful) = adapter.assertionResult(rejectedAssertionId);
+        assertTrue(rejectedSettled, "rejected assertion reached terminal state");
+        assertFalse(rejectedTruthful, "rejected verdict retained");
+        vm.expectRevert(abi.encodeWithSelector(IEventMarket.ResolutionAssertionRejected.selector, rejectedAssertionId));
+        market.settleResolution();
+
+        vm.warp(uint256(DEADLINE) + 1);
+        uint256 replacementAsserterBalance = usdc.balanceOf(replacementAsserter);
+        vm.startPrank(replacementAsserter);
+        usdc.approve(address(market), BOND);
+        market.proposeResolution(IEventMarket.Outcome.NO);
+        vm.stopPrank();
+
+        bytes32 replacementAssertionId = market.resolutionAssertionId();
+        assertTrue(replacementAssertionId != rejectedAssertionId, "replacement assertion id recorded");
+        assertEq(
+            adapter.assertionOf(replacementAssertionId).claimedValue,
+            uint256(IEventMarket.Outcome.NO),
+            "replacement outcome bound to assertion"
+        );
+        assertEq(
+            adapter.assertionBondPayerOf(replacementAssertionId), address(market), "market forwarded replacement bond"
+        );
+
+        vm.warp(block.timestamp + LIVENESS + 1);
+        adapter.settleAssertion(replacementAssertionId);
+        market.settleResolution();
+
+        assertEq(uint256(market.outcome()), uint256(IEventMarket.Outcome.NO), "replacement assertion settles market");
+        assertEq(uint256(market.status()), uint256(IEventMarket.Status.RESOLVED), "recovered market resolved");
+        assertEq(usdc.balanceOf(replacementAsserter), replacementAsserterBalance, "truthful replacement bond refunded");
+        assertEq(usdc.balanceOf(address(oo)), BOND, "only rejected bond remains slashed");
     }
 }

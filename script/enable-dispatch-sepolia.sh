@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Enable the custodial event-dispatch path on Base Sepolia (pm-engine #10, ops leg).
+# Enable the wallet-signed event-dispatch relayer on Base Sepolia (pm-engine #10, ops leg).
 #
 # On-chain state this assumes (verified 2026-07-03):
 #   - LPVault proxy 0x6347… already upgraded to the event-markets impl

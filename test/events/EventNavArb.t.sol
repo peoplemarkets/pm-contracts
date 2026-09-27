@@ -71,6 +71,7 @@ contract EventNavArbTest is Test {
         // ---- Event stack: mock feedback + UMA, real market impl + factory ----
         feedback = new MockFeedbackController();
         uma = new MockUMAAdapter();
+        uma.setBondConfig(address(usdc), ONE_USDC);
         marketImpl = new EventMarket();
 
         EventMarketFactory factoryImpl = new EventMarketFactory();
@@ -269,8 +270,10 @@ contract EventNavArbTest is Test {
         // Propose + finalize the MINORITY outcome. NAV must NOT move across this whole window: the
         // mark ignores UMA (no floor→exact snap), and the settle Δ is 0 to the wei.
         uint256 navBeforePropose = vault.totalAssets();
-        vm.prank(trader);
+        vm.startPrank(trader);
+        usdc.approve(address(m), ONE_USDC);
         m.proposeResolution(minority);
+        vm.stopPrank();
         m.settleResolution();
         uint256 navAfterFinalize = vault.totalAssets();
         assertEq(navBeforePropose, navAfterFinalize, "NAV identical across UMA propose->finalize (no snap)");

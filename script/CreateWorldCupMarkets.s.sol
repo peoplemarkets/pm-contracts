@@ -16,11 +16,10 @@ import {LMSRMath} from "../src/events/LMSRMath.sol";
 ///         Base Sepolia vault currently holds ~9.65 USDC, so the default lmsrB = 2e6 (~1.386 USDC
 ///         seed/market) fits several markets. Raise lmsrB only after depositing more USDC to the vault.
 ///
-/// @dev    Resolution: the deployed EventMarket resolves via UMA only (no operator override) and the
-///         #17 readiness gate is not yet on-chain, so these markets CREATE + TRADE without a
-///         pre-registered metric — but to SETTLE one you must register its eventId as a UMA metric
-///         (script/RegisterEventMetric.s.sol) and post an assertion. This script is for the custodial
-///         TRADE demo; resolution is a separate, optional step.
+/// @dev    Resolution: the EventMarket resolves via UMA only (no operator override). Every eventId
+///         must be registered as a UMA metric before this script calls `createMarket`; otherwise the
+///         factory reverts `MetricNotReady(eventId)`. Trade execution is wallet-signed; resolution
+///         still requires a valid proposal and the configured UMA lifecycle.
 ///
 /// @dev    eventClass is set to UNSET(0): the deployed FeedbackController has no sports class (that is
 ///         the #17 addition), and these markets are for trading, not the feedback demo. Inert here.
@@ -87,7 +86,7 @@ contract CreateWorldCupMarkets is Script {
         vm.stopBroadcast();
 
         console2.log("--------------------------------------");
-        console2.log("Done. Testers: get Circle testnet USDC (faucet.circle.com), approve the");
-        console2.log("EventMarketRouter once, then POST /api/v1/event-markets/<market>/orders.");
+        console2.log("Done. Testers: approve EventMarketRouter once, then sign an exact event order");
+        console2.log("for this chain/router and submit it through the event-order API.");
     }
 }

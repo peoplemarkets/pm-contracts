@@ -64,11 +64,13 @@ library LiquidationMath {
     /// @param  bountyToLiquidator    6-decimal USDC paid to the liquidator. Capped by what the
     ///                               slice's collateral + PnL can actually fund.
     /// @param  markPrice             Echoed input — convenient for callers and event-emission.
+    /// @param  signedPnl             Slice price PnL minus its exact quote-funding debt.
     struct PartialResult {
         int256 reducedSize;
         uint256 collateralFreed;
         uint256 bountyToLiquidator;
         uint256 markPrice;
+        int256 signedPnl;
     }
 
     /// @notice Output of `computeFullLiquidation`.
@@ -122,12 +124,13 @@ library LiquidationMath {
     ///           4. `bountyToLiquidator = reducedNotional6 × liquidatorBountyBps / 10_000`.
     ///           5. `pnlOnSlice6 = reducedSize × (mark − entry) / 1e18` (signed; long+mark>entry
     ///              → profit; short+mark>entry → loss).
-    ///           6. `slice's collateral share = currentCollateral × partialIncrementBps / 10_000`.
-    ///           7. `freedPool = sliceCollateral + pnlOnSlice − bounty` (signed).
-    ///           8. If `freedPool <= 0`: trader gets 0; bounty is capped at
+    ///           6. `sliceCollateral = currentCollateral × |reducedSize| / |currentSize|`.
+    ///           7. Subtract the exact reduced-size funding debt from slice PnL.
+    ///           8. `freedPool = sliceCollateral + signedPnl − bounty` (signed).
+    ///           9. If `freedPool <= 0`: trader gets 0; bounty is capped at
     ///              `max(sliceCollateral + pnl, 0)`. Caller's responsibility to handle any
     ///              implicit shortfall (the prior agent's design assumes Tier-3 absorbs it).
-    ///           9. Else: `collateralFreed = freedPool`.
+    ///          10. Else: `collateralFreed = freedPool`.
     ///
     ///         If `partialIncrementBps == 10_000` this collapses to a "full close via the partial
     ///         path" — `remainingSizeAbs = 0`, no MM-restore step.
@@ -160,6 +163,39 @@ library LiquidationMath {
         pure
         returns (PartialResult memory result)
     {
+        return computePartialIncrement(
+            currentSize,
+            currentCollateral,
+            markPrice,
+            entryPrice,
+            partialIncrementBps,
+            liquidatorBountyBps,
+            maintenanceMarginBps,
+            mmRestoreBufferBps,
+            0,
+            0
+        );
+    }
+
+    /// @notice Funding-aware Tier-1 partial liquidation.
+    /// @param fundingDebt6 Signed funding debt for the full position; positive means the trader owes.
+    /// @param fundingDebtOnSlice6 Exact signed funding debt for `reducedSize`; positive means the trader owes.
+    function computePartialIncrement(
+        int256 currentSize,
+        uint256 currentCollateral,
+        uint256 markPrice,
+        uint256 entryPrice,
+        uint16 partialIncrementBps,
+        uint16 liquidatorBountyBps,
+        uint16 maintenanceMarginBps,
+        uint16 mmRestoreBufferBps,
+        int256 fundingDebt6,
+        int256 fundingDebtOnSlice6
+    )
+        internal
+        pure
+        returns (PartialResult memory result)
+    {
         if (markPrice == 0) revert MarkNotPositive();
         if (entryPrice == 0) revert EntryPriceNotPositive();
         if (currentSize == 0) revert ZeroSize();
@@ -172,12 +208,10 @@ library LiquidationMath {
 
         result.markPrice = markPrice;
 
-        // Step 1 — reducedSizeAbs (uint256, in contract units × 1e6).
+        // Steps 1-2 — compute the exact rounded slice and preserve the position's sign.
         uint256 absSize = currentSize > 0 ? uint256(currentSize) : uint256(-currentSize);
-        uint256 reducedSizeAbs = (absSize * uint256(partialIncrementBps)) / BPS_DENOMINATOR;
-
-        // Step 2 — signed reducedSize, sign-matched to currentSize.
-        result.reducedSize = currentSize > 0 ? int256(reducedSizeAbs) : -int256(reducedSizeAbs);
+        result.reducedSize = partialSize(currentSize, partialIncrementBps);
+        uint256 reducedSizeAbs = result.reducedSize > 0 ? uint256(result.reducedSize) : uint256(-result.reducedSize);
 
         // Step 3 — slice notional in 6-decimal USDC. Use mulDiv against the 1e18 mark scaling.
         uint256 reducedNotional6 = Math.mulDiv(reducedSizeAbs, markPrice, ONE_E18);
@@ -189,16 +223,18 @@ library LiquidationMath {
         // size × (mark − entry) / 1e18; the sign falls out of the signed size automatically.
         int256 priceDelta = int256(markPrice) - int256(entryPrice);
         int256 pnlOnSlice6 = (result.reducedSize * priceDelta) / int256(ONE_E18);
+        result.signedPnl = pnlOnSlice6 - fundingDebtOnSlice6;
 
-        // Step 6 — slice's share of posted collateral. Bps-proportional, same denominator as size.
-        uint256 collateralAllocatedToSlice = (currentCollateral * uint256(partialIncrementBps)) / BPS_DENOMINATOR;
+        // Step 6 — collateral follows the exact rounded size slice. Reapplying bps here can differ
+        // by one or more micro-units and break payout conservation in PerpEngine.
+        uint256 collateralAllocatedToSlice = Math.mulDiv(currentCollateral, reducedSizeAbs, absSize);
 
         // Step 7 — what's left after paying PnL and bounty out of the slice.
-        int256 freedPoolInt = int256(collateralAllocatedToSlice) + pnlOnSlice6 - int256(bountyTarget);
+        int256 freedPoolInt = int256(collateralAllocatedToSlice) + result.signedPnl - int256(bountyTarget);
 
         if (freedPoolInt <= 0) {
             // Step 8 — bounty capped at sliceCollateral + pnl (≥0). Caller eats any remaining gap.
-            int256 fundable = int256(collateralAllocatedToSlice) + pnlOnSlice6;
+            int256 fundable = int256(collateralAllocatedToSlice) + result.signedPnl;
             result.bountyToLiquidator = fundable > 0 ? uint256(fundable) : 0;
             result.collateralFreed = 0;
         } else {
@@ -214,9 +250,13 @@ library LiquidationMath {
             uint256 totalReqBps = uint256(maintenanceMarginBps) + uint256(mmRestoreBufferBps);
             uint256 remainingRequired6 = (remainingNotional6 * totalReqBps) / BPS_DENOMINATOR;
             uint256 remainingAvailable6 = currentCollateral - collateralAllocatedToSlice;
+            int256 fullPnl6 = (currentSize * priceDelta) / int256(ONE_E18);
+            int256 remainingPnl6 = fullPnl6 - pnlOnSlice6;
+            int256 remainingFundingDebt6 = fundingDebt6 - fundingDebtOnSlice6;
+            int256 remainingEquity6 = int256(remainingAvailable6) + remainingPnl6 - remainingFundingDebt6;
 
-            if (remainingAvailable6 < remainingRequired6) {
-                uint256 topUp = remainingRequired6 - remainingAvailable6;
+            if (remainingEquity6 < int256(remainingRequired6)) {
+                uint256 topUp = uint256(int256(remainingRequired6) - remainingEquity6);
                 if (result.collateralFreed >= topUp) {
                     result.collateralFreed -= topUp;
                 } else {
@@ -230,6 +270,15 @@ library LiquidationMath {
         }
     }
 
+    /// @notice Exact signed size closed by one configured partial-liquidation increment.
+    function partialSize(int256 currentSize, uint16 partialIncrementBps) internal pure returns (int256 reducedSize) {
+        if (currentSize == 0) revert ZeroSize();
+        if (partialIncrementBps == 0 || partialIncrementBps > BPS_DENOMINATOR) revert BpsOutOfRange();
+        uint256 absSize = currentSize > 0 ? uint256(currentSize) : uint256(-currentSize);
+        uint256 reducedSizeAbs = (absSize * uint256(partialIncrementBps)) / BPS_DENOMINATOR;
+        reducedSize = currentSize > 0 ? int256(reducedSizeAbs) : -int256(reducedSizeAbs);
+    }
+
     // ------------------------------------------------------------------------------------------
     // Full liquidation
     // ------------------------------------------------------------------------------------------
@@ -240,7 +289,7 @@ library LiquidationMath {
     ///           1. `notional6 = |currentSize| × markPrice / 1e18`.
     ///           2. `pnl6 = currentSize × (mark − entry) / 1e18` (signed).
     ///           3. `bountyTarget = notional6 × fullLiquidationBountyBps / 10_000`.
-    ///           4. `equity6 = collateral + pnl6` (signed).
+    ///           4. `equity6 = collateral + pnl6 − fundingDebt6` (signed).
     ///           5. Branch:
     ///                A. `equity > bountyTarget`        → solvent: bounty = target, return rest.
     ///                B. `0 < equity ≤ bountyTarget`    → bounty = equity, trader = 0,
@@ -262,6 +311,24 @@ library LiquidationMath {
         pure
         returns (FullResult memory result)
     {
+        return
+            computeFullLiquidation(currentSize, currentCollateral, markPrice, entryPrice, fullLiquidationBountyBps, 0);
+    }
+
+    /// @notice Funding-aware Tier-2 full liquidation.
+    /// @param fundingDebt6 Signed funding debt for the position; positive reduces trader equity.
+    function computeFullLiquidation(
+        int256 currentSize,
+        uint256 currentCollateral,
+        uint256 markPrice,
+        uint256 entryPrice,
+        uint16 fullLiquidationBountyBps,
+        int256 fundingDebt6
+    )
+        internal
+        pure
+        returns (FullResult memory result)
+    {
         if (markPrice == 0) revert MarkNotPositive();
         if (entryPrice == 0) revert EntryPriceNotPositive();
         if (currentSize == 0) revert ZeroSize();
@@ -277,7 +344,7 @@ library LiquidationMath {
         int256 pnl6 = (currentSize * priceDelta) / int256(ONE_E18);
 
         uint256 bountyTarget = (notional6 * uint256(fullLiquidationBountyBps)) / BPS_DENOMINATOR;
-        int256 equity6Int = int256(currentCollateral) + pnl6;
+        int256 equity6Int = int256(currentCollateral) + pnl6 - fundingDebt6;
 
         if (equity6Int > int256(bountyTarget)) {
             // Case A — fully solvent.
@@ -347,7 +414,7 @@ library LiquidationMath {
     ///
     /// @dev    Solve `collateral + size × (P_b − entry) / 1e18 = 0` for `P_b`:
     ///
-    ///             P_b = entry − collateral × 1e18 / size            (size signed)
+    ///             P_b = entry − (collateral − fundingDebt) × 1e18 / size
     ///
     ///         For a LONG (`size > 0`) this lands BELOW entry; for a SHORT (`size < 0`) ABOVE entry.
     ///         This is the price the spec (§3 line 153) closes ADL'd counterparties at: the
@@ -373,21 +440,35 @@ library LiquidationMath {
         pure
         returns (uint256 pBank)
     {
+        return bankruptcyPrice(size, collateral, entryPrice, 0);
+    }
+
+    /// @notice Bankruptcy price after applying signed funding debt to effective collateral.
+    function bankruptcyPrice(
+        int256 size,
+        uint256 collateral,
+        uint256 entryPrice,
+        int256 fundingDebt6
+    )
+        internal
+        pure
+        returns (uint256 pBank)
+    {
         if (entryPrice == 0) revert EntryPriceNotPositive();
         if (size == 0) revert ZeroSize();
 
         uint256 absSize = size > 0 ? uint256(size) : uint256(-size);
-        // collateral-per-contract, expressed as a 1e18 price delta.
-        uint256 collateralPriceDelta = Math.mulDiv(collateral, ONE_E18, absSize);
+        int256 effectiveCollateral = int256(collateral) - fundingDebt6;
+        bool negativeEffective = effectiveCollateral < 0;
+        uint256 absEffective = negativeEffective ? uint256(-effectiveCollateral) : uint256(effectiveCollateral);
+        uint256 priceDelta = Math.mulDiv(absEffective, ONE_E18, absSize);
 
-        if (size > 0) {
-            // Long: P_b = entry − delta. A non-positive result means the position cannot reach
-            // zero equity by price alone — it is not an ADL candidate.
-            if (collateralPriceDelta >= entryPrice) revert BankruptcyPriceNonPositive();
-            pBank = entryPrice - collateralPriceDelta;
+        bool subtractDelta = (size > 0) != negativeEffective;
+        if (subtractDelta) {
+            if (priceDelta >= entryPrice) revert BankruptcyPriceNonPositive();
+            pBank = entryPrice - priceDelta;
         } else {
-            // Short: P_b = entry + delta. Always strictly positive.
-            pBank = entryPrice + collateralPriceDelta;
+            pBank = entryPrice + priceDelta;
         }
     }
 
@@ -423,6 +504,21 @@ library LiquidationMath {
         pure
         returns (bool)
     {
+        return isUnderMaintenance(size, collateral, markPrice, entryPrice, maintenanceMarginBps, 0);
+    }
+
+    function isUnderMaintenance(
+        int256 size,
+        uint256 collateral,
+        uint256 markPrice,
+        uint256 entryPrice,
+        uint16 maintenanceMarginBps,
+        int256 fundingDebt6
+    )
+        internal
+        pure
+        returns (bool)
+    {
         if (markPrice == 0) revert MarkNotPositive();
         if (entryPrice == 0) revert EntryPriceNotPositive();
         if (maintenanceMarginBps > BPS_DENOMINATOR) revert BpsOutOfRange();
@@ -432,7 +528,7 @@ library LiquidationMath {
         uint256 notional6 = Math.mulDiv(absSize, markPrice, ONE_E18);
         int256 priceDelta = int256(markPrice) - int256(entryPrice);
         int256 pnl6 = (size * priceDelta) / int256(ONE_E18);
-        int256 equity6Int = int256(collateral) + pnl6;
+        int256 equity6Int = int256(collateral) + pnl6 - fundingDebt6;
         uint256 mm6 = (notional6 * uint256(maintenanceMarginBps)) / BPS_DENOMINATOR;
         return equity6Int < int256(mm6);
     }
@@ -446,6 +542,24 @@ library LiquidationMath {
         uint256 entryPrice,
         uint16 maintenanceMarginBps,
         uint16 liquidationBufferBps
+    )
+        internal
+        pure
+        returns (bool)
+    {
+        return isUnderLiquidationBuffer(
+            size, collateral, markPrice, entryPrice, maintenanceMarginBps, liquidationBufferBps, 0
+        );
+    }
+
+    function isUnderLiquidationBuffer(
+        int256 size,
+        uint256 collateral,
+        uint256 markPrice,
+        uint256 entryPrice,
+        uint16 maintenanceMarginBps,
+        uint16 liquidationBufferBps,
+        int256 fundingDebt6
     )
         internal
         pure
@@ -465,7 +579,7 @@ library LiquidationMath {
         uint256 notional6 = Math.mulDiv(absSize, markPrice, ONE_E18);
         int256 priceDelta = int256(markPrice) - int256(entryPrice);
         int256 pnl6 = (size * priceDelta) / int256(ONE_E18);
-        int256 equity6Int = int256(collateral) + pnl6;
+        int256 equity6Int = int256(collateral) + pnl6 - fundingDebt6;
         uint256 thresholdBps = uint256(maintenanceMarginBps) + uint256(liquidationBufferBps);
         uint256 threshold6 = (notional6 * thresholdBps) / BPS_DENOMINATOR;
         return equity6Int < int256(threshold6);

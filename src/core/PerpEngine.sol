@@ -6,14 +6,11 @@ import {UUPSUpgradeable} from "@openzeppelin/contracts-upgradeable/proxy/utils/U
 
 import {ReentrancyGuard} from "solady/utils/ReentrancyGuard.sol";
 
-import {FundingMath} from "../libraries/FundingMath.sol";
 import {PerpInternals} from "../libraries/PerpInternals.sol";
-import {PositionMath} from "../libraries/PositionMath.sol";
-import {FundingStorage, PerpStorage} from "../libraries/StorageLib.sol";
+import {FundingStorage, PerpStorage, QuoteFundingStorage} from "../libraries/StorageLib.sol";
 import {ISubjectRegistry} from "../registry/ISubjectRegistry.sol";
 
 import {ILPVault} from "./ILPVault.sol";
-import {IMarginEngine} from "./IMarginEngine.sol";
 import {IPerpEngine} from "./IPerpEngine.sol";
 
 /// @title PerpEngine — position lifecycle for People Markets perps.
@@ -21,9 +18,9 @@ import {IPerpEngine} from "./IPerpEngine.sol";
 ///         `removeCollateral`, and the permissioned `pushMark`. Reads subject status + KYC
 ///         tier from the SubjectRegistry; routes collateral and PnL through the LPVault.
 ///
-/// @dev    v0 scope: one position per (trader, subject), no funding accrual, no liquidation,
-///         no event-impulse feedback. The Position struct reserves an `entryFundingIndex` slot
-///         so FundingEngine (week 8-9) can ship without a storage migration.
+/// @dev    Quote-denominated funding uses a separate namespaced index and per-position snapshot.
+///         The legacy dimensionless `entryFundingIndex` field remains ABI/storage compatible but
+///         is not consumed by settlement.
 ///
 /// @dev    Roles:
 ///         - `governance` — slow lever, timelocked. Mark-writer adds, governance transfer.
@@ -39,17 +36,10 @@ contract PerpEngine is Initializable, UUPSUpgradeable, ReentrancyGuard, IPerpEng
     uint256 internal constant ONE = 1e18;
     uint256 internal constant BPS_DENOMINATOR = 10_000;
 
-    /// @dev Fee precision: 1e6, so taker = 0.075% = 750. Bps (1e4) is too coarse for the spec's
-    ///      0.075% / 0.025% values; ppm gives clean integers without fractional rounding.
-    uint256 internal constant FEE_RATE_DENOM = 1_000_000;
-    uint16 internal constant TAKER_FEE_RATE = 750; // 0.075% per spec §3
-    uint16 internal constant MAKER_FEE_RATE = 250; // 0.025%
-
     /// @dev Spec §3 fee split: 40% LP rebate (default; tunable via `setLpRebatePct` in [25, 50]),
     ///      50% insurance (pinned), residual = 100 - lpRebatePct - 50 to treasury (`accruedFees`).
     ///      `lpRebatePct` lives in storage; the spec's 40 → 30% LP-rebate decay over 6 months is
     ///      executed by governance ratcheting this value down.
-    uint8 internal constant INSURANCE_PCT = 50;
     uint8 internal constant MIN_LP_REBATE_PCT = 25;
     uint8 internal constant MAX_LP_REBATE_PCT = 50;
 
@@ -113,9 +103,8 @@ contract PerpEngine is Initializable, UUPSUpgradeable, ReentrancyGuard, IPerpEng
     // Modifiers (continued)
     // ------------------------------------------------------------------------------------------
 
-    /// @dev Restricts to the configured FundingEngine. Reverts (with the caller address baked
-    ///      into the error) if the writer is unset OR the caller is not the writer. Until
-    ///      FundingEngine v1 ships, every `pushFundingIndex` call lands here and reverts.
+    /// @dev Restricts legacy and quote-index writes to the configured FundingEngine. Reverts
+    ///      (with the caller address baked into the error) when unset or called by another account.
     modifier onlyFundingEngine() {
         address writer = PerpStorage.load().fundingEngine;
         if (msg.sender != writer || writer == address(0)) revert OnlyFundingEngine(msg.sender);
@@ -142,8 +131,12 @@ contract PerpEngine is Initializable, UUPSUpgradeable, ReentrancyGuard, IPerpEng
     ///      removes are immediate (same shape as `markWriters`). Until governance registers a
     ///      router, every call lands here and reverts.
     modifier onlyRouter() {
-        if (!PerpStorage.load().routers[msg.sender]) revert OnlyRouter(msg.sender);
+        _requireRouter();
         _;
+    }
+
+    function _requireRouter() private view {
+        if (!PerpStorage.load().routers[msg.sender]) revert OnlyRouter(msg.sender);
     }
 
     // ------------------------------------------------------------------------------------------
@@ -151,8 +144,12 @@ contract PerpEngine is Initializable, UUPSUpgradeable, ReentrancyGuard, IPerpEng
     // ------------------------------------------------------------------------------------------
 
     modifier onlyGovernance() {
-        if (msg.sender != PerpStorage.load().governance) revert Unauthorized(msg.sender);
+        _requireGovernance();
         _;
+    }
+
+    function _requireGovernance() private view {
+        if (msg.sender != PerpStorage.load().governance) revert Unauthorized(msg.sender);
     }
 
     // ------------------------------------------------------------------------------------------
@@ -161,7 +158,7 @@ contract PerpEngine is Initializable, UUPSUpgradeable, ReentrancyGuard, IPerpEng
 
     /// @inheritdoc IPerpEngine
     function openPosition(OpenParams calldata p) external nonReentrant returns (bytes32 positionId) {
-        return _openPositionFor(msg.sender, p);
+        return PerpInternals.openPositionFor(msg.sender, p);
     }
 
     /// @inheritdoc IPerpEngine
@@ -179,120 +176,45 @@ contract PerpEngine is Initializable, UUPSUpgradeable, ReentrancyGuard, IPerpEng
         returns (bytes32 positionId)
     {
         if (trader == address(0)) revert InvalidConfig();
-        return _openPositionFor(trader, p);
+        return PerpInternals.openPositionFor(trader, p);
     }
 
-    /// @dev Shared open-path implementation. Both `openPosition` (where `trader == msg.sender`)
-    ///      and `openPositionFor` (where `trader` is supplied by a trusted router) delegate here
-    ///      so the open-side semantics stay in lockstep.
-    function _openPositionFor(address trader, OpenParams calldata p) internal returns (bytes32 positionId) {
-        PerpStorage.Layout storage perpS = PerpStorage.load();
-
-        if (perpS.globalHalt) revert GlobalHaltedError();
-        if (block.timestamp > p.deadline) revert DeadlineExpired(p.deadline);
-        if (p.collateralAmount == 0 || p.sizeNotional == 0) revert AmountZero();
-
-        // Subject + KYC gate — registry's requireTradeable reverts on UNREGISTERED, paused,
-        // delisted, or any policy flag.
-        ISubjectRegistry(perpS.subjectRegistry).requireTradeable(p.subjectId);
-        uint8 tier = ISubjectRegistry(perpS.subjectRegistry).kycTierOf(trader);
-        if (tier == 0) revert KycTierMissing(trader);
-
-        uint256 markNow = _readFreshMark(perpS, p.subjectId);
-        _checkSlippage(markNow, p.expectedMark, p.maxSlippageBps);
-
-        // One-position-per-(trader, subject) invariant.
-        if (perpS.openPositionId[trader][p.subjectId] != bytes32(0)) {
-            revert PositionAlreadyOpen(trader, p.subjectId);
-        }
-
-        // Margin + cap checks — delegated to MarginEngine. The two calls below revert with the
-        // MarginEngine-side error variants (LeverageTooHigh, InitialMarginShort, PerSubjectOiCap...)
-        // matching the legacy reverts byte-for-byte from the caller's perspective.
-        IMarginEngine me = IMarginEngine(perpS.marginEngine);
-        if (address(me) == address(0)) revert MarginEngineUnset();
-        me.checkInitialMargin(p.sizeNotional, p.collateralAmount);
-        bytes32 categoryId = _categoryOf(perpS, p.subjectId);
-        _enforceOpenCaps(me, perpS, trader, p.subjectId, categoryId, p.side, p.sizeNotional, tier);
-
-        // Compute fee + split.
-        (uint256 fee, uint256 lpRebate, uint256 insuranceShare) = _computeFees(p.sizeNotional, p.isMaker);
-
-        // Compute signed size in base units. Bound check: sizeNotional × ONE fits since
-        // sizeNotional ≤ tier cap (max ≈ 1e6 USDC × 1e18 = 1e24 — safe).
-        int256 absSize = int256((p.sizeNotional * ONE) / markNow);
-        int256 signedSize = p.side == Side.LONG ? absSize : -absSize;
-
-        // Allocate positionId from monotonic nonce.
-        unchecked {
-            positionId = keccak256(abi.encode(trader, p.subjectId, perpS.nextPositionNonce++));
-        }
-
-        // Tier-1 funding event stub: snapshot the cumulative funding index at open. The math is
-        // not applied in v0 (no per-position settle yet) — capturing the snapshot now means
-        // FundingEngine v1 can compute (currentIndex − entryFundingIndex) × size without a
-        // storage migration.
-        int256 entryFundingIndex = FundingStorage.load().cumulativeFundingIndex[p.subjectId];
-
-        // Write position.
-        perpS.positions[positionId] = Position({
-            size: signedSize,
-            collateral: p.collateralAmount,
-            entryPrice: markNow,
-            entryFundingIndex: entryFundingIndex,
-            openedAt: uint64(block.timestamp),
-            lastInteractionAt: uint64(block.timestamp),
-            owner: trader,
-            subjectId: p.subjectId
-        });
-        perpS.openPositionId[trader][p.subjectId] = positionId;
-
-        // OI side-counters live on PerpStorage. Signed per-category OI + per-trader exposure live
-        // on MarginEngine — delegate the update so the canonical state stays in one place.
-        if (p.side == Side.LONG) {
-            perpS.totalLongOI[p.subjectId] += p.sizeNotional;
-        } else {
-            perpS.totalShortOI[p.subjectId] += p.sizeNotional;
-        }
-        me.recordOpenDelta(trader, categoryId, IMarginEngine.Side(uint8(p.side)), p.sizeNotional, tier);
-
-        // Vault settle: pull (collateralAmount + fee) from trader, book the split. The trader
-        // (not the router or msg.sender) is the funds source — they must have pre-approved the
-        // LPVault for `collateralAmount + fee`.
-        ILPVault(perpS.lpVault).openPositionFlow(trader, p.collateralAmount, fee, lpRebate, insuranceShare);
-
-        emit PositionOpened(positionId, trader, p.subjectId, p.side, signedSize, markNow, p.collateralAmount, fee);
+    /// @inheritdoc IPerpEngine
+    /// @dev The trusted matched-fill router is the authorization and atomicity boundary. This
+    ///      wrapper preserves PerpEngine's reentrancy and timelocked-router gates; the extracted
+    ///      implementation keeps the additional execution-price path outside the EIP-170-constrained
+    ///      engine bytecode.
+    function openPositionForMatched(
+        address trader,
+        MatchedOpenParams calldata p
+    )
+        external
+        nonReentrant
+        onlyRouter
+        returns (bytes32 positionId)
+    {
+        return PerpInternals.openPositionForMatched(trader, p);
     }
 
-    /// @dev Local-only struct used to thread close-flow values out of the helper. Keeps
-    ///      `closePosition` under solc's stack-depth bound when via-IR is disabled (e.g. under
-    ///      `forge coverage` instrumentation).
-    struct _CloseValues {
-        int256 closeSize;
-        uint256 closeCollateral;
-        uint256 openingNotionalDelta;
-        int256 realizedPnl;
-        // Funding debt settled on the closed slice. Signed, 6-decimal USDC: positive = trader OWES
-        // funding (deducted from payout, credited to the LP vault); negative = trader RECEIVES
-        // funding (added to payout, debited from the LP vault). Computed from the cumulative
-        // funding index delta (currentIndex − entryFundingIndex) via `FundingMath.computeFundingDebt`.
-        int256 fundingDebt6;
-        // PnL leg actually booked to the vault on settle: `realizedPnl − fundingDebt6`. Folding
-        // funding into the vault's signed-pnl leg keeps a single settlement primitive (the vault is
-        // the universal counterparty), so funding paid by traders accrues to LP `freeAssets` and
-        // funding owed to traders is paid out of it.
-        int256 settlePnl;
-        uint256 fee;
-        uint256 lpRebate;
-        uint256 insuranceShare;
-        uint256 returned;
-        bool isLong;
-        bool fullClose;
+    /// @inheritdoc IPerpEngine
+    /// @dev The matched-fill router has already verified the trader signature, exact position
+    ///      binding, reduce-only flag, order direction, role, price limit, and atomic counterparty.
+    ///      The linked implementation re-checks all position-sensitive constraints at settlement.
+    function closePositionForMatched(
+        address trader,
+        MatchedCloseParams calldata p
+    )
+        external
+        nonReentrant
+        onlyRouter
+        returns (int256 realizedPnl)
+    {
+        return PerpInternals.closePositionForMatched(trader, p);
     }
 
     /// @inheritdoc IPerpEngine
     function closePosition(CloseParams calldata p) external nonReentrant returns (int256 realizedPnl) {
-        return _closePositionFor(msg.sender, p);
+        return PerpInternals.closePositionFor(msg.sender, p);
     }
 
     /// @inheritdoc IPerpEngine
@@ -309,128 +231,7 @@ contract PerpEngine is Initializable, UUPSUpgradeable, ReentrancyGuard, IPerpEng
         onlyRouter
         returns (int256 realizedPnl)
     {
-        return _closePositionFor(trader, p);
-    }
-
-    /// @dev Shared close-path implementation. Both `closePosition` and `closePositionFor` route
-    ///      here so semantics stay in lockstep.
-    function _closePositionFor(address trader, CloseParams calldata p) internal returns (int256 realizedPnl) {
-        PerpStorage.Layout storage perpS = PerpStorage.load();
-
-        if (perpS.globalHalt) revert GlobalHaltedError();
-        if (block.timestamp > p.deadline) revert DeadlineExpired(p.deadline);
-        if (p.sizeFractionBps == 0 || p.sizeFractionBps > BPS_DENOMINATOR) {
-            revert InvalidSizeFraction(p.sizeFractionBps);
-        }
-        // Once a subject has been force-settled, the canonical price is captured. Trades against
-        // the live mark are no longer meaningful — traders must use `closeAtForcedSettlement`.
-        if (perpS.subjectForceSettled[p.subjectId]) revert SubjectIsForceSettled(p.subjectId);
-
-        bytes32 positionId = perpS.openPositionId[trader][p.subjectId];
-        if (positionId == bytes32(0)) revert PositionNotOpen(p.subjectId);
-
-        // Closes are allowed during subject pauses (wind-down) — only globalHalt blocks them.
-        uint256 markNow = _readFreshMark(perpS, p.subjectId);
-        _checkSlippage(markNow, p.expectedMark, p.maxSlippageBps);
-
-        Position memory orig = perpS.positions[positionId];
-        // Funding settlement (Tier-1): the cumulative funding index is the single source of truth,
-        // pushed by FundingEngine via `pushFundingIndex` and frozen during pauses. We settle funding
-        // on the CLOSED SLICE only; the residual keeps its original `entryFundingIndex`, so funding
-        // that accrued over the residual's lifetime is settled in full at its own eventual close —
-        // no double counting, no missed accrual.
-        int256 currentFundingIndex = FundingStorage.load().cumulativeFundingIndex[p.subjectId];
-        _CloseValues memory v = _computeCloseValues(orig, markNow, p.sizeFractionBps, p.isMaker, currentFundingIndex);
-
-        // Update position state.
-        if (v.fullClose) {
-            delete perpS.positions[positionId];
-            delete perpS.openPositionId[trader][p.subjectId];
-        } else {
-            // Partial close locks in PnL via realizedPnl; entryPrice is unchanged so the residual
-            // continues to reference the original entry.
-            Position storage pos = perpS.positions[positionId];
-            pos.size = orig.size - v.closeSize;
-            pos.collateral = orig.collateral - v.closeCollateral;
-            pos.lastInteractionAt = uint64(block.timestamp);
-        }
-
-        // OI side-counters on PerpStorage. Signed per-category OI + per-trader exposure live on
-        // MarginEngine — delegate the unwind. OI deltas use OPENING notional throughout.
-        if (v.isLong) {
-            perpS.totalLongOI[p.subjectId] -= v.openingNotionalDelta;
-        } else {
-            perpS.totalShortOI[p.subjectId] -= v.openingNotionalDelta;
-        }
-        // marginEngine MAY be unset (legacy positions opened before Wave 4 rotation). Guard so
-        // close paths stay alive on a partially-wired engine — opens are blocked by the unset
-        // pointer, but unwinds must always succeed.
-        if (perpS.marginEngine != address(0)) {
-            IMarginEngine(perpS.marginEngine)
-                .recordCloseDelta(trader, _categoryOf(perpS, p.subjectId), v.openingNotionalDelta, v.isLong);
-        }
-
-        // Settle the closed slice against the vault. The pnl leg is `realizedPnl − fundingDebt6`
-        // (funding folded in — see `_CloseValues.settlePnl`). Fees are unchanged; funding is NOT
-        // a fee and does not route through the lpRebate/insurance split.
-        ILPVault(perpS.lpVault)
-            .settlePosition(trader, v.closeCollateral, v.settlePnl, v.fee, v.lpRebate, v.insuranceShare);
-
-        // Funding settled on the closed slice. `fundingDebt6 > 0` ⇒ trader paid funding into the
-        // vault; `< 0` ⇒ trader received funding from the vault. Reported separately from the
-        // trading PnL (`PositionClosed.realizedPnl`) so indexers can decompose the two.
-        emit FundingSettled(positionId, trader, v.fundingDebt6);
-        // `v.closeSize` is the SIGNED slice actually closed (full size on a full close, the
-        // pro-rata slice on a partial close); `v.isLong` is the position side. See IPerpEngine —
-        // appending these fields is a BREAKING event-signature change for off-chain decoders.
-        emit PositionClosed(
-            positionId, trader, p.subjectId, v.realizedPnl, v.fee, v.returned, v.fullClose, v.closeSize, v.isLong
-        );
-        return v.realizedPnl;
-    }
-
-    function _computeCloseValues(
-        Position memory orig,
-        uint256 markNow,
-        uint256 sizeFractionBps,
-        bool isMaker,
-        int256 currentFundingIndex
-    )
-        internal
-        view
-        returns (_CloseValues memory v)
-    {
-        v.fullClose = sizeFractionBps == BPS_DENOMINATOR;
-        v.isLong = orig.size > 0;
-
-        if (v.fullClose) {
-            v.closeSize = orig.size;
-            v.closeCollateral = orig.collateral;
-        } else {
-            v.closeSize = (orig.size * int256(sizeFractionBps)) / int256(BPS_DENOMINATOR);
-            v.closeCollateral = (orig.collateral * sizeFractionBps) / BPS_DENOMINATOR;
-        }
-
-        uint256 absCloseSize = v.closeSize > 0 ? uint256(v.closeSize) : uint256(-v.closeSize);
-        v.openingNotionalDelta = (absCloseSize * orig.entryPrice) / ONE;
-        uint256 closeNotionalAtMark = (absCloseSize * markNow) / ONE;
-        v.realizedPnl = PositionMath.unrealizedPnl(v.closeSize, orig.entryPrice, markNow);
-
-        (v.fee, v.lpRebate, v.insuranceShare) = _computeFees(closeNotionalAtMark, isMaker);
-
-        // Funding debt on the closed slice. `computeFundingDebt = closeSize × (currentIndex −
-        // entryIndex) / 1e18`. Sign: long + index-grew ⇒ pays; short + index-grew ⇒ receives.
-        // The `settlePnl` leg folds funding into the vault settlement.
-        v.fundingDebt6 = FundingMath.computeFundingDebt(v.closeSize, currentFundingIndex, orig.entryFundingIndex);
-        v.settlePnl = v.realizedPnl - v.fundingDebt6;
-
-        // Underwater guard. Voluntary close into negative equity (after funding) reverts — the
-        // LiquidationEngine waterfall is the only path that clears a position whose equity cannot
-        // cover its obligations. Funding is included so a position pushed underwater purely by
-        // accrued funding debt cannot be voluntarily closed at the vault's expense.
-        int256 returnedSigned = int256(v.closeCollateral) + v.settlePnl - int256(v.fee);
-        if (returnedSigned < 0) revert UnderwaterClose(returnedSigned);
-        v.returned = uint256(returnedSigned);
+        return PerpInternals.closePositionFor(trader, p);
     }
 
     /// @inheritdoc IPerpEngine
@@ -502,13 +303,13 @@ contract PerpEngine is Initializable, UUPSUpgradeable, ReentrancyGuard, IPerpEng
 
     /// @inheritdoc IPerpEngine
     function removeCollateral(bytes32 subjectId, uint256 amount) external nonReentrant {
-        _removeCollateralFor(msg.sender, subjectId, amount);
+        PerpInternals.removeCollateralFor(msg.sender, subjectId, amount);
     }
 
     /// @inheritdoc IPerpEngine
     /// @dev Wave 6C. Trusted-router entrypoint. `positionId` MUST be owned by `trader`.
     function removeCollateralFor(address trader, bytes32 positionId, uint256 amount) external nonReentrant onlyRouter {
-        _removeCollateralFor(trader, _subjectIdForOwner(trader, positionId), amount);
+        PerpInternals.removeCollateralFor(trader, _subjectIdForOwner(trader, positionId), amount);
     }
 
     /// @dev Resolve `positionId`'s subject and reject mismatches (positionId not owned by
@@ -519,47 +320,6 @@ contract PerpEngine is Initializable, UUPSUpgradeable, ReentrancyGuard, IPerpEng
         bytes32 subjectId = pos.subjectId;
         if (pos.owner != trader || pos.size == 0) revert PositionNotOpen(subjectId);
         return subjectId;
-    }
-
-    /// @dev Shared remove-collateral helper. Recomputes IM on the residual so withdrawals never
-    ///      leave a position teetering above maintenance margin.
-    function _removeCollateralFor(address trader, bytes32 subjectId, uint256 amount) internal {
-        if (amount == 0) revert AmountZero();
-        PerpStorage.Layout storage perpS = PerpStorage.load();
-        if (perpS.globalHalt) revert GlobalHaltedError();
-        if (perpS.subjectForceSettled[subjectId]) revert SubjectIsForceSettled(subjectId);
-
-        bytes32 positionId = perpS.openPositionId[trader][subjectId];
-        if (positionId == bytes32(0)) revert PositionNotOpen(subjectId);
-
-        Position storage pos = perpS.positions[positionId];
-        if (amount >= pos.collateral) revert AmountZero(); // can't remove all collateral
-
-        // Need a fresh mark to recompute leverage + IM on the residual.
-        uint256 markNow = _readFreshMark(perpS, subjectId);
-
-        uint256 newCollateral = pos.collateral - amount;
-        uint256 absSize = pos.size > 0 ? uint256(pos.size) : uint256(-pos.size);
-        uint256 currentNotional = (absSize * markNow) / ONE;
-
-        // Negative-equity short-circuit: emits the dedicated MaintenanceMarginShort selector to
-        // preserve the pre-extraction error trail. Other IM/leverage failures route through
-        // MarginEngine.checkInitialMarginResidual which mirrors the legacy selectors.
-        int256 uPnl = PositionMath.unrealizedPnl(pos.size, pos.entryPrice, markNow);
-        if (int256(newCollateral) + uPnl <= 0) revert MaintenanceMarginShort(0, 0);
-
-        // Re-check leverage + IM on the residual via MarginEngine. NOT maintenance — withdrawals
-        // must leave the position genuinely safe, not just past the liquidation threshold.
-        address me = perpS.marginEngine;
-        if (me == address(0)) revert MarginEngineUnset();
-        IMarginEngine(me).checkInitialMarginResidual(newCollateral, currentNotional, uPnl);
-
-        pos.collateral = newCollateral;
-        pos.lastInteractionAt = uint64(block.timestamp);
-
-        ILPVault(perpS.lpVault).releaseCollateral(trader, amount);
-
-        emit CollateralRemoved(positionId, amount, newCollateral);
     }
 
     // ------------------------------------------------------------------------------------------
@@ -600,100 +360,13 @@ contract PerpEngine is Initializable, UUPSUpgradeable, ReentrancyGuard, IPerpEng
     }
 
     // ------------------------------------------------------------------------------------------
-    // Internal helpers
-    // ------------------------------------------------------------------------------------------
-
-    function _readFreshMark(
-        PerpStorage.Layout storage perpS,
-        bytes32 subjectId
-    )
-        internal
-        view
-        returns (uint256 markNow)
-    {
-        markNow = perpS.markPrice[subjectId];
-        if (markNow == 0) revert MarkNotSet(subjectId);
-        uint64 ts = perpS.markUpdatedAt[subjectId];
-        if (block.timestamp > uint256(ts) + uint256(perpS.markStaleAfter)) {
-            revert MarkStale(subjectId, ts);
-        }
-    }
-
-    function _checkSlippage(uint256 markNow, uint256 expectedMark, uint256 maxSlippageBps) internal pure {
-        if (expectedMark == 0) revert InvalidConfig();
-        uint256 diff = markNow > expectedMark ? markNow - expectedMark : expectedMark - markNow;
-        // diff × 10_000 ≤ maxSlippageBps × expectedMark
-        if (diff * BPS_DENOMINATOR > maxSlippageBps * expectedMark) {
-            revert SlippageExceeded(expectedMark, markNow, maxSlippageBps);
-        }
-    }
-
-    /// @dev Delegates the cap enforcement to MarginEngine. PerpEngine computes the cap
-    ///      denominator (`min(cappedTvl, liveTvl)` — v2-audit Fix #3) locally so MarginEngine
-    ///      does not need a back-pointer to the LP vault. The signed-OI accumulator + side
-    ///      counters are read from PerpStorage and passed through.
-    function _enforceOpenCaps(
-        IMarginEngine me,
-        PerpStorage.Layout storage perpS,
-        address trader,
-        bytes32 subjectId,
-        bytes32 categoryId,
-        Side side,
-        uint256 sizeNotional,
-        uint8 tier
-    )
-        internal
-        view
-    {
-        // OI-cap TVL uses the O(1), event-funding-invariant `capTvl()` (= freeAssets + eventFundedSeed),
-        // NOT the share-price NAV `totalAssets()`. This keeps OI capacity/liveness unaffected by event
-        // funding (no availability regression) and avoids the per-market recoverable loop on the perp
-        // hot path. Share pricing still uses the exact bounded NAV view separately.
-        uint256 liveTvl = ILPVault(perpS.lpVault).capTvl();
-        uint256 vaultTvl = perpS.cappedTvl < liveTvl ? perpS.cappedTvl : liveTvl;
-        me.enforceOpenCaps(
-            trader,
-            subjectId,
-            categoryId,
-            IMarginEngine.Side(uint8(side)),
-            sizeNotional,
-            tier,
-            perpS.totalLongOI[subjectId],
-            perpS.totalShortOI[subjectId],
-            vaultTvl
-        );
-    }
-
-    /// @dev Look up the category for `subjectId` from the registry. Wrapped in a private helper
-    ///      to keep the open/close paths terse and to make the cross-contract read explicit.
-    function _categoryOf(PerpStorage.Layout storage perpS, bytes32 subjectId) internal view returns (bytes32) {
-        return ISubjectRegistry(perpS.subjectRegistry).subjectOf(subjectId).categoryId;
-    }
-
-    function _computeFees(
-        uint256 notional,
-        bool isMaker
-    )
-        internal
-        view
-        returns (uint256 fee, uint256 lpRebate, uint256 insuranceShare)
-    {
-        uint256 rate = isMaker ? MAKER_FEE_RATE : TAKER_FEE_RATE;
-        fee = (notional * rate) / FEE_RATE_DENOM;
-        // lpRebatePct lives in storage so governance can ratchet 40% → 30% per spec §3 line 139.
-        lpRebate = (fee * uint256(PerpStorage.load().lpRebatePct)) / 100;
-        insuranceShare = (fee * INSURANCE_PCT) / 100;
-        // residual = fee − lpRebate − insuranceShare flows to vault.accruedFees in the vault
-    }
-
-    // ------------------------------------------------------------------------------------------
     // Permissioned writes
     // ------------------------------------------------------------------------------------------
 
     /// @inheritdoc IPerpEngine
     /// @dev Mark pushes are allowed regardless of subject status — a writer can record a price
     ///      observation even on a paused or delisting subject. State-changing trades gate the
-    ///      mark via `_readFreshMark`.
+    ///      mark via `PerpInternals._readFreshMark`.
     /// @dev v2-audit Fix #5: per-update max-delta cap. The first push for a subject (oldMark == 0)
     ///      is uncapped — there is no prior reference point. Subsequent pushes must satisfy
     ///      |newMark − oldMark| × 10_000 ≤ markMaxDeltaBps × oldMark, bounding the damage from a
@@ -720,12 +393,8 @@ contract PerpEngine is Initializable, UUPSUpgradeable, ReentrancyGuard, IPerpEng
     }
 
     /// @inheritdoc IPerpEngine
-    /// @dev Tier-1 funding event stub. FundingEngine v1 will call this once per accrual interval
-    ///      per subject. The engine writes the new index + last-accrued timestamp and emits the
-    ///      event so indexers can compute realized funding off-chain. Pauses freeze funding per
-    ///      spec §2 line 66 — we route through `requireTradeable` to share the existing
-    ///      pause-state semantics (status == ACTIVE, no policy flag).
     function pushFundingIndex(bytes32 subjectId, int256 newIndex, int256 fundingRate1e18) external onlyFundingEngine {
+        if (QuoteFundingStorage.load().enabled) revert LegacyFundingIndexDisabled();
         PerpStorage.Layout storage perpS = PerpStorage.load();
         ISubjectRegistry(perpS.subjectRegistry).requireTradeable(subjectId);
 
@@ -735,6 +404,19 @@ contract PerpEngine is Initializable, UUPSUpgradeable, ReentrancyGuard, IPerpEng
         fundingS.lastFundingAt[subjectId] = uint64(block.timestamp);
 
         emit FundingPushed(subjectId, oldIndex, newIndex, fundingRate1e18, uint64(block.timestamp));
+    }
+
+    /// @inheritdoc IPerpEngine
+    function pushFundingQuoteIndex(
+        bytes32 subjectId,
+        int256 newQuoteIndex1e18,
+        int256 fundingRate1e18,
+        uint256 markPrice1e18
+    )
+        external
+        onlyFundingEngine
+    {
+        PerpInternals.pushFundingQuoteIndex(subjectId, newQuoteIndex1e18, fundingRate1e18, markPrice1e18);
     }
 
     /// @inheritdoc IPerpEngine
@@ -751,24 +433,7 @@ contract PerpEngine is Initializable, UUPSUpgradeable, ReentrancyGuard, IPerpEng
     /// @dev First-ever push for a subject (mark == 0) reverts: applying a multiplicative impulse
     ///      to an uninitialized mark would still leave it at zero and silently drop the bump.
     function applyImpulse(bytes32 subjectId, int256 impulseBps) external onlyFeedbackController {
-        PerpStorage.Layout storage perpS = PerpStorage.load();
-        ISubjectRegistry(perpS.subjectRegistry).requireTradeable(subjectId);
-
-        uint256 oldMark = perpS.markPrice[subjectId];
-        if (oldMark == 0) revert MarkNotInitialized(subjectId);
-
-        // newMark = oldMark × (BPS + impulseBps) / BPS. The multiplier is signed; for
-        // `impulseBps = -BPS_DENOMINATOR` it is zero and we revert as ImpulseUnderflow. For
-        // anything more negative it would be negative — also caught by the underflow guard.
-        int256 multiplier = int256(BPS_DENOMINATOR) + impulseBps;
-        int256 newMarkSigned = (int256(oldMark) * multiplier) / int256(BPS_DENOMINATOR);
-        if (newMarkSigned <= 0) revert ImpulseUnderflow();
-        uint256 newMark = uint256(newMarkSigned);
-
-        perpS.markPrice[subjectId] = newMark;
-        perpS.markUpdatedAt[subjectId] = uint64(block.timestamp);
-
-        emit MarkImpulsed(subjectId, oldMark, newMark, impulseBps, uint64(block.timestamp));
+        PerpInternals.applyImpulse(subjectId, impulseBps);
     }
 
     /// @inheritdoc IPerpEngine
@@ -926,8 +591,8 @@ contract PerpEngine is Initializable, UUPSUpgradeable, ReentrancyGuard, IPerpEng
     // ------------------------------------------------------------------------------------------
     // Governance: FundingEngine writer rotation (timelocked)
     //
-    // Same shape as `proposeSetPerpEngine` on LPVault. Until FundingEngine v1 ships, the writer
-    // stays at `address(0)` and `pushFundingIndex` reverts.
+    // Same shape as `proposeSetPerpEngine` on LPVault. Both legacy-transition and quote-index
+    // selectors share this writer so rotation remains atomic.
     // ------------------------------------------------------------------------------------------
 
     /// @inheritdoc IPerpEngine
@@ -1159,34 +824,17 @@ contract PerpEngine is Initializable, UUPSUpgradeable, ReentrancyGuard, IPerpEng
 
     /// @inheritdoc IPerpEngine
     function equityOf(bytes32 positionId) external view returns (int256) {
-        Position memory pos = PerpStorage.load().positions[positionId];
-        if (pos.size == 0) return 0;
-        uint256 markNow = PerpStorage.load().markPrice[pos.subjectId];
-        if (markNow == 0) return int256(pos.collateral);
-        int256 uPnl = PositionMath.unrealizedPnl(pos.size, pos.entryPrice, markNow);
-        return PositionMath.equity(pos.collateral, uPnl);
+        return PerpInternals.equityOf(positionId);
     }
 
     /// @inheritdoc IPerpEngine
     function marginRatioBpsOf(bytes32 positionId) external view returns (uint256) {
-        Position memory pos = PerpStorage.load().positions[positionId];
-        if (pos.size == 0) return 0;
-        uint256 markNow = PerpStorage.load().markPrice[pos.subjectId];
-        if (markNow == 0) return 0;
-        uint256 notional_ = PositionMath.notional(pos.size, markNow);
-        int256 uPnl = PositionMath.unrealizedPnl(pos.size, pos.entryPrice, markNow);
-        int256 eq = PositionMath.equity(pos.collateral, uPnl);
-        return PositionMath.marginRatioBps(eq, notional_);
+        return PerpInternals.marginRatioBpsOf(positionId);
     }
 
     /// @inheritdoc IPerpEngine
     function leverageBpsOf(bytes32 positionId) external view returns (uint256) {
-        Position memory pos = PerpStorage.load().positions[positionId];
-        if (pos.size == 0 || pos.collateral == 0) return 0;
-        uint256 markNow = PerpStorage.load().markPrice[pos.subjectId];
-        if (markNow == 0) return 0;
-        uint256 notional_ = PositionMath.notional(pos.size, markNow);
-        return PositionMath.leverageBps(notional_, pos.collateral);
+        return PerpInternals.leverageBpsOf(positionId);
     }
 
     /// @inheritdoc IPerpEngine
@@ -1253,6 +901,31 @@ contract PerpEngine is Initializable, UUPSUpgradeable, ReentrancyGuard, IPerpEng
     /// @inheritdoc IPerpEngine
     function lastFundingAt(bytes32 subjectId) external view returns (uint64) {
         return FundingStorage.load().lastFundingAt[subjectId];
+    }
+
+    /// @inheritdoc IPerpEngine
+    function cumulativeFundingQuoteIndex(bytes32 subjectId) external view returns (int256) {
+        return QuoteFundingStorage.load().cumulativeQuoteIndex[subjectId];
+    }
+
+    /// @inheritdoc IPerpEngine
+    function lastQuoteFundingAt(bytes32 subjectId) external view returns (uint64) {
+        return QuoteFundingStorage.load().lastQuoteFundingAt[subjectId];
+    }
+
+    /// @inheritdoc IPerpEngine
+    function positionFundingQuoteIndex(bytes32 positionId) external view returns (int256) {
+        return QuoteFundingStorage.load().entryQuoteIndex[positionId];
+    }
+
+    /// @inheritdoc IPerpEngine
+    function fundingDebtOf(bytes32 positionId) external view returns (int256) {
+        return PerpInternals.fundingDebtOf(positionId);
+    }
+
+    /// @inheritdoc IPerpEngine
+    function quoteFundingEnabled() external view returns (bool) {
+        return QuoteFundingStorage.load().enabled;
     }
 
     /// @notice Pending FundingEngine rotation (zero address + zero timestamp when none in flight).

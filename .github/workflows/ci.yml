@@ -55,6 +55,36 @@ jobs:
           FOUNDRY_PROFILE: lite
         continue-on-error: true
 
+  storage-layout:
+    name: storage layout · deployed baseline
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          # The baseline is a historical commit (the live implementation's), not the PR base.
+          fetch-depth: 0
+
+      - name: Install Foundry
+        uses: foundry-rs/foundry-toolchain@v1
+        with:
+          version: stable
+
+      # Compiling one small source makes forge install solc 0.8.24 (foundry.toml pins it).
+      - name: Install solc 0.8.24
+        run: forge build src/libraries/StorageLib.sol
+
+      # Compares every namespaced storage layout with the commit that built the live Base
+      # mainnet implementations (DEPLOYED_BASE in the script; see script/DEPLOYMENT.md).
+      # Update DEPLOYED_BASE in the same PR that records a new mainnet upgrade.
+      - name: Check storage layout against the deployed baseline
+        run: |
+          SOLC="$(find "$HOME" -type f -name 'solc-0.8.24' 2>/dev/null | head -n 1)"
+          test -n "$SOLC" || { echo "solc 0.8.24 not found"; exit 1; }
+          SOLC="$SOLC" python3 script/check-storage-layout.py
+
   slither:
     name: static analysis · slither
     runs-on: ubuntu-latest

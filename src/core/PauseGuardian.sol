@@ -62,10 +62,11 @@ contract PauseGuardian is Initializable, UUPSUpgradeable {
     uint16 public constant MIN_THRESHOLD_BPS = 10;
     uint16 public constant MAX_THRESHOLD_BPS = 5_000;
 
-    /// @dev Window bounds (seconds). Lower bound matches the rate-limit floor; upper bound is one
-    ///      day (any longer and ring-buffer coverage becomes unreliable).
+    /// @dev Window bounds (seconds). Lower bound matches the rate-limit floor. The one-hour upper
+    ///      bound is exactly covered by the 721-entry ring at the densest permitted five-second
+    ///      observation cadence, so governance cannot configure a window the detector may evict.
     uint32 public constant MIN_WINDOW_SECONDS = 5;
-    uint32 public constant MAX_WINDOW_SECONDS = 1 days;
+    uint32 public constant MAX_WINDOW_SECONDS = 1 hours;
 
     /// @dev Reason codes passed through to `SubjectRegistry.PauseTriggered`. Matches the spec's three
     ///      breaker tiers. `0` is reserved for "manual / unknown" external pauses; the guardian never
@@ -73,6 +74,7 @@ contract PauseGuardian is Initializable, UUPSUpgradeable {
     uint8 public constant REASON_5PCT_30S = 1;
     uint8 public constant REASON_10PCT_30M = 2;
     uint8 public constant REASON_20PCT_60M = 3;
+    uint8 public constant REASON_UNOBSERVABLE_WINDOW = 4;
 
     /// @dev Tier identifiers used in the `BreakerTriggered` event. Mirrors the registry's pause-tier
     ///      ordering with FROZEN being the worst tier.
@@ -152,6 +154,11 @@ contract PauseGuardian is Initializable, UUPSUpgradeable {
 
         PauseGuardianStorage.Ring storage ring = s.rings[subjectId];
 
+        // A v1 ring that filled and wrapped used modulus 128. Rotate its valid history into
+        // chronological slots 0..127 before applying the expanded 721-slot modulus. Partial v1
+        // rings were already linear and need no migration.
+        _migrateLegacyRing(ring);
+
         // If we already have observations, enforce the rate-limit AND require the new push to be
         // newer (or equal-and-different) than the last recorded one. Recording the same `updatedAt`
         // twice would write a duplicate observation that consumes a buffer slot without adding
@@ -206,6 +213,18 @@ contract PauseGuardian is Initializable, UUPSUpgradeable {
         // Pauses move from ACTIVE only (per `SubjectRegistry._setPause`). If the subject is already
         // paused, terminating, delisted, or death-pending, there is nothing to do.
         if (status != ISubjectRegistry.SubjectStatus.ACTIVE) return;
+
+        // An upgraded v1 proxy may already hold a window above the new one-hour coverage bound.
+        // Never evaluate such a subject against incomplete history: freeze it until governance
+        // activates an observable configuration and the normal admin review unfreezes it.
+        uint32 configuredMaxWindow = s.frozen60WindowSeconds;
+        if (s.cooldown30WindowSeconds > configuredMaxWindow) configuredMaxWindow = s.cooldown30WindowSeconds;
+        if (s.auto5WindowSeconds > configuredMaxWindow) configuredMaxWindow = s.auto5WindowSeconds;
+        if (configuredMaxWindow > MAX_WINDOW_SECONDS) {
+            emit ObservationCoverageInsufficient(subjectId, configuredMaxWindow, MAX_WINDOW_SECONDS);
+            registry.setFrozen(subjectId, REASON_UNOBSERVABLE_WINDOW);
+            return;
+        }
 
         uint64 nowTs = uint64(block.timestamp);
         uint16 auto5Bps = s.auto5MinBps;
@@ -268,6 +287,44 @@ contract PauseGuardian is Initializable, UUPSUpgradeable {
 
     function _capBps(uint256 bps) internal pure returns (uint16) {
         return bps > type(uint16).max ? type(uint16).max : uint16(bps);
+    }
+
+    function _migrateLegacyRing(PauseGuardianStorage.Ring storage ring) internal {
+        if (!_isWrappedLegacyRing(ring)) return;
+
+        uint16 legacyHead = ring.head;
+        if (legacyHead != 0) {
+            PauseGuardianStorage.Observation[] memory ordered =
+                new PauseGuardianStorage.Observation[](PauseGuardianStorage.LEGACY_RING_SIZE);
+            uint16 legacyIdx = legacyHead;
+            for (uint16 i = 0; i < PauseGuardianStorage.LEGACY_RING_SIZE; ++i) {
+                ordered[i] = ring.entries[legacyIdx];
+                legacyIdx = _nextLegacyIndex(legacyIdx);
+            }
+            for (uint16 i = 0; i < PauseGuardianStorage.LEGACY_RING_SIZE; ++i) {
+                ring.entries[i] = ordered[i];
+            }
+        }
+
+        // The next expanded-ring write belongs immediately after the 128 preserved entries.
+        ring.head = PauseGuardianStorage.LEGACY_RING_SIZE;
+    }
+
+    function _isWrappedLegacyRing(PauseGuardianStorage.Ring storage ring) internal view returns (bool) {
+        return ring.length == PauseGuardianStorage.LEGACY_RING_SIZE && ring.head < PauseGuardianStorage.LEGACY_RING_SIZE;
+    }
+
+    function _nextLegacyIndex(uint16 idx) internal pure returns (uint16) {
+        unchecked {
+            uint16 next = idx + 1;
+            return next == PauseGuardianStorage.LEGACY_RING_SIZE ? 0 : next;
+        }
+    }
+
+    function _prevLegacyIndex(uint16 idx) internal pure returns (uint16) {
+        unchecked {
+            return idx == 0 ? PauseGuardianStorage.LEGACY_RING_SIZE - 1 : idx - 1;
+        }
     }
 
     function _nextIndex(uint16 idx) internal pure returns (uint16) {
@@ -486,7 +543,8 @@ contract PauseGuardian is Initializable, UUPSUpgradeable {
     function lastObservation(bytes32 subjectId) external view returns (uint192 mark, uint64 timestamp) {
         PauseGuardianStorage.Ring storage ring = PauseGuardianStorage.load().rings[subjectId];
         if (ring.length == 0) return (0, 0);
-        PauseGuardianStorage.Observation memory o = ring.entries[_prevIndex(ring.head)];
+        uint16 newestIdx = _isWrappedLegacyRing(ring) ? _prevLegacyIndex(ring.head) : _prevIndex(ring.head);
+        PauseGuardianStorage.Observation memory o = ring.entries[newestIdx];
         return (o.mark, o.timestamp);
     }
 
@@ -495,9 +553,10 @@ contract PauseGuardian is Initializable, UUPSUpgradeable {
     function observationAt(bytes32 subjectId, uint16 n) external view returns (uint192 mark, uint64 timestamp) {
         PauseGuardianStorage.Ring storage ring = PauseGuardianStorage.load().rings[subjectId];
         if (n >= ring.length) revert ObservationOutOfRange(n, ring.length);
+        bool wrappedLegacy = _isWrappedLegacyRing(ring);
         uint16 idx = ring.head;
         for (uint16 i = 0; i <= n; ++i) {
-            idx = _prevIndex(idx);
+            idx = wrappedLegacy ? _prevLegacyIndex(idx) : _prevIndex(idx);
         }
         PauseGuardianStorage.Observation memory o = ring.entries[idx];
         return (o.mark, o.timestamp);
@@ -518,6 +577,7 @@ contract PauseGuardian is Initializable, UUPSUpgradeable {
 
     event ObservationRecorded(bytes32 indexed subjectId, uint256 mark, uint64 timestamp);
     event MarkUnchangedNoBreach(bytes32 indexed subjectId, uint64 lastTimestamp, uint64 latestTimestamp);
+    event ObservationCoverageInsufficient(bytes32 indexed subjectId, uint32 configuredWindow, uint32 maxWindow);
     event BreakerTriggered(bytes32 indexed subjectId, uint8 tier, uint16 observedBps, uint16 thresholdBps);
     event ThresholdsProposed(
         uint16 auto5Bps,

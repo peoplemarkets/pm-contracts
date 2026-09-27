@@ -48,8 +48,11 @@ vault USDC balance, totalAssets and share price must not inflate).
 2. Governance Safe signers available: every wiring step is two Safe transactions (propose, then
    activate after the 1 hour timelock).
 3. The engine EVENT_OPERATOR KMS signer address is known (must equal the engine's
-   `chain.event_operator`).
-4. `forge build` clean and full `forge test` green at the release commit.
+   `chain.event_operator` and every signed order's `executor`).
+4. The API and client use the canonical `PeopleMarketsEventOrders` v1 EIP-712 payload and bind the
+   authenticated wallet, configured executor, chain id, and router proxy without client overrides.
+5. `forge build` and the full `forge test` gate are green at the release commit, followed by an
+   independent security review. This runbook is not authorization to deploy an unreviewed head.
 
 ## 2. Deploy (deployer key)
 
@@ -87,6 +90,8 @@ cast call $EVENT_MARKET_ROUTER  "governance()(address)"            --rpc-url "$B
 cast call $EVENT_MARKET_ROUTER  "factory()(address)"               --rpc-url "$BASE_MAINNET_RPC_URL"  # factory proxy
 cast call $EVENT_MARKET_ROUTER  "usdc()(address)"                  --rpc-url "$BASE_MAINNET_RPC_URL"
 cast call $EVENT_MARKET_ROUTER  "timelockDelay()(uint32)"          --rpc-url "$BASE_MAINNET_RPC_URL"  # 3600
+cast call $EVENT_MARKET_ROUTER  "EVENT_ORDER_TYPEHASH()(bytes32)"  --rpc-url "$BASE_MAINNET_RPC_URL"
+cast call $EVENT_MARKET_ROUTER  "domainSeparator()(bytes32)"       --rpc-url "$BASE_MAINNET_RPC_URL"
 ```
 
 ## 3. Governance timelock choreography (Safe batches)
@@ -137,7 +142,7 @@ Verify:
 cast call $EVENT_MARKET_FACTORY "isOperator(address)(bool)" $EVENT_MARKET_ROUTER --rpc-url "$BASE_MAINNET_RPC_URL"  # true
 ```
 
-### Batch (c): engine KMS signer as router operator
+### Batch (c): engine KMS signer as signed-order executor
 
 ```bash
 export EVENT_OPERATOR=<engine KMS EVENT_OPERATOR signer address>
@@ -160,6 +165,11 @@ Verify:
 ```bash
 cast call $EVENT_MARKET_ROUTER "isOperator(address)(bool)" $EVENT_OPERATOR --rpc-url "$BASE_MAINNET_RPC_URL"  # true
 ```
+
+This allowlist is relay authorization, not trader authorization. Each execution must call
+`executeOrder` with an unexpired EOA/ERC-1271 signature that binds the trader, this executor,
+market, outcome, BUY/SELL intent, quantities, nonce, and deadline. The retained router
+`buyOutcomeFor` and `sellOutcomeFor` selectors always revert.
 
 ### Batch (d): register the UMA metric for EACH event (before createMarket)
 
@@ -251,15 +261,19 @@ event_market_factory      = $EVENT_MARKET_FACTORY
 chain.event_operator      = $EVENT_OPERATOR
 ```
 
+The client signing-domain response must additionally publish the current chain id,
+`PeopleMarketsEventOrders` / version `1`, and `$EVENT_MARKET_ROUTER` as the verifying contract.
+
 ## 4. Kill switch reality
 
-There is NO pause path on the factory, the router, or the markets. The ONLY way to stop trading on
-the custodial path is the immediate (non-timelocked) governance `removeOperator`:
+There is NO pause path on the factory, the router, or the markets. The immediate way to stop the
+signed relay path is the non-timelocked governance `removeOperator`:
 
 - `EventMarketRouter.removeOperator(EVENT_OPERATOR)` cuts off the engine relay instantly.
 - `EventMarketFactory.removeOperator(EVENT_MARKET_ROUTER)` disables the router's `*For` calls on
   every market.
 
-Direct (non-relayed) user trades against a market cannot be halted. Keep the Safe able to execute
+Wallet nonce cancellation remains available but is per trader. Direct (non-relayed) user trades
+against a market cannot be halted. Keep the Safe able to execute
 `removeOperator` at short notice; re-enabling later requires the full 1 hour propose/activate
 timelock again.

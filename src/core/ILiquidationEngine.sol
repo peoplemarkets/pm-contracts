@@ -11,7 +11,8 @@ pragma solidity 0.8.24;
 ///           Tier 3 — Insurance fund draw. Covers shortfall when equity < bounty.
 ///           Tier 4 — LP socialization. Capped at 30% of vault TVL per liquidation event.
 ///                    Implemented naturally via `LPVault.settlePosition` accepting a negative pnl.
-///           Tier 5 — ADL (auto-deleveraging). DEFERRED in v0; reverts with `ADLNotImplemented`.
+///           Tier 5 — ADL (auto-deleveraging). Force-closes a bankrupt position and profitable
+///                    opposite-side counterparties at the bankruptcy price.
 ///
 /// @dev    Liquidators are a registered set (timelocked add, immediate remove) — matches the
 ///         mark-writer / sentiment-writer / resolution-writer pattern. The bounty is the
@@ -37,8 +38,8 @@ interface ILiquidationEngine {
     }
 
     /// @notice Outcome of a single `liquidate(positionId)` call.
-    /// @param  tier                 Highest tier reached (PARTIAL, FULL, INSURANCE, or
-    ///                              SOCIALIZATION). Higher tiers imply lower tiers also fired.
+    /// @param  tier                 Action reached: PARTIAL, FULL, INSURANCE, SOCIALIZATION, or ADL.
+    ///                              For the normal waterfall, higher tiers imply lower-tier checks.
     /// @param  positionId           The position closed (partially or fully).
     /// @param  trader               Position owner. Convenience for indexers.
     /// @param  sizeClosed           Signed contract units closed (1e6-fixed contracts). Same sign
@@ -68,7 +69,10 @@ interface ILiquidationEngine {
     error InvalidConfig();
     error PositionNotFound(bytes32 positionId);
     error NotUnderBuffer(bytes32 positionId);
+    /// @dev The liquidation and ADL paths share PerpEngine's canonical mark-staleness window.
+    error MarkStale(bytes32 subjectId, uint64 updatedAt);
     error SocializationCapExceeded(uint256 requested, uint256 cap);
+    /// @dev Retained for source/ABI compatibility; current Tier-5 ADL is implemented.
     error ADLNotImplemented();
     /// @dev Thrown by `adl` when the position is NOT bad enough to justify ADL — i.e. the normal
     ///      Tier 1-4 waterfall (insurance draw + socialization within the cap) could absorb the
@@ -152,9 +156,8 @@ interface ILiquidationEngine {
     /// @notice Run the waterfall against a single position. Only registered liquidators may call.
     /// @dev    Returns the LiquidationResult and emits one Liquidated event with the highest tier
     ///         reached. Reverts (a) `NotUnderBuffer` if the position is not yet eligible, (b)
-    ///         `PositionNotFound` if `size == 0`, (c) `SocializationCapExceeded` if LP
-    ///         socialization would exceed the cap, (d) `ADLNotImplemented` if the waterfall would
-    ///         need Tier 5.
+    ///         `PositionNotFound` if `size == 0`, (c) `MarkStale` if the canonical mark is too old,
+    ///         or (d) `SocializationCapExceeded` if LP socialization would exceed the cap.
     function liquidate(bytes32 positionId) external returns (LiquidationResult memory);
 
     /// @notice Tier-5 auto-deleveraging. Closes a bankrupt position at zero equity (its full

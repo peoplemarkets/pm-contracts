@@ -2,7 +2,8 @@
 # In-place UPGRADE ceremony for the LIVE Base Sepolia event-market stack.
 #
 #   >>> RUN THE FORK TEST FIRST — it is the safety gate. The LPVault proxy also backs LIVE perp
-#   >>> positions, so this ceremony must not move its NAV / share price. Do not run any broadcast
+#   >>> positions, so booked collateral and real USDC must not move; NAV/share price may only
+#   >>> correct downward and must never inflate. Do not run any broadcast
 #   >>> phase until the fork test is green:
 #   >>>
 #   >>>   BASE_SEPOLIA_RPC_URL=https://sepolia.base.org \
@@ -11,12 +12,13 @@
 # What this upgrades (all IN PLACE, storage-compat to current main verified GO / append-only):
 #   - LPVault proxy            0x6347E37eE6597A99DE63eb00F469d19771AE41F2  -> new LPVault impl (#13 NAV fix)
 #   - EventMarketFactory proxy 0xb73feD3C858CE69376C349c17368f4Ff1726ffBF  -> new factory impl (operator relay + timelocked setMarketImpl)
+#   - EventMarketRouter proxy  0x0AE0E0744ACD79a26F5ACC5c8Ec8231Bc47d7a16  -> wallet-signed relay impl
 #   - EventMarket clone template (via factory.setMarketImplementation)     -> new EventMarket (buyOutcomeFor/sellOutcomeFor + fixed priceOf + currentRecoverable)
-# Then allowlists the operator relay path (router->factory, EVENT_OPERATOR->router).
+# Then allowlists the signed operator relay path (router->factory, EVENT_OPERATOR->router).
 #
 # Phases (each write SIMULATES first, then broadcasts; read-only cast checks run between steps):
-#   deploy                  -> deploy the 4 new impls (LPVault, Factory, EventMarket, FeedbackController)
-#   upgrade                 -> upgradeToAndCall on the LPVault + Factory proxies (asserts perp reads unchanged)
+#   deploy                  -> deploy 5 new impls (LPVault, Factory, EventMarket, Router, FeedbackController)
+#   upgrade                 -> upgradeToAndCall on LPVault + Factory + Router (asserts funds/config unchanged)
 #   set-market-impl-propose -> factory.proposeSetMarketImplementation(new EventMarket)
 #   ...wait 1 hour (factory timelockDelay = 3600s)...
 #   set-market-impl-activate-> factory.activateSetMarketImplementation()
@@ -37,7 +39,8 @@
 #   [export SEPOLIA_RPC=<dedicated rpc>]            # defaults to https://sepolia.base.org
 #
 #   ./script/upgrade-event-stack-sepolia.sh deploy
-#   export NEW_LPVAULT_IMPL=0x...  NEW_FACTORY_IMPL=0x...  NEW_EVENT_MARKET_IMPL=0x...  # from deploy output
+#   export NEW_LPVAULT_IMPL=0x... NEW_FACTORY_IMPL=0x... NEW_EVENT_MARKET_IMPL=0x...
+#   export NEW_ROUTER_IMPL=0x... # from deploy output
 #   ./script/upgrade-event-stack-sepolia.sh upgrade
 #   ./script/upgrade-event-stack-sepolia.sh set-market-impl-propose
 #   ...wait 1 hour...
@@ -94,13 +97,13 @@ case "${1:-}" in
     echo ">>> Reminder: the fork test (UpgradeCeremonyFork) MUST be green before broadcasting further phases."
     run_forge --sig 'deploy()'
     echo
-    echo ">>> export NEW_LPVAULT_IMPL / NEW_FACTORY_IMPL / NEW_EVENT_MARKET_IMPL (from output), then: $0 upgrade"
+    echo ">>> export NEW_LPVAULT_IMPL / NEW_FACTORY_IMPL / NEW_EVENT_MARKET_IMPL / NEW_ROUTER_IMPL (from output), then: $0 upgrade"
     ;;
   upgrade)
-    need DEPLOYER_PK; need NEW_LPVAULT_IMPL; need NEW_FACTORY_IMPL
+    need DEPLOYER_PK; need NEW_LPVAULT_IMPL; need NEW_FACTORY_IMPL; need NEW_ROUTER_IMPL
     echo "── vault perp reads BEFORE upgrade ──"; vault_reads
     run_forge --sig 'upgrade()'
-    echo "── vault perp reads AFTER upgrade (totalAssets/pps/positionCollateral MUST match above) ──"; vault_reads
+    echo "── vault reads AFTER (positionCollateral must match; totalAssets/pps must not increase) ──"; vault_reads
     echo ">>> next: $0 set-market-impl-propose"
     ;;
   set-market-impl-propose)
@@ -147,6 +150,10 @@ case "${1:-}" in
     cast call "$EVENT_MARKET_FACTORY" 'isOperator(address)(bool)' "$EVENT_MARKET_ROUTER" --rpc-url "$RPC"
     echo "router.isOperator(EVENT_OPERATOR) (want true):"
     cast call "$EVENT_MARKET_ROUTER" 'isOperator(address)(bool)' "$EVENT_OPERATOR" --rpc-url "$RPC"
+    echo "router.EVENT_ORDER_TYPEHASH (wallet-signed implementation must expose this):"
+    cast call "$EVENT_MARKET_ROUTER" 'EVENT_ORDER_TYPEHASH()(bytes32)' --rpc-url "$RPC"
+    echo "router.domainSeparator (binds chain + proxy):"
+    cast call "$EVENT_MARKET_ROUTER" 'domainSeparator()(bytes32)' --rpc-url "$RPC"
     echo "operator ETH balance (needs gas to relay trades):"
     cast balance "$EVENT_OPERATOR" --rpc-url "$RPC"
     ;;

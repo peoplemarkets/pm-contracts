@@ -3,7 +3,7 @@ pragma solidity 0.8.24;
 
 /// @title  FundingMath — pure helpers for the People Markets funding-rate model.
 ///
-/// @notice Implements the spec §2 funding-rate formula and the two derived primitives the
+/// @notice Implements the spec §2 funding-rate formula and the derived primitives the
 ///         FundingEngine needs:
 ///
 ///           fundingRatePerHour_e18 = clamp(
@@ -37,7 +37,8 @@ pragma solidity 0.8.24;
 ///         | premium / skew / each component   | 1e18 fixed-point, signed (int256)        |
 ///         | totalRate (output)                | 1e18 fixed-point, signed (int256)        |
 ///         | elapsedSeconds                    | uint64 wall-clock seconds                |
-///         | indexDelta (output)               | 1e18 fixed-point, signed (int256)        |
+///         | rateIndexDelta (legacy output)    | 1e18 fixed-point, signed (int256)        |
+///         | quoteIndexDelta (output)          | quote/base, 1e18 fixed-point, signed     |
 ///         | size_1e6                          | 1e6-fixed contracts, signed (int256)     |
 ///         | debt6 (output)                    | 6-decimal USDC, signed (int256)          |
 ///
@@ -49,10 +50,10 @@ pragma solidity 0.8.24;
 ///           skew     = (6e6 - 4e6) / 10e6                       = +0.20e18
 ///           rate     = kPremium*0.05 + kSentiment*0.5 + kSkew*0.20
 ///                                                              > 0
-///           delta    = rate * elapsed / 3600                    > 0
+///           delta    = rate * mark * elapsed / (1e18 * 3600)    > 0
 ///           newIndex = oldIndex + delta                         (cumulative index grows)
 ///
-///         A long opened earlier with `entryFundingIndex = oldIndex` and `size > 0` pays funding:
+///         A long opened earlier with `entryQuoteIndex = oldIndex` and `size > 0` pays funding:
 ///
 ///           debt6 = size × (newIndex - entryIndex) / 1e18       > 0
 ///
@@ -186,7 +187,7 @@ library FundingMath {
     }
 
     // ------------------------------------------------------------------------------------------
-    // computeIndexDelta
+    // computeIndexDelta (legacy dimensionless index)
     // ------------------------------------------------------------------------------------------
 
     /// @notice Integrate a per-hour rate over an elapsed window into a cumulative-index delta.
@@ -210,10 +211,34 @@ library FundingMath {
     }
 
     // ------------------------------------------------------------------------------------------
+    // computeQuoteIndexDelta
+    // ------------------------------------------------------------------------------------------
+
+    /// @notice Integrate a dimensionless hourly rate into quote funding per base contract.
+    /// @dev    `quoteDelta_e18 = rate_e18 * mark_e18 * elapsed / (1e18 * 3600)`.
+    ///         The protocol bounds mark at 1e36 and the rate at a small 1e18 fraction, so the
+    ///         intermediate product remains inside int256 even across the full uint64 elapsed
+    ///         domain. Multiplying before division preserves sub-hour precision with one rounding
+    ///         boundary. Positive delta means longs pay and shorts receive.
+    function computeQuoteIndexDelta(
+        int256 fundingRate_e18,
+        uint256 markPrice_e18,
+        uint64 elapsedSeconds
+    )
+        internal
+        pure
+        returns (int256 quoteDelta_e18)
+    {
+        if (elapsedSeconds == 0 || fundingRate_e18 == 0 || markPrice_e18 == 0) return 0;
+        quoteDelta_e18 =
+            (fundingRate_e18 * int256(markPrice_e18) * int256(uint256(elapsedSeconds))) / (ONE_E18 * SECONDS_PER_HOUR);
+    }
+
+    // ------------------------------------------------------------------------------------------
     // computeFundingDebt
     // ------------------------------------------------------------------------------------------
 
-    /// @notice Convert an index-growth delta plus a signed position size into a signed USDC debt.
+    /// @notice Convert a quote-index delta plus a signed position size into signed USDC debt.
     ///
     /// @dev    `debt6 = size_1e6 × (currentIndex_e18 - entryIndex_e18) / 1e18`
     ///
@@ -227,13 +252,12 @@ library FundingMath {
     ///         |  -   |     -       |  +    | short pays (rate flipped negative ⇒ longs paid) |
     ///
     ///         `debt6 > 0` means the trader OWES at close (deducted from collateral); `debt6 < 0`
-    ///         is a credit added to the trader's payout. v0 does not consume this primitive yet
-    ///         (per-position settle deferred to a later wave) but every off-chain settler and the
-    ///         integration tests do, so the conversion lives here.
+    ///         is a credit added to the trader's payout. Voluntary and forced close paths consume
+    ///         this primitive; risk and liquidation paths use the same debt convention.
     ///
     /// @param  size_1e6         Signed position size in 1e6-fixed contracts (matches `LiquidationMath`).
-    /// @param  currentIndex_e18 Cumulative funding index at the close moment, signed 1e18.
-    /// @param  entryIndex_e18   Cumulative funding index snapshotted at position open, signed 1e18.
+    /// @param  currentIndex_e18 Cumulative quote funding per base at close, signed 1e18.
+    /// @param  entryIndex_e18   Quote funding per base snapshotted at position open, signed 1e18.
     /// @return debt6            Signed funding debt in 6-decimal USDC (positive = trader pays).
     function computeFundingDebt(
         int256 size_1e6,

@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: BUSL-1.1
 pragma solidity 0.8.24;
 
+import {Math} from "@openzeppelin/contracts/utils/math/Math.sol";
 import {Test} from "forge-std/Test.sol";
 
 import {ILPVault} from "../../src/core/ILPVault.sol";
@@ -20,8 +21,8 @@ import {MockUSDC} from "../mocks/MockUSDC.sol";
 ///         updated only on successful calls.
 ///
 /// @dev    Ghost mirror posture: track per-bucket bookkeepers (positionCollateral, insurance,
-///         accruedFees) explicitly; track OI both ways (running counter AND walk-recompute over a
-///         per-subject position list). The bookkeeper-sum-identity invariant is the load-bearing
+///         accruedFees) explicitly; track each position's remaining opening notional for OI
+///         counter updates. The bookkeeper-sum-identity invariant is the load-bearing
 ///         I1 check; ghost-equality on individual buckets catches bugs in either side independently.
 contract PerpVaultHandler is Test {
     PerpEngine internal immutable engine;
@@ -56,6 +57,7 @@ contract PerpVaultHandler is Test {
     mapping(bytes32 => uint256) public ghostExpectedLongOI;
     mapping(bytes32 => uint256) public ghostExpectedShortOI;
     mapping(address => uint256) public ghostExpectedTraderExposure;
+    mapping(bytes32 => uint256) public ghostRemainingOpeningNotional;
 
     bytes32[] public ghostAllPositionIds;
     mapping(bytes32 => uint256) internal _ghostPositionIndex; // 1-based; 0 means "not in list"
@@ -238,6 +240,7 @@ contract PerpVaultHandler is Test {
             ghostExpectedShortOI[subject] += sizeNotional;
         }
         ghostExpectedTraderExposure[trader] += sizeNotional;
+        ghostRemainingOpeningNotional[newId] = sizeNotional;
 
         ghostAllPositionIds.push(newId);
         _ghostPositionIndex[newId] = ghostAllPositionIds.length; // 1-based
@@ -274,7 +277,14 @@ contract PerpVaultHandler is Test {
             // Compute opening-notional delta so we can mirror OI updates.
             int256 closeSize = fullClose ? orig.size : (orig.size * int256(fraction)) / int256(uint256(10_000));
             uint256 absCloseSize = closeSize > 0 ? uint256(closeSize) : uint256(-closeSize);
-            uint256 openingNotionalDelta = (absCloseSize * orig.entryPrice) / ONE_18;
+            uint256 remaining = ghostRemainingOpeningNotional[positionId];
+            uint256 absPositionSize = orig.size > 0 ? uint256(orig.size) : uint256(-orig.size);
+            uint256 openingNotionalDelta = fullClose ? remaining : Math.mulDiv(remaining, absCloseSize, absPositionSize);
+            if (fullClose) {
+                delete ghostRemainingOpeningNotional[positionId];
+            } else {
+                ghostRemainingOpeningNotional[positionId] = remaining - openingNotionalDelta;
+            }
             uint256 closeNotionalAtMark = (absCloseSize * mark) / ONE_18;
             uint256 closeCollateral = fullClose ? orig.collateral : (orig.collateral * fraction) / 10_000;
 
