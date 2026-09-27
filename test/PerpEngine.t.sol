@@ -3067,39 +3067,60 @@ contract PerpEngineTest is Test {
         assertEq(marginEngine.netCategoryOiOf(CATEGORY_ID), 0);
     }
 
-    function test_LegacyOpeningOiSeedsBeforeMatchedIncreaseAndDrains() public {
-        (bytes32 positionId, address router) = _openRoundedMatchedSlices(1);
-        uint256 oldOpeningNotional = 100 * ONE_USDC;
-        // PerpStorage.Layout's final mapping is slot 27 relative to its v1 namespace.
-        // Assert the slot before changing it so this test fails if the layout moves.
+    /// @dev The stored opening notional is the only source of the OI a close releases (there is no
+    ///      legacy recomputation). It must equal the booked OI after every open, increase, and
+    ///      partial close, stay non-zero while the position lives, and be cleared on full close.
+    function test_OpeningNotionalSlotTracksBookedOiThroughIncreaseAndPartialClose() public {
+        (bytes32 positionId, address router) = _openRoundedMatchedSlices(3);
+        // PerpStorage.Layout's final mapping is slot 27 relative to its v1 namespace. Reading the
+        // raw slot pins the compiler-established layout of the appended field.
         bytes32 mappingSlot = bytes32(uint256(keccak256("people.markets.perp.v1")) + 27);
         bytes32 valueSlot = keccak256(abi.encode(positionId, mappingSlot));
-        assertEq(uint256(vm.load(address(engine), valueSlot)), oldOpeningNotional);
-        vm.store(address(engine), valueSlot, bytes32(0)); // simulate a pre-upgrade position
-
-        IPerpEngine.MatchedOpenParams memory increase = _baseMatchedOpenParams();
-        increase.quantity = ONE_USDC;
-        increase.collateralAmount = 25 * ONE_USDC;
-        increase.executionPrice = 101 * ONE_18;
-        increase.maxFee = 25_250;
-        vm.prank(router);
-        assertEq(engine.openPositionForMatched(trader, increase), positionId);
-
         (uint256 longOi,) = engine.openInterestOf(SUBJECT_ID);
-        assertEq(longOi, 201 * ONE_USDC);
+        assertEq(longOi, 300 * ONE_USDC);
+        assertEq(uint256(vm.load(address(engine), valueSlot)), longOi);
+
+        IPerpEngine.MatchedCloseParams memory closeParams = _baseMatchedCloseParams(positionId);
+        closeParams.quantity = ONE_USDC;
+        closeParams.executionPrice = INITIAL_MARK + 5e11;
+        closeParams.maxFee = 150_000;
+        vm.prank(router);
+        engine.closePositionForMatched(trader, closeParams);
+        (longOi,) = engine.openInterestOf(SUBJECT_ID);
+        assertEq(longOi, 200 * ONE_USDC);
         assertEq(uint256(vm.load(address(engine), valueSlot)), longOi);
         assertEq(marginEngine.netCategoryOiOf(CATEGORY_ID), int256(longOi));
 
-        IPerpEngine.MatchedCloseParams memory closeParams = _baseMatchedCloseParams(positionId);
         closeParams.quantity = 2 * ONE_USDC;
-        closeParams.executionPrice = INITIAL_MARK;
-        closeParams.maxFee = 150_000;
         vm.prank(router);
         engine.closePositionForMatched(trader, closeParams);
         (longOi,) = engine.openInterestOf(SUBJECT_ID);
         assertEq(longOi, 0);
         assertEq(uint256(vm.load(address(engine), valueSlot)), 0);
         assertEq(marginEngine.netCategoryOiOf(CATEGORY_ID), 0);
+    }
+
+    /// @dev Pins the removal of the legacy fallback: a position without a stored opening notional
+    ///      (only possible for one opened before the field existed) releases no OI and is never
+    ///      recomputed from size * entryPrice. This is why script/UpgradePerpEngine.s.sol refuses
+    ///      to upgrade an engine with open positions.
+    function test_MissingOpeningNotionalReleasesNoOi() public {
+        (bytes32 positionId, address router) = _openRoundedMatchedSlices(2);
+        bytes32 mappingSlot = bytes32(uint256(keccak256("people.markets.perp.v1")) + 27);
+        bytes32 valueSlot = keccak256(abi.encode(positionId, mappingSlot));
+        assertEq(uint256(vm.load(address(engine), valueSlot)), 200 * ONE_USDC);
+        vm.store(address(engine), valueSlot, bytes32(0));
+
+        IPerpEngine.MatchedCloseParams memory closeParams = _baseMatchedCloseParams(positionId);
+        closeParams.quantity = 2 * ONE_USDC;
+        closeParams.executionPrice = INITIAL_MARK + 5e11;
+        closeParams.maxFee = 150_000;
+        vm.prank(router);
+        engine.closePositionForMatched(trader, closeParams);
+
+        (uint256 longOi,) = engine.openInterestOf(SUBJECT_ID);
+        assertEq(longOi, 200 * ONE_USDC);
+        assertEq(engine.positionIdOf(trader, SUBJECT_ID), bytes32(0));
     }
 
     function test_OpenPositionForMatched_MakerIncreasePreservesAccruedFundingDebt() public {

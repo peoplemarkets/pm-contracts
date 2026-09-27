@@ -251,8 +251,7 @@ library PerpInternals {
         );
         uint256 positionQuantity = orig.size > 0 ? uint256(orig.size) : uint256(-orig.size);
         uint256 closeQuantity = v.closeSize > 0 ? uint256(v.closeSize) : uint256(-v.closeSize);
-        v.openingNotionalDelta =
-            PerpStorage.consumeOpeningNotional(perpS, positionId, closeQuantity, positionQuantity, orig.entryPrice);
+        v.openingNotionalDelta = PerpStorage.consumeOpeningNotional(perpS, positionId, closeQuantity, positionQuantity);
 
         if (v.fullClose) {
             delete perpS.positions[positionId];
@@ -508,10 +507,6 @@ library PerpInternals {
         int256 fundingDebt = FundingMath.computeFundingDebt(newSize, currentQuoteIndex, newQuoteEntry);
         me.checkInitialMarginResidual(newCollateral, currentNotional, unrealizedPnl - fundingDebt);
 
-        if (perpS.positionOpeningNotional[positionId] == 0) {
-            // Seed positions opened before this accounting field was added.
-            perpS.positionOpeningNotional[positionId] = (oldQuantity * position.entryPrice) / ONE;
-        }
         perpS.positionOpeningNotional[positionId] += sizeNotional;
 
         position.size = newSize;
@@ -612,8 +607,7 @@ library PerpInternals {
             quoteS.entryQuoteIndex[p.positionId]
         );
         if (v.fee > p.maxFee) revert FeeLimitExceeded(v.fee, p.maxFee);
-        v.openingNotionalDelta =
-            PerpStorage.consumeOpeningNotional(perpS, p.positionId, p.quantity, positionQuantity, orig.entryPrice);
+        v.openingNotionalDelta = PerpStorage.consumeOpeningNotional(perpS, p.positionId, p.quantity, positionQuantity);
 
         if (v.fullClose) {
             delete perpS.positions[p.positionId];
@@ -848,8 +842,7 @@ library PerpInternals {
         // freeAssets-solvency guards (settleLiquidation) remain the authoritative checks in all cases.
         if (tierCode != 5 && collateralToReturn > collateralReleased) revert InvalidConfig();
 
-        uint256 openingNotionalDelta =
-            PerpStorage.consumeOpeningNotional(perpS, positionId, absClose, absPos, pos.entryPrice);
+        uint256 openingNotionalDelta = PerpStorage.consumeOpeningNotional(perpS, positionId, absClose, absPos);
         int256 fundingDebt6 = FundingMath.computeFundingDebt(
             sizeToClose, quoteS.cumulativeQuoteIndex[pos.subjectId], quoteS.entryQuoteIndex[positionId]
         );
@@ -927,8 +920,7 @@ library PerpInternals {
         }
 
         uint256 absSize = orig.size > 0 ? uint256(orig.size) : uint256(-orig.size);
-        uint256 openingNotional =
-            PerpStorage.consumeOpeningNotional(perpS, positionId, absSize, absSize, orig.entryPrice);
+        uint256 openingNotional = PerpStorage.consumeOpeningNotional(perpS, positionId, absSize, absSize);
 
         // CEI: state mutations before the external settle.
         delete perpS.positions[positionId];

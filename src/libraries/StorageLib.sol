@@ -117,23 +117,26 @@ library PerpStorage {
         mapping(bytes32 positionId => uint256) positionOpeningNotional;
     }
 
+    /// @notice Release the exact opening notional held by `closeQuantity` of a position.
+    /// @dev    Every open and increase stores a non-zero value, partial releases round down so the
+    ///         remainder stays non-zero, and a full close deletes it with the position. There is no
+    ///         fallback for positions opened before this field existed: the upgrade that introduced
+    ///         it requires zero open positions (script/UpgradePerpEngine.s.sol preflight gate).
     function consumeOpeningNotional(
         Layout storage s,
         bytes32 positionId,
         uint256 closeQuantity,
-        uint256 positionQuantity,
-        uint256 entryPrice
+        uint256 positionQuantity
     )
         internal
         returns (uint256 amount)
     {
         uint256 remaining = s.positionOpeningNotional[positionId];
-        // Positions opened before this field existed retain the historical calculation.
-        if (remaining == 0) remaining = (positionQuantity * entryPrice) / 1e18;
-        amount = closeQuantity == positionQuantity ? remaining : Math.mulDiv(remaining, closeQuantity, positionQuantity);
         if (closeQuantity == positionQuantity) {
+            amount = remaining;
             delete s.positionOpeningNotional[positionId];
-        } else if (s.positionOpeningNotional[positionId] != 0) {
+        } else {
+            amount = Math.mulDiv(remaining, closeQuantity, positionQuantity);
             s.positionOpeningNotional[positionId] = remaining - amount;
         }
     }
