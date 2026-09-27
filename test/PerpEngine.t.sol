@@ -2995,9 +2995,42 @@ contract PerpEngineTest is Test {
 
         (longOi,) = engine.openInterestOf(SUBJECT_ID);
         assertEq(longOi, 0);
+        assertEq(marginEngine.netCategoryOiOf(CATEGORY_ID), 0);
     }
 
+    /// @dev Three rounded fills: each slice books floor(1e6 * (100e18 + 5e11) / 1e18) = 100e6, so
+    ///      OI is 300e6 while size * entryPrice / 1e18 = 300_000_001. Liquidating 1 then 2 units
+    ///      must release exactly 100e6 then 200e6. The pre-fix formula releases 100e6 then
+    ///      200_000_001 and underflows the side OI (panic 0x11).
     function test_RoundedOpeningOiDrainsAcrossPartialAndFullLiquidation() public {
+        address le = makeAddr("liqEngine");
+        _activateLiquidationEngine(le);
+        (bytes32 positionId,) = _openRoundedMatchedSlices(3);
+
+        IPerpEngine.Position memory position = engine.positionOf(positionId);
+        (uint256 longOi,) = engine.openInterestOf(SUBJECT_ID);
+        assertEq(longOi, 300 * ONE_USDC);
+        assertEq((uint256(position.size) * position.entryPrice) / ONE_18, longOi + 1);
+
+        vm.prank(le);
+        engine.liquidateClose(positionId, int256(ONE_USDC), 25 * ONE_USDC, 0, 0, le, 1);
+        (longOi,) = engine.openInterestOf(SUBJECT_ID);
+        assertEq(longOi, 200 * ONE_USDC);
+        assertEq(engine.positionOf(positionId).size, int256(2 * ONE_USDC));
+        assertEq(marginEngine.netCategoryOiOf(CATEGORY_ID), int256(longOi));
+
+        vm.prank(le);
+        engine.liquidateClose(positionId, int256(2 * ONE_USDC), 50 * ONE_USDC, 0, 0, le, 2);
+        (longOi,) = engine.openInterestOf(SUBJECT_ID);
+        assertEq(longOi, 0);
+        assertEq(engine.positionOf(positionId).size, 0);
+        assertEq(engine.positionIdOf(trader, SUBJECT_ID), bytes32(0));
+        assertEq(marginEngine.netCategoryOiOf(CATEGORY_ID), 0);
+    }
+
+    /// @dev Two rounded fills liquidated in one full close: releases exactly the 200e6 booked,
+    ///      not the recomputed 200_000_001 (which underflows the side OI).
+    function test_RoundedOpeningOiDrainsAtSingleFullLiquidation() public {
         address le = makeAddr("liqEngine");
         _activateLiquidationEngine(le);
         (bytes32 positionId,) = _openRoundedMatchedSlices(2);
@@ -3008,14 +3041,7 @@ contract PerpEngineTest is Test {
         assertEq((uint256(position.size) * position.entryPrice) / ONE_18, longOi + 1);
 
         vm.prank(le);
-        engine.liquidateClose(positionId, int256(ONE_USDC), 25 * ONE_USDC, 0, 0, le, 1);
-        (longOi,) = engine.openInterestOf(SUBJECT_ID);
-        assertEq(longOi, 100 * ONE_USDC);
-        assertEq(engine.positionOf(positionId).size, int256(ONE_USDC));
-        assertEq(marginEngine.netCategoryOiOf(CATEGORY_ID), int256(longOi));
-
-        vm.prank(le);
-        engine.liquidateClose(positionId, int256(ONE_USDC), 25 * ONE_USDC, 0, 0, le, 2);
+        engine.liquidateClose(positionId, position.size, 50 * ONE_USDC, 0, 0, le, 2);
         (longOi,) = engine.openInterestOf(SUBJECT_ID);
         assertEq(longOi, 0);
         assertEq(engine.positionOf(positionId).size, 0);
