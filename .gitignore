@@ -31,3 +31,6 @@ typechain-types/
 # private key. Ignore the pattern, not just the one file.
 .env.bak*
 .env.*.bak
+
+# Python
+__pycache__/
