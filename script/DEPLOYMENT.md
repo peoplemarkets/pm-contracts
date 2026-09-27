@@ -121,8 +121,11 @@ session as the governance transaction, with opens halted:
 
 This release adds `openPositionForMatched` / `closePositionForMatched`. Any
 address with the PerpEngine router role can call them for **any trader**, at an
-execution price it chooses within its own `maxMarkDivergenceBps` (up to 100% of
-mark), spending that trader's LPVault allowance. Before this upgrade a router
+execution price it chooses within its own `maxMarkDivergenceBps`, spending that
+trader's LPVault allowance. The divergence is measured against the execution
+price, not the mark (`|mark - price| * 10_000 <= bps * price`), so 5,000 bps
+admits anything from 2/3 of mark to 2x mark and 10,000 bps admits anything from
+mark/2 up to `MAX_MARK` (1e36): there is no effective upper bound. Before this upgrade a router
 could only trade at the mark. The role must therefore be held only by contracts
 that verify trader signatures (`MatchedFillRouter`) or that never call these
 entrypoints (`PairTradeRouter`, `BatchRouter`), never by a key.
@@ -208,6 +211,24 @@ cannot be enumerated on chain, so this list must be complete.
    `script/DeployMatchedFillRouter.s.sol` (its simulation refuses an engine
    without the matched-fill surface) and register it through the timelocked
    `proposeAddRouter` / `activateAddRouter` pair.
+
+### Other contracts changed in this release
+
+This runbook upgrades only PerpEngine (plus the library) and deploys the
+MatchedFillRouter. The same release also changes MarginEngine,
+LiquidationEngine, FundingEngine, PauseGuardian, UMAAdapter, EventMarket and
+EventMarketRouter, and no runbook here covers them yet. Their order is fixed
+by the calls they make:
+
+- PerpEngine first. The new MarginEngine (`MarginEngine.sol:629`) and
+  LiquidationEngine call `PerpEngine.fundingDebtOf`, and the new FundingEngine
+  calls `pushFundingQuoteIndex`, `cumulativeFundingQuoteIndex` and
+  `lastQuoteFundingAt`; none of these exist on the deployed implementation
+  (`278fbbc`). Upgrading PerpEngine alone is compatible with the live peers.
+- MarginEngine and LiquidationEngine before FundingEngine enables quote
+  funding, or liquidation eligibility ignores funding debt.
+- Write and review an ordered plan for the remaining contracts before
+  upgrading any of them.
 
 ### Rollback
 

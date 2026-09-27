@@ -171,8 +171,8 @@ abstract contract PerpEngineUpgradeChecks is Script {
 
     /// @dev After this upgrade a router may call `openPositionForMatched` /
     ///      `closePositionForMatched` for ANY trader at a caller-chosen execution price (bounded
-    ///      only by the caller-chosen `maxMarkDivergenceBps`, up to 100% of mark), spending that
-    ///      trader's LPVault allowance. Only contracts that verify trader signatures (the
+    ///      only by the caller-chosen `maxMarkDivergenceBps`, measured against the execution price, so
+    ///      10,000 bps admits mark/2 up to MAX_MARK), spending that trader's LPVault allowance. Only contracts that verify trader signatures (the
     ///      MatchedFillRouter) may hold the role. Every ROUTER_CANDIDATES address without code
     ///      (operator, mark writers, KYC writer, deployer keys) must be neither a router nor pending.
     function _requireNoEoaRouters(PerpEngine engine) internal view {
